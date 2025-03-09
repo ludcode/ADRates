@@ -1,5 +1,5 @@
 # Ignore Jupyter notebooks
-*.ipynb
+#*.ipynb
 .ipynb_checkpoints/
 
 # Ignore virtual environment directories
