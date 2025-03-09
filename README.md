@@ -1,6 +1,6 @@
 # ADRates
 
-**ADRates** is a limited and modernized fork of an early version of [FinancePy](https://github.com/domokane/FinancePy), created by one of its students. The project aims to enhance the library with improved **Overnight Index Swap (OIS) curve building** and **Automatic Differentiation (AD)** for computing **delta** and **gamma** of interest rate swaps.
+**ADRates** is a limited and modernized fork of an early version of [Dominic O'Kane](https://www.edhec.edu/en/research-and-faculty/faculty/professors-and-researchers/dominic-o-kane) teaching materials, created by one of its (former) students. The project aims to enhance the library with improved **Overnight Index Swap (OIS) curve building** and **Automatic Differentiation (AD)** for computing **delta** and **gamma** of interest rate swaps.
 
 ## 🚀 Features
 
