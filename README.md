@@ -6,7 +6,7 @@
 
 - **Enhanced OIS Curve Construction**: More robust and flexible methodologies for discount curve bootstrapping.
 - **Automatic Differentiation for Greeks**: Uses AD to compute **delta** and **gamma**, making risk calculations more efficient.
-- **Modernization & Bug Fixes**: Improves outdated functionality while preserving core FinancePy concepts.
+- **Modernization & Bug Fixes**: Improves outdated functionality while preserving core FinancePy concepts. Possible now to build Roundtrip proof OIS discount and forward curves
 
 ## 📦 Installation
 
