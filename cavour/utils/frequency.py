@@ -1,10 +1,4 @@
-##############################################################################
-# Cavour 0.1 2024
-##############################################################################
-
 from ..utils.error import LibError
-
-###############################################################################
 
 from enum import Enum
 
@@ -18,8 +12,6 @@ class FrequencyTypes(Enum):
     QUARTERLY = 4
     MONTHLY = 12
     CONTINUOUS = 99
-
-###############################################################################
 
 
 def annual_frequency(freq_type: FrequencyTypes):
@@ -44,5 +36,3 @@ def annual_frequency(freq_type: FrequencyTypes):
         return 4.0
     elif freq_type == FrequencyTypes.MONTHLY:
         return 12.0
-
-###############################################################################

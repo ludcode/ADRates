@@ -6,6 +6,8 @@ import numpy as np
 from scipy import optimize
 from scipy.interpolate import interp1d
 import copy
+import jax.numpy as jnp
+from jax import grad, hessian
 
 from ...utils.error import LibError
 from ...utils.date import Date
@@ -56,7 +58,87 @@ class OISCurve(DiscountCurve):
         self._interp_type = interp_type
         self._check_refit = check_refit
         self._interpolator = None
-        self._build_curve()
+        swap_rates = self._prepare_curve_builder_inputs()
+        self._build_curve_ad(swap_rates)
+
+###############################################################################
+
+    def _prepare_curve_builder_inputs(self):
+        """ Construct the discount curve using a bootstrap approach. This is
+        the linear swap rate method that is fast and exact as it does not
+        require the use of a solver. It is also market standard.
+        Adjusted for automatic differentiation """
+
+        self._dc_type = self._used_swaps[0]._float_leg._dc_type
+        self._times = jnp.array([])
+        self._dfs = jnp.array([])
+
+        # time zero is now.
+        df_mat = 1.0
+        self._times = jnp.append(self._times, 0.0)
+        self._dfs = jnp.append(self._dfs, df_mat)
+
+        swap_rates = []
+        swap_times = []
+
+        # I use the last coupon date for the swap rate interpolation as this
+        # may be different from the maturity date due to a holiday adjustment
+        # and the swap rates need to align with the coupon payment dates
+        for swap in self._used_swaps:
+            swap_rate = swap._fixed_coupon
+            maturity_dt = swap._adjusted_fixed_dts[-1]
+            tswap = (maturity_dt - self._value_dt) / gDaysInYear
+            swap_times.append(tswap)
+            swap_rates.append(swap_rate)
+
+        self.swap_times = swap_times
+
+        return swap_rates
+
+    def _build_curve_ad(self, swap_rates):
+
+        pv01 = 0.0
+        df_settle = 1 
+
+        pv01_dict = {}
+        pv01 = 0
+
+        def calculate_single_df(pv01, i, target_maturity=None, step=0):
+            if target_maturity is None:
+                t_mat = self.swap_times[i]
+                #swap_rate = swap_rates[i]
+            else:
+                t_mat = target_maturity
+                #swap_rate = interpolate_loglinear(t_mat)
+            swap_rate = swap_rates[i]
+
+            if len(self._used_swaps[i]._fixed_leg._year_fracs) == 1:
+                acc = self._used_swaps[i]._fixed_leg._year_fracs[0]
+                pv01_end = (acc * swap_rate + 1.0)
+                df_mat = (df_settle) / pv01_end
+                pv01 = acc * df_mat
+            else:
+                acc = self._used_swaps[i]._fixed_leg._year_fracs[-1]
+                last_payment = sum(self._used_swaps[i]._fixed_leg._year_fracs[:-1-step])
+                if round(last_payment , 1) not in pv01_dict:
+                    step += 1
+                    pv01_dict[round(last_payment,1)] = calculate_single_df(pv01, i, last_payment, step)
+
+                pv01_end = (acc * swap_rate + 1)
+                df_mat = (df_settle - swap_rate * pv01_dict[round(last_payment,1)]) / pv01_end
+                pv01 = pv01_dict[round(last_payment,1)] + acc * df_mat
+
+            self._times = np.append(self._times, t_mat)
+            self._dfs = np.append(self._dfs, df_mat)
+
+            pv01_dict[round(t_mat,1)] = pv01
+
+            step = 0
+
+            return pv01
+        
+        for i in range(0, len(self._used_swaps)):
+            pv01 = calculate_single_df(pv01, i)
 
 ###############################################################################
 
