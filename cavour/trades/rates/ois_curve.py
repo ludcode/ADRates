@@ -118,7 +118,7 @@ class OISCurve(DiscountCurve):
                 df_mat = (df_settle) / pv01_end
                 pv01 = acc * df_mat
             else:
-                acc = self._used_swaps[i]._fixed_leg._year_fracs[-1]
+                acc = self._used_swaps[i]._fixed_leg._year_fracs[-1-step]
                 last_payment = sum(self._used_swaps[i]._fixed_leg._year_fracs[:-1-step])
                 if round(last_payment , 1) not in pv01_dict:
                     step += 1
