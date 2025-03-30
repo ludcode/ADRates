@@ -13,6 +13,6 @@
 Clone the repository and install dependencies:
 
 ```bash
-git clone https://github.com/ludocode/ADRates.git
+git clone https://github.com/ludcode/ADRates.git
 cd ADRates
 pip install -r requirements.txt
