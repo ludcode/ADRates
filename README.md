@@ -25,3 +25,8 @@ git clone https://github.com/ludocode/ADRates.git
 cd ADRates
 pip install -r requirements.txt
 
+> **AI/ML Usage Notice**  
+> This repository’s source code is made available under the MIT License **for human review and development only.**  
+> **No part of this codebase may be used to train, fine-tune, evaluate, or benchmark any machine-learning or AI model** (including large language models) without the express prior written permission of the author.
+
+
