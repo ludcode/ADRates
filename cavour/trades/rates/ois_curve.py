@@ -8,6 +8,7 @@ from scipy.interpolate import interp1d
 import copy
 import jax.numpy as jnp
 from jax import grad, hessian
+import jax
 
 from ...utils.error import LibError
 from ...utils.date import Date
@@ -19,6 +20,8 @@ from ...market.curves.discount_curve import DiscountCurve
 from ...trades.rates.ois import OIS
 
 SWAP_TOL = 1e-10
+
+jax.config.update("jax_enable_x64", True)
 
 
 class OISCurve(DiscountCurve):
@@ -80,6 +83,7 @@ class OISCurve(DiscountCurve):
 
         swap_rates = []
         swap_times = []
+        year_fracs = []
 
         # I use the last coupon date for the swap rate interpolation as this
         # may be different from the maturity date due to a holiday adjustment
@@ -88,10 +92,14 @@ class OISCurve(DiscountCurve):
             swap_rate = swap._fixed_coupon
             maturity_dt = swap._adjusted_fixed_dts[-1]
             tswap = (maturity_dt - self._value_dt) / gDaysInYear
+            year_frac = swap._fixed_leg._year_fracs
             swap_times.append(tswap)
             swap_rates.append(swap_rate)
+            year_fracs.append(year_frac)
 
         self.swap_times = swap_times
+        self.swap_rates = swap_rates
+        self.year_fracs = year_fracs
 
         return swap_rates
 
@@ -128,8 +136,8 @@ class OISCurve(DiscountCurve):
                 df_mat = (df_settle - swap_rate * pv01_dict[round(last_payment,1)]) / pv01_end
                 pv01 = pv01_dict[round(last_payment,1)] + acc * df_mat
 
-            self._times = np.append(self._times, t_mat)
-            self._dfs = np.append(self._dfs, df_mat)
+            self._times = jnp.append(self._times, t_mat)
+            self._dfs = jnp.append(self._dfs, df_mat)
 
             pv01_dict[round(t_mat,1)] = pv01
 
@@ -139,6 +147,8 @@ class OISCurve(DiscountCurve):
         
         for i in range(0, len(self._used_swaps)):
             pv01 = calculate_single_df(pv01, i)
+
+        return self._times, self._dfs
 
 ###############################################################################
 
