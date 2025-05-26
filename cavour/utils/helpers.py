@@ -9,6 +9,8 @@ from numba import njit, float64
 from typing import Union
 from prettytable import PrettyTable
 
+
+from cavour.market.curves.interpolator import Interpolator, InterpTypes, interpolate
 from .date import Date
 from .global_vars import gDaysInYear, g_small
 from .error import LibError
@@ -547,3 +549,45 @@ def check_argument_types(func, values):
             raise LibError("Argument Type Error")
 
 ###############################################################################
+
+# def interpolator_helper(self,
+#         dt: (list, Date),
+#         day_count=DayCountTypes.ACT_ACT_ISDA,
+#         value_dt: (Date),
+#         interp_type):
+#     ''' Function to calculate a discount factor from a date or a
+#     vector of dates. The day count determines how dates get converted to
+#     years. I allow this to default to ACT_ACT_ISDA unless specified. '''
+
+#     times = times_from_dates(dt, value_dt, day_count)
+#     dfs = independent_interpolator(times, interp_type)
+
+#     if isinstance(dfs, float):
+#         return dfs
+#     else:
+#         return np.array(dfs)
+    
+# def independent_interpolator(self,
+#         t: (float, np.ndarray),
+#         dfs
+#         interp_type):
+#     """ Hidden function to calculate a discount factor from a time or a
+#     vector of times. Discourage usage in favour of passing in dates. """
+
+#     if interp_type is InterpTypes.FLAT_FWD_RATES or \
+#             interp_type is InterpTypes.LINEAR_ZERO_RATES or \
+#             interp_type is InterpTypes.LINEAR_FWD_RATES:
+
+#         df = interpolate(t,
+#                             self._times,
+#                             self._dfs,
+#                             interp_type.value)
+
+#     else:
+
+#         #raise LibError(f"{interp_type} not allowed")
+#         interpolator = Interpolator(interp_type)
+#         interpolator.fit(self._times, self._dfs)
+#         df = interpolator.interpolate(t)
+
+#     return df

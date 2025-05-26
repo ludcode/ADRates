@@ -14,8 +14,9 @@ from ...utils.calendar import CalendarTypes,  DateGenRuleTypes
 from ...utils.calendar import Calendar, BusDayAdjustTypes
 from ...utils.helpers import check_argument_types, label_to_string
 from ...utils.math import ONE_MILLION
-from ...utils.global_types import SwapTypes
+from ...utils.global_types import SwapTypes,InstrumentTypes
 from ...market.curves.discount_curve import DiscountCurve
+from ...market.position.position import Position
 
 from .swap_fixed_leg import SwapFixedLeg
 from .swap_float_leg import SwapFloatLeg
@@ -89,6 +90,8 @@ class OIS:
 
         check_argument_types(self.__init__, locals())
 
+        self.derivative_type = InstrumentTypes.OIS_SWAP
+
         if isinstance(term_dt_or_tenor, Date):
             self._termination_dt = term_dt_or_tenor
         else:
@@ -145,6 +148,17 @@ class OIS:
         self._start_dt = self._fixed_leg._effective_dt
         self._notional = notional
 
+
+###############################################################################
+
+    def position(self,
+                 model,
+                #  amount,
+                #  direction
+                 ):
+        
+        return Position(self, model)# , amount, direction)
+
 ###############################################################################
 
     def value(self,
@@ -176,6 +190,7 @@ class OIS:
 
         value = fixed_leg_value + float_leg_value
         return value
+    
     
 ###############################################################################
 

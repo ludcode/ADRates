@@ -11,7 +11,7 @@ from ...utils.calendar import CalendarTypes,  DateGenRuleTypes
 from ...utils.calendar import Calendar, BusDayAdjustTypes
 from ...utils.schedule import Schedule
 from ...utils.helpers import format_table, label_to_string, check_argument_types
-from ...utils.global_types import SwapTypes
+from ...utils.global_types import SwapTypes, InstrumentTypes
 from ...market.curves.discount_curve import DiscountCurve
 
 ##########################################################################
@@ -39,6 +39,8 @@ class SwapFixedLeg:
         """ Create the fixed leg of a swap contract giving the contract start
         date, its maturity, fixed coupon, fixed leg frequency, fixed leg day
         count convention and notional.  """
+
+        self.intrument_type = InstrumentTypes.SWAP_FIXED_LEG
 
         check_argument_types(self.__init__, locals())
 
@@ -153,6 +155,55 @@ class SwapFixedLeg:
 ###############################################################################
 
     def value(self,
+              value_dt: Date,
+              discount_curve: DiscountCurve):
+
+        self._payment_dfs = []
+        self._payment_pvs = []
+        self._cumulative_pvs = []
+
+        notional = self._notional
+        df_value = discount_curve.df(value_dt,self._dc_type)
+        leg_pv = 0.0
+        num_payments = len(self._payment_dts)
+
+        df_pmnt = 0.0
+
+        for i_pmnt in range(0, num_payments):
+
+            pmnt_dt = self._payment_dts[i_pmnt]
+            pmnt_amount = self._payments[i_pmnt]
+
+            if pmnt_dt > value_dt:
+
+                df_pmnt = discount_curve.df(pmnt_dt,self._dc_type) / df_value
+                pmnt_pv = pmnt_amount * df_pmnt
+                leg_pv += pmnt_pv
+
+                self._payment_dfs.append(df_pmnt)
+                self._payment_pvs.append(pmnt_amount*df_pmnt)
+                self._cumulative_pvs.append(leg_pv)
+
+            else:
+
+                self._payment_dfs.append(0.0)
+                self._payment_pvs.append(0.0)
+                self._cumulative_pvs.append(0.0)
+
+        if pmnt_dt > value_dt:
+            payment_pv = self._principal * df_pmnt * notional
+            self._payment_pvs[-1] += payment_pv
+            leg_pv += payment_pv
+            self._cumulative_pvs[-1] = leg_pv
+
+        if self._leg_type == SwapTypes.PAY:
+            leg_pv = leg_pv * (-1.0)
+
+        return leg_pv
+    
+###############################################################################
+
+    def value_agnostic(self,
               value_dt: Date,
               discount_curve: DiscountCurve):
 

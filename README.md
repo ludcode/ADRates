@@ -1,12 +1,26 @@
 # ADRates
 
-**ADRates** is a limited and modernized fork of an early version of [Dominic O'Kane](https://www.edhec.edu/en/research-and-faculty/faculty/professors-and-researchers/dominic-o-kane) teaching materials, created by one of its (former) students. The project aims to enhance the library with improved **Overnight Index Swap (OIS) curve building** and **Automatic Differentiation (AD)** for computing **delta** and **gamma** of interest rate swaps.
+**ADRates** is a modern, Python‐based library for building Overnight Index Swap (OIS) discount curves and computing sensitivities (delta and gamma) of interest rate swaps via Automatic Differentiation (AD).
 
 ## 🚀 Features
 
-- **Enhanced OIS Curve Construction**: More robust and flexible methodologies for discount curve bootstrapping.
-- **Automatic Differentiation for Greeks**: Uses AD to compute **delta** and **gamma**, making risk calculations more efficient.
-- **Modernization & Bug Fixes**: Improves outdated functionality while preserving core FinancePy concepts. Possible now to build Roundtrip proof OIS discount and forward curves
+- **Robust OIS Curve Construction**  
+  Flexible bootstrapping routines for building arbitrage‐free discount and forward curves from market quotes.
+
+- **Automatic Differentiation of Greeks**  
+  Compute first‐order (delta) and second‐order (gamma) sensitivities of swap PVs directly via AD, without finite‐difference approximations.
+
+- **Modern API & Performance**  
+  Designed for JAX integration, enabling vectorized, just-in-time compilation and GPU acceleration.
+
+- **Round-Trip Curve Consistency**  
+  Build discount and forward curves that reproduce input swap rates exactly, ensuring theoretical consistency.
+
+> **AI/ML Usage Notice**  
+> This repository’s source code is made available under the MIT License **for human review and development only.**  
+> **No part of this codebase may be used to train, fine-tune, evaluate, or benchmark any machine-learning or AI model** (including large language models) without the express prior written permission of the author.
+
+
 
 ## 📦 Installation
 
@@ -16,3 +30,7 @@ Clone the repository and install dependencies:
 git clone https://github.com/ludcode/ADRates.git
 cd ADRates
 pip install -r requirements.txt
+
+
+
+

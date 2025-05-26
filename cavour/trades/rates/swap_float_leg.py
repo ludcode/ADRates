@@ -318,6 +318,97 @@ class SwapFloatLeg:
             leg_pv = leg_pv * (-1.0)
 
         return leg_pv
+    
+###############################################################################
+
+    def value_ad2(self,
+              value_dt: Date,  # This should be the settlement date
+              discount_curve: list,
+              index_curve: list,
+              first_fixing_rate: float = None):
+        """ Value the floating leg with payments from an index curve and
+        discounting based on a supplied discount curve as of the valuation date
+        supplied. For an existing swap, the user must enter the next fixing
+        coupon. """
+
+        if discount_curve is None:
+            raise LibError("Discount curve is None")
+
+        if index_curve is None:
+            index_curve = discount_curve
+
+        self._rates = []
+        self._payments = []
+        self._payment_dfs = []
+        self._payment_pvs = []
+        self._cumulative_pvs = []
+
+        df_value = discount_curve.df(value_dt,self._dc_type)
+        leg_pv = 0.0
+        num_payments = len(self._payment_dts)
+        first_payment = False
+
+        if not len(self._notional_array):
+            self._notional_array = [self._notional] * num_payments
+
+        index_basis = index_curve._dc_type
+        index_day_counter = DayCount(index_basis)
+
+        for i_pmnt in range(0, num_payments):
+
+            pmnt_dt = self._payment_dts[i_pmnt]
+
+            if pmnt_dt > value_dt:
+
+                start_accrued_dt = self._start_accrued_dts[i_pmnt]
+                end_accrued_dt = self._end_accrued_dts[i_pmnt]
+                pay_alpha = self._year_fracs[i_pmnt]
+
+                (index_alpha, num, _) = index_day_counter.year_frac(start_accrued_dt,
+                                                                    end_accrued_dt)
+
+                if first_payment is False and first_fixing_rate is not None:
+
+                    fwd_rate = first_fixing_rate
+                    first_payment = True
+
+                else:
+
+                    df_start = index_curve.df(start_accrued_dt,self._dc_type)
+                    df_end = index_curve.df(end_accrued_dt,self._dc_type)
+                    fwd_rate = (df_start / df_end - 1.0) / index_alpha
+
+                pmntAmount = (fwd_rate + self._spread) * \
+                    pay_alpha * self._notional_array[i_pmnt]
+
+                df_pmnt = discount_curve.df(pmnt_dt,self._dc_type) / df_value
+                pmnt_pv = pmntAmount * df_pmnt
+                leg_pv += pmnt_pv
+
+                self._rates.append(fwd_rate)
+                self._payments.append(pmntAmount)
+                self._payment_dfs.append(df_pmnt)
+                self._payment_pvs.append(pmnt_pv)
+                self._cumulative_pvs.append(leg_pv)
+
+            else:
+
+                self._rates.append(0.0)
+                self._payments.append(0.0)
+                self._payment_dfs.append(0.0)
+                self._payment_pvs.append(0.0)
+                self._cumulative_pvs.append(leg_pv)
+
+        if pmnt_dt > value_dt:
+            payment_pv = self._principal * df_pmnt * self._notional_array[-1]
+            self._payment_pvs[-1] += payment_pv
+            leg_pv += payment_pv
+            self._cumulative_pvs[-1] = leg_pv
+
+        if self._leg_type == SwapTypes.PAY:
+            leg_pv = leg_pv * (-1.0)
+
+        return leg_pv
 
 ##########################################################################
 
