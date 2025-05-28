@@ -1,13 +1,19 @@
 "Create Position to value derivatives"
 
 import jax
+from functools import partial
 
 from cavour.market.curves.interpolator import *
-from cavour.utils import *
+from cavour.utils.helpers import to_tenor, times_from_dates
+from cavour.utils.date import Date
 from cavour.market.curves.interpolator_ad import InterpolatorAd
-from ...utils.global_types import (SwapTypes, 
+from cavour.requests.results import Valuation, Risk, Delta, AnalyticsResult
+from cavour.utils.global_types import (SwapTypes, 
                                    InstrumentTypes, 
-                                   RequestTypes)
+                                   RequestTypes,
+                                   CurveTypes)
+from cavour.utils.currency import CurrencyTypes
+
 
 class Position:
     def __init__(self,
@@ -70,18 +76,16 @@ class Position:
                             self.model._interp_type,
                             None)
 
-                    arr1 = jnp.stack(fixed_risk)   # shape (N,)
-                    arr2 = jnp.stack(floating_risk)   # shape (N,)
-
                     # now sum along axis=0 to get an array of length N
-                    compute_output['delta'] = jnp.stack([arr1, arr2]).sum(axis=0)
+                    compute_output['delta'] = fixed_risk + floating_risk
 
         else:
             raise LibError(f"{self.derivative.derivative_type} not yet implemented")
 
+        analytics_results = AnalyticsResult(value=compute_output['value'],
+                                            risk=compute_output['delta'])
 
-
-        return compute_output
+        return analytics_results
 
     def _value(self):
 
@@ -222,6 +226,28 @@ class Position:
         )
         return pure_fn(swap_rates)   # we only differentiate w.r.t. swap_rates
 
+    def valuation_fixed_leg(self,
+                        swap_rates, 
+                        swap_times, 
+                        year_fracs,
+                        fixed_leg_details,
+                        value_dt: Date,
+                        interpolator_dc_type):
+        
+        val = self.value_fixed_leg(
+                        swap_rates, 
+                        swap_times, 
+                        year_fracs,
+                        fixed_leg_details,
+                        value_dt,
+                        interpolator_dc_type
+        )
+
+        valuation = Valuation(amount=val.item(),
+                              currency=CurrencyTypes.NONE)
+        
+        return valuation
+
     def delta_fixed_leg(self,
                     swap_rates, 
                     swap_times, 
@@ -241,8 +267,15 @@ class Position:
         sensitivities = grad_price(swap_rates)
 
         sensies = [x * 1e-4 for x in sensitivities]
+
+        tenors = to_tenor(swap_times)
+
+        delta= Delta(risk_ladder=sensies, 
+              tenors=tenors,
+              currency=CurrencyTypes.GBP, 
+              curve_type=CurveTypes.SONIA)
     
-        return sensies
+        return delta
     
 
     def _float_leg_jax(self,
@@ -388,6 +421,31 @@ class Position:
         # 5) Call it with swap_rates as the only differentiable arg
         return pure_fn(swap_rates)
     
+    def valuation_float_leg(self,
+                    swap_rates,
+                    swap_times,
+                    year_fracs,
+                    floating_leg_details,
+                    value_dt,
+                    discount_curve_type,
+                    index_curve_type = None,
+                    first_fixing_rate = None):
+
+        val = self.value_float_leg(self,
+                    swap_rates,
+                    swap_times,
+                    year_fracs,
+                    floating_leg_details,
+                    value_dt,
+                    discount_curve_type,
+                    index_curve_type,
+                    first_fixing_rate)
+        
+        valuation = Valuation(amount=val.item(),
+                              currency=CurrencyTypes.NONE)
+        
+        return valuation
+
     def delta_float_leg(self,
                     swap_rates,
                     swap_times,
@@ -412,6 +470,13 @@ class Position:
 
         sensies = [x * 1e-4 for x in sensitivities]
     
-        return sensies
+        tenors = to_tenor(swap_times)
+
+        delta= Delta(risk_ladder=sensies, 
+              tenors=tenors,
+              currency=CurrencyTypes.GBP, 
+              curve_type=CurveTypes.SONIA)
+    
+        return delta
 
 
