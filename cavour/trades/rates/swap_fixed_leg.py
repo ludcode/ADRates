@@ -7,6 +7,7 @@ from ...utils.date import Date
 from ...utils.math import ONE_MILLION
 from ...utils.day_count import DayCount, DayCountTypes
 from ...utils.frequency import FrequencyTypes
+from ...utils.global_types import CurveTypes
 from ...utils.calendar import CalendarTypes,  DateGenRuleTypes
 from ...utils.calendar import Calendar, BusDayAdjustTypes
 from ...utils.schedule import Schedule
@@ -35,7 +36,8 @@ class SwapFixedLeg:
                  cal_type: CalendarTypes = CalendarTypes.WEEKEND,
                  bd_type: BusDayAdjustTypes = BusDayAdjustTypes.FOLLOWING,
                  dg_type: DateGenRuleTypes = DateGenRuleTypes.BACKWARD,
-                 end_of_month: bool = False):
+                 end_of_month: bool = False,
+                 floating_index: CurveTypes = CurveTypes.SONIA):
         """ Create the fixed leg of a swap contract giving the contract start
         date, its maturity, fixed coupon, fixed leg frequency, fixed leg day
         count convention and notional.  """
@@ -65,6 +67,7 @@ class SwapFixedLeg:
         self._notional = notional
         self._principal = principal
         self._cpn = coupon
+        self._floating_index = floating_index
 
         self._dc_type = dc_type
         self._cal_type = cal_type

@@ -10,6 +10,7 @@ from ...utils.error import LibError
 from ...utils.date import Date
 from ...utils.day_count import DayCountTypes
 from ...utils.frequency import FrequencyTypes
+from ...utils.global_types import CurveTypes
 from ...utils.calendar import CalendarTypes,  DateGenRuleTypes
 from ...utils.calendar import Calendar, BusDayAdjustTypes
 from ...utils.helpers import check_argument_types, label_to_string
@@ -78,7 +79,8 @@ class OIS:
                  float_dc_type: DayCountTypes = DayCountTypes.THIRTY_E_360,
                  cal_type: CalendarTypes = CalendarTypes.WEEKEND,
                  bd_type: BusDayAdjustTypes = BusDayAdjustTypes.FOLLOWING,
-                 dg_type: DateGenRuleTypes = DateGenRuleTypes.BACKWARD):
+                 dg_type: DateGenRuleTypes = DateGenRuleTypes.BACKWARD,
+                 floating_index: CurveTypes = CurveTypes.SONIA):
         """ Create an overnight index swap contract giving the contract start
         date, its maturity, fixed coupon, fixed leg frequency, fixed leg day
         count convention and notional. The floating leg parameters have default
@@ -113,6 +115,8 @@ class OIS:
 
         principal = 0.0
 
+        self._floating_index = floating_index
+
         self._fixed_leg = SwapFixedLeg(effective_dt,
                                        self._termination_dt,
                                        fixed_leg_type,
@@ -124,7 +128,9 @@ class OIS:
                                        payment_lag,
                                        cal_type,
                                        bd_type,
-                                       dg_type)
+                                       dg_type,
+                                       False,
+                                       floating_index)
 
         self._float_leg = SwapFloatLeg(effective_dt,
                                        self._termination_dt,
@@ -137,7 +143,9 @@ class OIS:
                                        payment_lag,
                                        cal_type,
                                        bd_type,
-                                       dg_type)
+                                       dg_type,
+                                       False,
+                                       floating_index)
         
 
         #TEMP Ludo

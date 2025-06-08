@@ -12,7 +12,10 @@ import jax
 
 from ...utils.error import LibError
 from ...utils.date import Date
-from ...utils.helpers import check_argument_types, _func_name
+from ...utils.helpers import (check_argument_types,
+                              _func_name, 
+                              label_to_string, 
+                              format_table)
 from ...utils.global_vars import gDaysInYear
 from ...market.curves.interpolator import InterpTypes, Interpolator
 from ...market.curves.discount_curve import DiscountCurve
@@ -75,11 +78,13 @@ class OISCurve(DiscountCurve):
         self._dc_type = self._used_swaps[0]._float_leg._dc_type
         self._times = jnp.array([])
         self._dfs = jnp.array([])
+        self._repr_dfs = jnp.array([])
 
         # time zero is now.
         df_mat = 1.0
         self._times = jnp.append(self._times, 0.0)
         self._dfs = jnp.append(self._dfs, df_mat)
+        self._repr_dfs = jnp.append(self._repr_dfs, df_mat)
 
         swap_rates = []
         swap_times = []
@@ -138,6 +143,9 @@ class OISCurve(DiscountCurve):
 
             self._times = jnp.append(self._times, t_mat)
             self._dfs = jnp.append(self._dfs, df_mat)
+
+            if target_maturity is None:
+               self._repr_dfs = jnp.append(self._repr_dfs, df_mat)
 
             pv01_dict[round(t_mat,1)] = pv01
 
@@ -300,3 +308,30 @@ class OISCurve(DiscountCurve):
                 swap.print_fixed_leg_pv()
                 swap.print_float_leg_pv()
                 raise LibError(f"Swap with maturity {swap._maturity_dt} not repriced. Difference is {abs(v)}")
+
+    def __repr__(self):
+
+        s = label_to_string("OBJECT TYPE", type(self).__name__)
+        num_points = len(self.swap_rates)
+        s += label_to_string("DATES", "DISCOUNT FACTORS")
+        for i in range(0, num_points):
+            s += label_to_string("%12s" % self.swap_times[i],
+                                 "%12.8f" % self.swap_rates[i])
+            
+        header = ["TENORS", "YEAR_FRACTION", "RATES", "DFs"]
+
+        rows = []
+
+        for i in range(0, len(self.swap_rates)):
+            rows.append([
+                round(self.swap_times[i],4),
+                round(self.year_fracs[i][-1],4),
+                round(self.swap_rates[i],4),
+                round(self._repr_dfs[i],4),
+            ])
+
+        table = format_table(header, rows)
+        print("\nCURVE DETAILS:")
+        print(table)
+
+        return "xGamma_v0.1"
