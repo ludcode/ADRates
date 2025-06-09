@@ -1,4 +1,5 @@
-"Create Position to value derivatives"
+
+"Valuation Engine"
 
 import jax
 from functools import partial
@@ -7,63 +8,117 @@ from cavour.market.curves.interpolator import *
 from cavour.utils.helpers import to_tenor, times_from_dates
 from cavour.utils.date import Date
 from cavour.market.curves.interpolator_ad import InterpolatorAd
-from cavour.requests.results import Valuation, Risk, Delta, AnalyticsResult
+from cavour.requests.results import Valuation, Gamma, Delta, AnalyticsResult
 from cavour.utils.global_types import (SwapTypes, 
                                    InstrumentTypes, 
                                    RequestTypes,
                                    CurveTypes)
 from cavour.utils.currency import CurrencyTypes
-from cavour.market.position.engine import Engine
 
 
-class Position:
+
+class Engine:
     def __init__(self,
-                 derivative,
                  model):
-        
-        self.derivative = derivative
+
         self.model = model
 
-        self._engine = Engine(model)
+    def valuation(self,
+                  derivative):
 
+        if derivative.derivative_type == InstrumentTypes.OIS_SWAP:
 
-        #TODO: Remove from lower classes and move to position()
-        # self.amount = amount
-        # self.direction = direction
+            ir_model = getattr(self.model.curves, derivative._floating_index.name)
 
-    def compute(self, request_list):
+            fixed_value = self.value_fixed_leg(
+                    ir_model.swap_rates, 
+                    ir_model.swap_times, 
+                    ir_model.year_fracs,
+                    derivative._fixed_leg,
+                    ir_model._value_dt,
+                    ir_model._interp_type
+            )
 
-        compute_output = {}
+            floating_value = self.value_float_leg(
+                    ir_model.swap_rates, 
+                    ir_model.swap_times, 
+                    ir_model.year_fracs,
+                    derivative._float_leg,
+                    ir_model._value_dt,
+                    ir_model._interp_type,
+                    ir_model._interp_type,
+                    None)
+            
+            return fixed_value + floating_value
 
-        if self.derivative.derivative_type == InstrumentTypes.OIS_SWAP:
+        else:
+            raise LibError(f"{self.derivative.derivative_type} not yet implemented")
         
-            for req in request_list:
-                if req == RequestTypes.VALUE:
-                    
-                    compute_output['value'] = self._engine.valuation(self.derivative)
+    def delta(self,
+                  derivative):
 
-                if req == RequestTypes.DELTA:
+        if derivative.derivative_type == InstrumentTypes.OIS_SWAP: 
 
-                    compute_output['delta'] = self._engine.delta(self.derivative)
+            ir_model = getattr(self.model.curves, derivative._floating_index.name)
 
-                if req == RequestTypes.GAMMA:
 
-                    compute_output['gamma'] = self._engine.gamma(self.derivative)
+            fixed_risk = self.delta_fixed_leg(
+                    ir_model.swap_rates, 
+                    ir_model.swap_times, 
+                    ir_model.year_fracs,
+                    derivative._fixed_leg,
+                    ir_model._value_dt,
+                    ir_model._interp_type
+            )
+
+            floating_risk = self.delta_float_leg(
+                    ir_model.swap_rates, 
+                    ir_model.swap_times, 
+                    ir_model.year_fracs,
+                    derivative._float_leg,
+                    ir_model._value_dt,
+                    ir_model._interp_type,
+                    ir_model._interp_type,
+                    None)
+            
+            return fixed_risk + floating_risk
 
         else:
             raise LibError(f"{self.derivative.derivative_type} not yet implemented")
 
-        analytics_results = AnalyticsResult(value=compute_output['value'],
-                                            risk=compute_output['delta'],
-                                            gamma = compute_output['gamma'])
+    def gamma(self,
+                derivative):
 
-        return analytics_results
+        if derivative.derivative_type == InstrumentTypes.OIS_SWAP: 
 
-    def _value(self):
+            ir_model = getattr(self.model.curves, derivative._floating_index.name)
 
-        if self.derivative.derivative_type == InstrumentTypes.SWAP_FIXED_LEG:
-            return self._value_swap_fixed_leg()
-        
+
+            fixed_gamma = self.gamma_fixed_leg(
+                    ir_model.swap_rates, 
+                    ir_model.swap_times, 
+                    ir_model.year_fracs,
+                    derivative._fixed_leg,
+                    ir_model._value_dt,
+                    ir_model._interp_type
+            )
+
+            floating_gamma = self.gamma_float_leg(
+                    ir_model.swap_rates, 
+                    ir_model.swap_times, 
+                    ir_model.year_fracs,
+                    derivative._float_leg,
+                    ir_model._value_dt,
+                    ir_model._interp_type,
+                    ir_model._interp_type,
+                    None)
+            
+            return fixed_gamma + floating_gamma
+
+        else:
+            raise LibError(f"{self.derivative.derivative_type} not yet implemented")
+
+
     def build_curve_ad(self, swap_rates, swap_times, year_fracs):
 
         times = [] #jnp.array([])
@@ -248,6 +303,40 @@ class Position:
               curve_type=CurveTypes.SONIA)
     
         return delta
+    
+    def gamma_fixed_leg(self, 
+                        swap_rates, 
+                        swap_times, 
+                        year_fracs,
+                        fixed_leg_details,
+                        value_dt: Date,
+                        interpolator_dc_type):  # Hessian w.r.t. swap_rates
+
+        hess_price = jax.hessian(lambda sr: self.value_fixed_leg(
+            sr,
+            swap_times, 
+            year_fracs,
+            fixed_leg_details,
+            value_dt,
+            interpolator_dc_type))
+        
+        gammas = hess_price(swap_rates)
+
+        # Extract diagonal (second derivative of each rate w.r.t. itself)
+        #gamma_diag = [gammas[i, i] * 1e-4 for i in range(len(swap_rates))]
+
+        # tenors = to_tenor(swap_times)
+
+        # gamma = Gamma(risk_ladder=gamma_diag,
+        #             tenors=tenors,
+        #             currency=CurrencyTypes.GBP,
+        #             curve_type=CurveTypes.SONIA)
+
+        gammas = np.array(gammas, dtype=np.float64) * 1e-8
+
+        gamma = Gamma(gammas, swap_times)
+
+        return gamma
     
 
     def _float_leg_jax(self,
@@ -450,5 +539,42 @@ class Position:
               curve_type=CurveTypes.SONIA)
     
         return delta
+    
+    def gamma_float_leg(self,
+                    swap_rates,
+                    swap_times,
+                    year_fracs,
+                    floating_leg_details,
+                    value_dt,
+                    discount_curve_type,
+                    index_curve_type = None,
+                    first_fixing_rate = None):
+        
+        # Gradient w.r.t. swap_rates:
+        hess_price = jax.hessian(lambda sr: self.value_float_leg(
+            sr, swap_times, year_fracs,
+            floating_leg_details,
+            value_dt,
+            discount_curve_type,
+            index_curve_type,
+            first_fixing_rate
+        ))
+
+        gammas = hess_price(swap_rates)
+
+        # sensies = [x * 1e-4 for x in sensitivities]
+    
+        # tenors = to_tenor(swap_times)
+
+        # delta= Delta(risk_ladder=sensies, 
+        #       tenors=tenors,
+        #       currency=CurrencyTypes.GBP, 
+        #       curve_type=CurveTypes.SONIA)
+    
+        gammas = np.array(gammas, dtype=np.float64) * 1e-8
+
+        gamma = Gamma(gammas, swap_times)
+
+        return gamma
 
 

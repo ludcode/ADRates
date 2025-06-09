@@ -26,3 +26,8 @@ class InterpTypes(Enum):
     NATCUBIC_ZERO_RATES = 9
     PCHIP_ZERO_RATES = 10
     PCHIP_LOG_DISCOUNT = 11
+
+class CurveTypes(Enum):
+    SONIA = 1
+    SOFR = 2
+    ESTR = 3

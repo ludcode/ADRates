@@ -3,10 +3,11 @@
 ##############################################################################
 
 import sys
+import math
 import numpy as np
 import jax.numpy as jnp
 from numba import njit, float64
-from typing import Union
+from typing import Union, List
 from prettytable import PrettyTable
 
 
@@ -156,6 +157,52 @@ def times_from_dates(dt: (Date, list),
         raise LibError("Discount factor must take dates.")
 
     return None
+
+###############################################################################
+
+def to_tenor(x: Union[float, List[float]]) -> Union[str, List[str]]:
+    """
+    Convert a year-fraction (or list of year-fractions) into a tenor string:
+      - < 1 month   → rounded up to the nearest week, “#W”
+      - < 1 year    → rounded to the nearest month, “#M”
+      - ≥ 1 year    → “PY[QM]M” (years plus leftover months)
+    
+    Examples:
+        to_tenor(0.02)       # -> '1W'
+        to_tenor(0.1)        # -> '1M'
+        to_tenor(0.25)       # -> '3M'
+        to_tenor(1.0)        # -> '1Y'
+        to_tenor(1.5)        # -> '1Y6M'
+        to_tenor([0.02,1.5]) # -> ['1W','1Y6M']
+    """
+    def _one(val: float) -> str:
+        # weeks if less than one month
+        if val < 1/12:
+            weeks = math.ceil(val * 365 / 7)
+            return f"{weeks}W"
+        # months if less than one year
+        elif val < 1:
+            months = int(round(val * 12))
+            months = max(months, 1)
+            return f"{months}M"
+        # years + leftover months
+        else:
+            years = int(math.floor(val))
+            rem_months = int(round((val - years) * 12))
+            # e.g. if rem_months==12, roll into a full extra year
+            if rem_months == 12:
+                years += 1
+                rem_months = 0
+            if rem_months == 0:
+                return f"{years}Y"
+            else:
+                return f"{years}Y{rem_months}M"
+
+    if isinstance(x, list):
+        return [_one(v) for v in x]
+    else:
+        return _one(x)
+
 
 ###############################################################################
 
