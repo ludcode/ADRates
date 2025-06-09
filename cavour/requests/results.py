@@ -249,7 +249,6 @@ class Gamma:
         df.index.name = "Tenors"
         # Pretty print
         print(tabulate(df, headers='keys', tablefmt='grid', floatfmt=".2f"))
-        #return matrix
     
     @property
     def to_dict(self) -> dict:
