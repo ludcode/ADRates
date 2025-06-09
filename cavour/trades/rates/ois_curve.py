@@ -288,14 +288,9 @@ class OISCurve(DiscountCurve):
 
 ###############################################################################
 
-    def _check_refits(self, depo_tol, fra_tol, swap_tol):
-        """ Ensure that the Libor curve refits the calibration instruments. """
+    def _check_refits(self, swap_tol):
+        """ Ensure that the OIS curve refits the calibration instruments. """
 
-        for fra in self._used_fras:
-            v = fra.value(self._value_dt, self) / fra._notional
-            if abs(v) > fra_tol:
-                print("Value", v)
-                raise LibError("FRA not repriced.")
 
         for swap in self._used_swaps:
             # We value it as of the start date of the swap
@@ -308,6 +303,8 @@ class OISCurve(DiscountCurve):
                 swap.print_fixed_leg_pv()
                 swap.print_float_leg_pv()
                 raise LibError(f"Swap with maturity {swap._maturity_dt} not repriced. Difference is {abs(v)}")
+
+###############################################################################
 
     def __repr__(self):
 
@@ -334,4 +331,4 @@ class OISCurve(DiscountCurve):
         print("\nCURVE DETAILS:")
         print(table)
 
-        return "xGamma_v0.1"
+        return "Cavour_v0.1"

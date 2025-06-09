@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from tabulate import tabulate
 from typing import List, Tuple, Iterator, Dict, Iterable, Optional, Any
 
 
@@ -234,6 +235,28 @@ class Gamma:
         Return the gamma matrix as a nested dict: {row_tenor: {col_tenor: value}}.
         Assumes risk_ladder is 2D.
         """
+        matrix = self.to_dict
+
+        df = pd.DataFrame(matrix)
+        # Drop all-zero rows and columns
+        df = df.loc[~(df == 0).all(axis=1)]  # drop zero rows
+        df = df.loc[:, ~(df == 0).all(axis=0)]  # drop zero cols
+
+        # Round headers/index for display
+        df.index = [f"{i:.2f}" for i in df.index]
+        df.columns = [f"{c:.2f}" for c in df.columns]
+
+        df.index.name = "Tenors"
+        # Pretty print
+        print(tabulate(df, headers='keys', tablefmt='grid', floatfmt=".2f"))
+        #return matrix
+    
+    @property
+    def to_dict(self) -> dict:
+        """
+        Return the gamma matrix as a nested dict: {row_tenor: {col_tenor: value}}.
+        Assumes risk_ladder is 2D.
+        """
         gamma_np = np.array(self.risk_ladder)
         if gamma_np.ndim != 2:
             raise ValueError("Gamma risk_ladder must be 2D to access matrix")
@@ -250,21 +273,28 @@ class Gamma:
     def plot(self):
         """
         Plot the gamma heatmap using Plotly.
-        - Works for full matrices (2D).
-        - For 1D ladders, converts to diagonal matrix.
+        Trims outer rows/columns if they are all zero.
         """
         gamma_np = np.array(self.risk_ladder, dtype=np.float64)
         if gamma_np.ndim == 1:
-            gamma_np = np.diag(gamma_np)  # make it square
+            gamma_np = np.diag(gamma_np)
+
+        # Identify non-zero rows and columns
+        nonzero_rows = ~np.all(gamma_np == 0, axis=1)
+        nonzero_cols = ~np.all(gamma_np == 0, axis=0)
+        keep_mask = nonzero_rows & nonzero_cols
+
+        trimmed_matrix = gamma_np[np.ix_(keep_mask, keep_mask)]
+        trimmed_tenors = [t for t, keep in zip(self.tenors, keep_mask) if keep]
 
         fig = go.Figure(data=go.Heatmap(
-            z=gamma_np,
-            x=self.tenors,
-            y=self.tenors,
-            colorscale="RdYlGn_r",  # green=low, red=high
+            z=trimmed_matrix,
+            x=trimmed_tenors,
+            y=trimmed_tenors,
+            colorscale="RdYlGn_r",
             colorbar=dict(title="Gamma"),
-            zmin=np.min(gamma_np),
-            zmax=np.max(gamma_np),
+            zmin=np.min(trimmed_matrix),
+            zmax=np.max(trimmed_matrix),
         ))
 
         fig.update_layout(
