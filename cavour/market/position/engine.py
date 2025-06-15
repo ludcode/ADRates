@@ -300,7 +300,7 @@ class Engine:
         delta= Delta(risk_ladder=sensies, 
               tenors=tenors,
               currency=CurrencyTypes.GBP, 
-              curve_type=CurveTypes.SONIA)
+              curve_type=CurveTypes.GBP_OIS_SONIA)
     
         return delta
     
@@ -330,7 +330,7 @@ class Engine:
         # gamma = Gamma(risk_ladder=gamma_diag,
         #             tenors=tenors,
         #             currency=CurrencyTypes.GBP,
-        #             curve_type=CurveTypes.SONIA)
+        #             curve_type=CurveTypes.GBP_OIS_SONIA)
 
         gammas = np.array(gammas, dtype=np.float64) * 1e-8
 
@@ -536,7 +536,7 @@ class Engine:
         delta= Delta(risk_ladder=sensies, 
               tenors=tenors,
               currency=CurrencyTypes.GBP, 
-              curve_type=CurveTypes.SONIA)
+              curve_type=CurveTypes.GBP_OIS_SONIA)
     
         return delta
     
@@ -569,7 +569,7 @@ class Engine:
         # delta= Delta(risk_ladder=sensies, 
         #       tenors=tenors,
         #       currency=CurrencyTypes.GBP, 
-        #       curve_type=CurveTypes.SONIA)
+        #       curve_type=CurveTypes.GBP_OIS_SONIA)
     
         gammas = np.array(gammas, dtype=np.float64) * 1e-8
 

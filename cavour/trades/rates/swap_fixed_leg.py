@@ -37,7 +37,7 @@ class SwapFixedLeg:
                  bd_type: BusDayAdjustTypes = BusDayAdjustTypes.FOLLOWING,
                  dg_type: DateGenRuleTypes = DateGenRuleTypes.BACKWARD,
                  end_of_month: bool = False,
-                 floating_index: CurveTypes = CurveTypes.SONIA):
+                 floating_index: CurveTypes = CurveTypes.GBP_OIS_SONIA):
         """ Create the fixed leg of a swap contract giving the contract start
         date, its maturity, fixed coupon, fixed leg frequency, fixed leg day
         count convention and notional.  """

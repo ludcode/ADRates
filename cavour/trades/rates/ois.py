@@ -80,7 +80,7 @@ class OIS:
                  cal_type: CalendarTypes = CalendarTypes.WEEKEND,
                  bd_type: BusDayAdjustTypes = BusDayAdjustTypes.FOLLOWING,
                  dg_type: DateGenRuleTypes = DateGenRuleTypes.BACKWARD,
-                 floating_index: CurveTypes = CurveTypes.SONIA):
+                 floating_index: CurveTypes = CurveTypes.GBP_OIS_SONIA):
         """ Create an overnight index swap contract giving the contract start
         date, its maturity, fixed coupon, fixed leg frequency, fixed leg day
         count convention and notional. The floating leg parameters have default

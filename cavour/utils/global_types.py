@@ -28,6 +28,6 @@ class InterpTypes(Enum):
     PCHIP_LOG_DISCOUNT = 11
 
 class CurveTypes(Enum):
-    SONIA = 1
-    SOFR = 2
-    ESTR = 3
+    GBP_OIS_SONIA = 1
+    USD_OIS_SOFR = 2
+    EUR_OIS_ESTR = 3

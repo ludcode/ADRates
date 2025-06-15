@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 from cavour.utils import *
 from cavour.trades.rates.ois_curve import OISCurve
 from cavour.trades.rates.ois import OIS
-
+from cavour.marketdata.market_data_constants import MARKET_DATA
+from cavour.marketdata.market_data_engine import MarketCurveBuilder
 
 
 class CurveAccessor:
@@ -23,9 +24,26 @@ class CurveAccessor:
 
 @dataclass
 class Model:
-    value_dt: "datetime.date"
+    value_dt: Date
     _curves_dict: Dict[str, OISCurve] = field(default_factory=dict)
     _curve_params_dict: Dict[str, dict] = field(default_factory=dict)  # ← Add this line
+    
+
+    def prebuilt_curve(
+        self,
+        curve_names: Union[str, List[str]],
+    ):
+        
+        builder = MarketCurveBuilder(MARKET_DATA)
+
+        if isinstance(curve_names, str):
+            curve_names = [curve_names]
+
+        for curve_name in curve_names:
+            curve_inputs = builder.get_curve_inputs(curve_name, self.value_dt)
+            self.build_curve(**curve_inputs)
+            
+
 
     def build_curve(
         self,

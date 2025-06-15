@@ -245,7 +245,7 @@ class Position:
         delta= Delta(risk_ladder=sensies, 
               tenors=tenors,
               currency=CurrencyTypes.GBP, 
-              curve_type=CurveTypes.SONIA)
+              curve_type=CurveTypes.GBP_OIS_SONIA)
     
         return delta
     
@@ -447,7 +447,7 @@ class Position:
         delta= Delta(risk_ladder=sensies, 
               tenors=tenors,
               currency=CurrencyTypes.GBP, 
-              curve_type=CurveTypes.SONIA)
+              curve_type=CurveTypes.GBP_OIS_SONIA)
     
         return delta
 
