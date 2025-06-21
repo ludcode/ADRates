@@ -13,6 +13,7 @@ from ...utils.calendar import Calendar, BusDayAdjustTypes
 from ...utils.schedule import Schedule
 from ...utils.helpers import format_table, label_to_string, check_argument_types
 from ...utils.global_types import SwapTypes
+from ...utils.currency import CurrencyTypes
 from ...market.curves.discount_curve import DiscountCurve
 
 ##########################################################################
@@ -37,7 +38,8 @@ class SwapFloatLeg:
                  bd_type: BusDayAdjustTypes = BusDayAdjustTypes.FOLLOWING,
                  dg_type: DateGenRuleTypes = DateGenRuleTypes.BACKWARD,
                  end_of_month: bool = False,
-                 floating_index: CurveTypes = CurveTypes.GBP_OIS_SONIA):
+                 floating_index: CurveTypes = CurveTypes.GBP_OIS_SONIA,
+                 currency: CurrencyTypes = CurrencyTypes.GBP):        
         """ Create the fixed leg of a swap contract giving the contract start
         date, its maturity, fixed coupon, fixed leg frequency, fixed leg day
         count convention and notional.  """
@@ -67,6 +69,7 @@ class SwapFloatLeg:
         self._notional_array = []
         self._spread = spread
         self._floating_index = floating_index
+        self._currency = currency
 
         self._dc_type = dc_type
         self._cal_type = cal_type

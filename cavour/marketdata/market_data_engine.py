@@ -6,8 +6,10 @@ import math
 
 
 class MarketCurveBuilder:
-    def __init__(self, market_data: Dict[str, dict]):
+    def __init__(self, market_data: Dict[str, dict],
+                 fx_market_data: Dict[str, dict]):
         self.market_data = market_data
+        self.fx_market_data = fx_market_data
 
     def get_curve_inputs(self, curve_key: str, value_date: Date):
         value_dt = value_date.datetime()
@@ -45,6 +47,44 @@ class MarketCurveBuilder:
             "bus_day_type": conventions["business_day_adjustment"],
             "interp_type": conventions["interp_type"]
         }
+    
+    def get_fx_rates(self, fx_key: list[str], value_date: Date):
+        value_dt = value_date.datetime()
+        field = "PX_LAST"
+
+        if fx_key == ["ALL"]:
+            fx_return = self.fx_market_data
+            ticker_list = []
+            tickers = []
+            for pair, details in self.fx_market_data.items():
+                ticker_list.append(details['ticker'])
+                tickers.append(pair)
+        else:
+            fx_return = {key:val for key,val in self.fx_market_data.items() if key in fx_key}
+            fx_ticker_dict = {key:val['ticker'] for key,val in self.fx_market_data.items() if key in fx_key}
+            ticker_list = list(fx_ticker_dict.values())
+            tickers = list(fx_ticker_dict.keys())
+
+        # Fetch prices
+        df = blp.bdh(
+            tickers=ticker_list,
+            flds=field,
+            start_date=value_dt,
+            end_date=value_dt,
+            Per="D"
+        )
+
+        px_list = [df[ticker][field].iloc[0] for ticker in ticker_list]
+
+        fx_pairs = dict(zip(tickers,px_list))
+
+        for pair, price in fx_pairs.items():
+            if pair in fx_return:
+                fx_return[pair]["price"] = float(price)
+
+
+        return fx_return
+
     
 
 class FXRoutingEngine:

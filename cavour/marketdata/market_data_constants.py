@@ -48,3 +48,86 @@ MARKET_DATA = {
         "index": "SONIA"
     }
 }
+
+FX_MARKET_DATA = {
+    # USD Majors
+    "EURUSD": {
+        "base": CurrencyTypes.EUR,
+        "quote": CurrencyTypes.USD,
+        "ticker": "EURUSD Curncy"
+    },
+    "GBPUSD": {
+        "base": CurrencyTypes.GBP,
+        "quote": CurrencyTypes.USD,
+        "ticker": "GBPUSD Curncy"
+    },
+    "USDCHF": {
+        "base": CurrencyTypes.USD,
+        "quote": CurrencyTypes.CHF,
+        "ticker": "USDCHF Curncy"
+    },
+    "USDCAD": {
+        "base": CurrencyTypes.USD,
+        "quote": CurrencyTypes.CAD,
+        "ticker": "USDCAD Curncy"
+    },
+    "AUDUSD": {
+        "base": CurrencyTypes.AUD,
+        "quote": CurrencyTypes.USD,
+        "ticker": "AUDUSD Curncy"
+    },
+    "NZDUSD": {
+        "base": CurrencyTypes.NZD,
+        "quote": CurrencyTypes.USD,
+        "ticker": "NZDUSD Curncy"
+    },
+    "USDJPY": {
+        "base": CurrencyTypes.USD,
+        "quote": CurrencyTypes.JPY,
+        "ticker": "USDJPY Curncy"
+    },
+    "USDSEK": {
+        "base": CurrencyTypes.USD,
+        "quote": CurrencyTypes.SEK,
+        "ticker": "USDSEK Curncy"
+    },
+    "USDNOK": {
+        "base": CurrencyTypes.USD,
+        "quote": CurrencyTypes.NOK,
+        "ticker": "USDNOK Curncy"
+    },
+    "USDDKK": {
+        "base": CurrencyTypes.USD,
+        "quote": CurrencyTypes.DKK,
+        "ticker": "USDDKK Curncy"
+    },
+    "USDHKD": {
+        "base": CurrencyTypes.USD,
+        "quote": CurrencyTypes.HKD,
+        "ticker": "USDHKD Curncy"
+    },
+
+    # European currencies vs EUR
+    "EURPLN": {
+        "base": CurrencyTypes.EUR,
+        "quote": CurrencyTypes.PLN,
+        "ticker": "EURPLN Curncy"
+    },
+    "EURRON": {
+        "base": CurrencyTypes.EUR,
+        "quote": CurrencyTypes.RON,
+        "ticker": "EURRON Curncy"
+    },
+
+    # Direct USD pairs (often traded too)
+    "USDPLN": {
+        "base": CurrencyTypes.USD,
+        "quote": CurrencyTypes.PLN,
+        "ticker": "USDPLN Curncy"
+    },
+    "USDRON": {
+        "base": CurrencyTypes.USD,
+        "quote": CurrencyTypes.RON,
+        "ticker": "USDRON Curncy"
+    }
+}

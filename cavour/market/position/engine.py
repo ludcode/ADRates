@@ -30,7 +30,7 @@ class Engine:
 
             ir_model = getattr(self.model.curves, derivative._floating_index.name)
 
-            fixed_value = self.value_fixed_leg(
+            fixed_value = self.valuation_fixed_leg(
                     ir_model.swap_rates, 
                     ir_model.swap_times, 
                     ir_model.year_fracs,
@@ -39,15 +39,15 @@ class Engine:
                     ir_model._interp_type
             )
 
-            floating_value = self.value_float_leg(
-                    ir_model.swap_rates, 
-                    ir_model.swap_times, 
-                    ir_model.year_fracs,
-                    derivative._float_leg,
-                    ir_model._value_dt,
-                    ir_model._interp_type,
-                    ir_model._interp_type,
-                    None)
+            floating_value = self.valuation_float_leg(
+                    swap_rates = ir_model.swap_rates, 
+                    swap_times = ir_model.swap_times, 
+                    year_fracs = ir_model.year_fracs,
+                    floating_leg_details = derivative._float_leg,
+                    value_dt = ir_model._value_dt,
+                    discount_curve_type = ir_model._interp_type,
+                    index_curve_type = ir_model._interp_type,
+                    first_fixing_rate = None)
             
             return fixed_value + floating_value
 
@@ -271,7 +271,7 @@ class Engine:
         )
 
         valuation = Valuation(amount=val.item(),
-                              currency=CurrencyTypes.NONE)
+                              currency=fixed_leg_details._currency)
         
         return valuation
 
@@ -370,7 +370,7 @@ class Engine:
         # d) Vectorised forward rates
         fwd = (df_start / df_end - 1.0) / pay_alphas                 # [..., M]
 
-        # only override if the user actually passed a first_fixing_rate
+        # only override if the I actually passed a first_fixing_rate
         first_mask     = jnp.arange(fwd.shape[-1]) == 0             # [M]
         # make it match the batch dims
         first_mask_b   = jnp.broadcast_to(first_mask, fwd.shape)    # [..., M]
@@ -492,7 +492,7 @@ class Engine:
                     index_curve_type = None,
                     first_fixing_rate = None):
 
-        val = self.value_float_leg(self,
+        val = self.value_float_leg(
                     swap_rates,
                     swap_times,
                     year_fracs,
@@ -503,7 +503,7 @@ class Engine:
                     first_fixing_rate)
         
         valuation = Valuation(amount=val.item(),
-                              currency=CurrencyTypes.NONE)
+                              currency=floating_leg_details._currency)
         
         return valuation
 
