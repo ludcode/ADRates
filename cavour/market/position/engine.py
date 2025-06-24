@@ -1,8 +1,10 @@
 
 "Valuation Engine"
 
-import jax
+import jax.numpy as jnp
+from jax import lax, jit, grad, hessian
 from functools import partial
+from typing import Sequence
 
 from cavour.market.curves.interpolator import *
 from cavour.utils.helpers import to_tenor, times_from_dates
@@ -119,55 +121,118 @@ class Engine:
             raise LibError(f"{self.derivative.derivative_type} not yet implemented")
 
 
-    def build_curve_ad(self, swap_rates, swap_times, year_fracs):
+    # def build_curve_ad(self, swap_rates, swap_times, year_fracs):
 
-        times = [] #jnp.array([])
-        dfs = [] #jnp.array([])
+    #     times = [] #jnp.array([])
+    #     dfs = [] #jnp.array([])
 
-        pv01 = 0.0
-        df_settle = 1 
+    #     pv01 = 0.0
+    #     df_settle = 1 
 
-        pv01_dict = {}
-        pv01 = 0
+    #     pv01_dict = {}
+    #     pv01 = 0
 
-        def calculate_single_df(pv01, i, target_maturity=None, step=0):
-            if target_maturity is None:
-                t_mat = swap_times[i]
-                #swap_rate = swap_rates[i]
-            else:
-                t_mat = target_maturity
-                #swap_rate = interpolate_loglinear(t_mat)
-            swap_rate = swap_rates[i]
+    #     def calculate_single_df(pv01, i, target_maturity=None, step=0):
+    #         if target_maturity is None:
+    #             t_mat = swap_times[i]
+    #             #swap_rate = swap_rates[i]
+    #         else:
+    #             t_mat = target_maturity
+    #             #swap_rate = interpolate_loglinear(t_mat)
+    #         swap_rate = swap_rates[i]
 
-            if len(year_fracs[i]) == 1:
-                acc = year_fracs[i][0]
-                pv01_end = (acc * swap_rate + 1.0)
-                df_mat = (df_settle) / pv01_end
-                pv01 = acc * df_mat
-            else:
-                acc = year_fracs[i][-1-step]
-                last_payment = sum(year_fracs[i][:-1-step])
-                if round(last_payment , 1) not in pv01_dict:
-                    step += 1
-                    pv01_dict[round(last_payment,1)] = calculate_single_df(pv01, i, last_payment, step)
+    #         if len(year_fracs[i]) == 1:
+    #             acc = year_fracs[i][0]
+    #             pv01_end = (acc * swap_rate + 1.0)
+    #             df_mat = (df_settle) / pv01_end
+    #             pv01 = acc * df_mat
+    #         else:
+    #             acc = year_fracs[i][-1-step]
+    #             last_payment = sum(year_fracs[i][:-1-step])
+    #             if round(last_payment , 1) not in pv01_dict:
+    #                 step += 1
+    #                 pv01_dict[round(last_payment,1)] = calculate_single_df(pv01, i, last_payment, step)
 
-                pv01_end = (acc * swap_rate + 1)
-                df_mat = (df_settle - swap_rate * pv01_dict[round(last_payment,1)]) / pv01_end
-                pv01 = pv01_dict[round(last_payment,1)] + acc * df_mat
+    #             pv01_end = (acc * swap_rate + 1)
+    #             df_mat = (df_settle - swap_rate * pv01_dict[round(last_payment,1)]) / pv01_end
+    #             pv01 = pv01_dict[round(last_payment,1)] + acc * df_mat
 
-            times.append(t_mat)
-            dfs.append(df_mat)
+    #         times.append(t_mat)
+    #         dfs.append(df_mat)
 
-            pv01_dict[round(t_mat,1)] = pv01
+    #         pv01_dict[round(t_mat,1)] = pv01
 
-            step = 0
+    #         step = 0
 
-            return pv01
+    #         return pv01
         
-        for i in range(0, len(swap_rates)):
-            pv01 = calculate_single_df(pv01, i)
+    #     for i in range(0, len(swap_rates)):
+    #         pv01 = calculate_single_df(pv01, i)
 
-        return times, dfs
+    #     return times, dfs
+    
+
+    def build_curve_ad(self,
+                    swap_rates: list[float],
+                    swap_times: list[float],
+                    year_fracs: list[list[float]]
+                    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Bootstraps an OIS curve via par-swap rates.
+        Inputs as Python lists; outputs as JAX arrays.
+        """
+
+        # 1) Convert inputs to JAX arrays
+        rates = jnp.array(swap_rates)    # shape (N,)
+        times = jnp.array(swap_times)    # shape (N,)
+        N     = rates.shape[0]
+
+        # 2) Precompute prev_idx & acc_last in Python (using 1-dp rounding)
+        times_rounded = [round(t, 1) for t in swap_times]
+        prev_idx = []
+        acc_last = []
+        for i, fr in enumerate(year_fracs):
+            if len(fr) == 1:
+                prev_idx.append(-1)
+                acc_last.append(fr[0])
+            else:
+                last_pay = round(sum(fr[:-1]), 1)
+                if last_pay in times_rounded:
+                    j = times_rounded.index(last_pay)
+                else:
+                    # fallback: nearest tenor
+                    diffs = [abs(t - last_pay) for t in swap_times]
+                    j = int(min(range(len(diffs)), key=lambda k: diffs[k]))
+                prev_idx.append(j)
+                acc_last.append(fr[-1])
+
+        prev_idx = jnp.array(prev_idx, dtype=jnp.int32)  # shape (N,)
+        acc_last = jnp.array(acc_last)                   # shape (N,)
+
+        # 3) JAX-friendly scan step
+        def step(pv01_arr, inputs):
+            i, r = inputs
+            pi    = prev_idx[i]
+            prev  = jnp.where(pi < 0, 0.0, pv01_arr[pi])
+            a     = acc_last[i]
+
+            df_i = jnp.where(
+                pi < 0,
+                1.0 / (1.0 + r * a),
+                (1.0 - r * prev) / (1.0 + r * a)
+            )
+
+            pv01_i   = prev + a * df_i
+            new_pv01 = pv01_arr.at[i].set(pv01_i)
+            return new_pv01, df_i
+
+        # 4) Run the scan
+        init_pv01 = jnp.zeros_like(rates)
+        idxs       = jnp.arange(N)
+        _, dfs_arr = lax.scan(step, init_pv01, (idxs, rates))
+
+        # 5) Return JAX arrays
+        return times, dfs_arr
         
     def _price_fixed_leg_jax(self,
                             swap_rates,                  # [..., N]
@@ -283,7 +348,7 @@ class Engine:
                     value_dt: Date,
                     interpolator_dc_type): # Gradient w.r.t. swap_rates
     
-        grad_price = jax.grad(lambda sr: self.value_fixed_leg(
+        grad_price = grad(lambda sr: self.value_fixed_leg(
             sr,
             swap_times, 
             year_fracs,
@@ -312,7 +377,7 @@ class Engine:
                         value_dt: Date,
                         interpolator_dc_type):  # Hessian w.r.t. swap_rates
 
-        hess_price = jax.hessian(lambda sr: self.value_fixed_leg(
+        hess_price = hessian(lambda sr: self.value_fixed_leg(
             sr,
             swap_times, 
             year_fracs,
@@ -518,7 +583,7 @@ class Engine:
                     first_fixing_rate = None):
         
         # Gradient w.r.t. swap_rates:
-        delta = jax.grad(lambda sr: self.value_float_leg(
+        delta = grad(lambda sr: self.value_float_leg(
             sr, swap_times, year_fracs,
             floating_leg_details,
             value_dt,
@@ -551,7 +616,7 @@ class Engine:
                     first_fixing_rate = None):
         
         # Gradient w.r.t. swap_rates:
-        hess_price = jax.hessian(lambda sr: self.value_float_leg(
+        hess_price = hessian(lambda sr: self.value_float_leg(
             sr, swap_times, year_fracs,
             floating_leg_details,
             value_dt,

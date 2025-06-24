@@ -191,31 +191,6 @@ class OIS:
 
         value = fixed_leg_value + float_leg_value
         return value
-    
-###############################################################################
-
-    def value_ad(self,
-                dfs
-                ):
-
-        fixed_leg_value = self._fixed_leg.value_ad(dfs)
-        float_leg_value = self._float_leg.value_ad(dfs)
-
-        value = fixed_leg_value + float_leg_value
-        return value
-    
-    
-###############################################################################
-
-    def delta_ad(self,
-                 dfs):
-
-        sensies_function = grad(self.value_ad)
-        delta_df_list = sensies_function(dfs)
-        delta_df_divided = jnp.array(delta_df_list) / 100
-
-        return delta_df_divided
-
 
 ##########################################################################
 
