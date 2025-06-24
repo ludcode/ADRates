@@ -208,7 +208,7 @@ class Gamma:
     risk_ladder: jnp.ndarray       # shape [N] or [N, N]
     tenors:       List[str]        # length N
     currency:     CurrencyTypes = CurrencyTypes.GBP
-    curve_type:   CurveTypes = CurveTypes.SONIA
+    curve_type:   CurveTypes = CurveTypes.GBP_OIS_SONIA
 
     def __post_init__(self):
         arr = self.risk_ladder
@@ -344,7 +344,7 @@ class Risk:
         risk.SONIA.ladder  (for Delta)
         risk.SONIA.matrix  (for Gamma)
     Or:
-        risk(CurveTypes.SONIA) => Delta or Gamma
+        risk(CurveTypes.GBP_OIS_SONIA) => Delta or Gamma
     """
     def __init__(self, ladders: Iterable[Union[Delta, Gamma]]):
         self._by_curve = {}  # type: Dict[str, Union[Delta, Gamma]]
@@ -358,7 +358,7 @@ class Risk:
 
     def __call__(self, curve_type: CurveTypes) -> Union[Delta, Gamma]:
         """
-        Allow callable access: risk(CurveTypes.SONIA) => Delta or Gamma
+        Allow callable access: risk(CurveTypes.GBP_OIS_SONIA) => Delta or Gamma
         """
         try:
             return self._by_curve[curve_type.name]

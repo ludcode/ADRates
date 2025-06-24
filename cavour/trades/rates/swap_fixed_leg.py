@@ -13,6 +13,7 @@ from ...utils.calendar import Calendar, BusDayAdjustTypes
 from ...utils.schedule import Schedule
 from ...utils.helpers import format_table, label_to_string, check_argument_types
 from ...utils.global_types import SwapTypes, InstrumentTypes
+from ...utils.currency import CurrencyTypes
 from ...market.curves.discount_curve import DiscountCurve
 
 ##########################################################################
@@ -37,7 +38,8 @@ class SwapFixedLeg:
                  bd_type: BusDayAdjustTypes = BusDayAdjustTypes.FOLLOWING,
                  dg_type: DateGenRuleTypes = DateGenRuleTypes.BACKWARD,
                  end_of_month: bool = False,
-                 floating_index: CurveTypes = CurveTypes.SONIA):
+                 floating_index: CurveTypes = CurveTypes.GBP_OIS_SONIA,
+                 currency: CurrencyTypes = CurrencyTypes.GBP):
         """ Create the fixed leg of a swap contract giving the contract start
         date, its maturity, fixed coupon, fixed leg frequency, fixed leg day
         count convention and notional.  """
@@ -55,6 +57,7 @@ class SwapFixedLeg:
 
         self._maturity_dt = calendar.adjust(self._termination_dt,
                                             bd_type)
+                                            
 
         if effective_dt > self._maturity_dt:
             raise LibError("Effective date after maturity date")
@@ -68,6 +71,7 @@ class SwapFixedLeg:
         self._principal = principal
         self._cpn = coupon
         self._floating_index = floating_index
+        self._currency = currency
 
         self._dc_type = dc_type
         self._cal_type = cal_type
@@ -204,142 +208,6 @@ class SwapFixedLeg:
 
         return leg_pv
     
-###############################################################################
-
-    def value_agnostic(self,
-              value_dt: Date,
-              discount_curve: DiscountCurve):
-
-        self._payment_dfs = []
-        self._payment_pvs = []
-        self._cumulative_pvs = []
-
-        notional = self._notional
-        df_value = discount_curve.df(value_dt,self._dc_type)
-        leg_pv = 0.0
-        num_payments = len(self._payment_dts)
-
-        df_pmnt = 0.0
-
-        for i_pmnt in range(0, num_payments):
-
-            pmnt_dt = self._payment_dts[i_pmnt]
-            pmnt_amount = self._payments[i_pmnt]
-
-            if pmnt_dt > value_dt:
-
-                df_pmnt = discount_curve.df(pmnt_dt,self._dc_type) / df_value
-                pmnt_pv = pmnt_amount * df_pmnt
-                leg_pv += pmnt_pv
-
-                self._payment_dfs.append(df_pmnt)
-                self._payment_pvs.append(pmnt_amount*df_pmnt)
-                self._cumulative_pvs.append(leg_pv)
-
-            else:
-
-                self._payment_dfs.append(0.0)
-                self._payment_pvs.append(0.0)
-                self._cumulative_pvs.append(0.0)
-
-        if pmnt_dt > value_dt:
-            payment_pv = self._principal * df_pmnt * notional
-            self._payment_pvs[-1] += payment_pv
-            leg_pv += payment_pv
-            self._cumulative_pvs[-1] = leg_pv
-
-        if self._leg_type == SwapTypes.PAY:
-            leg_pv = leg_pv * (-1.0)
-
-        return leg_pv
-    
-###############################################################################
-
-    def value_ad(self,
-              dfs):
-
-        #self._payment_dfs = []
-        self._payment_pvs = []
-        self._cumulative_pvs = []
-
-        time_from_t0 = 0
-        notional = self._notional
-        df_value = 1
-        leg_pv = 0.0
-        num_payments = len(self._payment_dts_ad)
-
-        df_pmnt = 0.0
-
-        for i_pmnt in range(0, num_payments):
-
-            pmnt_dt = self._payment_dts_ad[i_pmnt]
-            pmnt_amount = self._payments[i_pmnt]
-
-            if pmnt_dt > time_from_t0:
-
-                df_pmnt = dfs[i_pmnt] / df_value
-                pmnt_pv = pmnt_amount * df_pmnt
-                leg_pv += pmnt_pv
-
-                #self._payment_dfs.append(df_pmnt)
-                self._payment_pvs.append(pmnt_amount*df_pmnt)
-                self._cumulative_pvs.append(leg_pv)
-
-            else:
-
-                #self._payment_dfs.append(0.0)
-                self._payment_pvs.append(0.0)
-                self._cumulative_pvs.append(0.0)
-
-        if pmnt_dt > time_from_t0:
-            payment_pv = self._principal * df_pmnt * notional
-            self._payment_pvs[-1] += payment_pv
-            leg_pv += payment_pv
-            self._cumulative_pvs[-1] = leg_pv
-
-        if self._leg_type == SwapTypes.PAY:
-            leg_pv = leg_pv * (-1.0)
-
-        return leg_pv
-
-##########################################################################
-
-    def print_payments(self):
-        """ Prints the fixed leg dates, accrual factors, discount factors,
-        cash amounts, their present value and their cumulative PV using the
-        last valuation performed. """
-
-        print("START DATE:", self._effective_dt)
-        print("MATURITY DATE:", self._maturity_dt)
-        print("COUPON (%):", self._cpn * 100)
-        print("FREQUENCY:", str(self._freq_type))
-        print("DAY COUNT:", str(self._dc_type))
-
-        if len(self._payments) == 0:
-            print("Payments not calculated.")
-            return
-
-        header = ["PAY_NUM", "PAY_dt", "ACCR_START", "ACCR_END",
-                  "DAYS", "YEARFRAC", "RATE", "PMNT"]
-
-        rows = []
-        num_flows = len(self._payment_dts)
-        for i_flow in range(0, num_flows):
-            rows.append([
-                i_flow + 1,
-                self._payment_dts[i_flow],
-                self._start_accrued_dts[i_flow],
-                self._end_accrued_dts[i_flow],
-                self._accrued_days[i_flow],
-                round(self._year_fracs[i_flow], 4),
-                round(self._rates[i_flow] * 100.0, 4),
-                round(self._payments[i_flow], 2),
-            ])
-
-        table = format_table(header, rows)
-        print("\nPAYMENTS SCHEDULE:")
-        print(table)
-
 ###############################################################################
 
     def print_valuation(self):

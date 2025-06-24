@@ -16,6 +16,7 @@ from ...utils.calendar import Calendar, BusDayAdjustTypes
 from ...utils.helpers import check_argument_types, label_to_string
 from ...utils.math import ONE_MILLION
 from ...utils.global_types import SwapTypes,InstrumentTypes
+from ...utils.currency import CurrencyTypes
 from ...market.curves.discount_curve import DiscountCurve
 from ...market.position.position import Position
 
@@ -80,7 +81,8 @@ class OIS:
                  cal_type: CalendarTypes = CalendarTypes.WEEKEND,
                  bd_type: BusDayAdjustTypes = BusDayAdjustTypes.FOLLOWING,
                  dg_type: DateGenRuleTypes = DateGenRuleTypes.BACKWARD,
-                 floating_index: CurveTypes = CurveTypes.SONIA):
+                 floating_index: CurveTypes = CurveTypes.GBP_OIS_SONIA,
+                 currency: CurrencyTypes = CurrencyTypes.GBP):
         """ Create an overnight index swap contract giving the contract start
         date, its maturity, fixed coupon, fixed leg frequency, fixed leg day
         count convention and notional. The floating leg parameters have default
@@ -116,6 +118,7 @@ class OIS:
         principal = 0.0
 
         self._floating_index = floating_index
+        self._currency = currency
 
         self._fixed_leg = SwapFixedLeg(effective_dt,
                                        self._termination_dt,
@@ -130,7 +133,8 @@ class OIS:
                                        bd_type,
                                        dg_type,
                                        False,
-                                       floating_index)
+                                       floating_index,
+                                       currency)
 
         self._float_leg = SwapFloatLeg(effective_dt,
                                        self._termination_dt,
@@ -145,7 +149,8 @@ class OIS:
                                        bd_type,
                                        dg_type,
                                        False,
-                                       floating_index)
+                                       floating_index,
+                                       currency)
         
 
         #TEMP Ludo
@@ -186,31 +191,6 @@ class OIS:
 
         value = fixed_leg_value + float_leg_value
         return value
-    
-###############################################################################
-
-    def value_ad(self,
-                dfs
-                ):
-
-        fixed_leg_value = self._fixed_leg.value_ad(dfs)
-        float_leg_value = self._float_leg.value_ad(dfs)
-
-        value = fixed_leg_value + float_leg_value
-        return value
-    
-    
-###############################################################################
-
-    def delta_ad(self,
-                 dfs):
-
-        sensies_function = grad(self.value_ad)
-        delta_df_list = sensies_function(dfs)
-        delta_df_divided = jnp.array(delta_df_list) / 100
-
-        return delta_df_divided
-
 
 ##########################################################################
 

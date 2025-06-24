@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 from cavour.utils import *
 from cavour.trades.rates.ois_curve import OISCurve
 from cavour.trades.rates.ois import OIS
-
+from cavour.marketdata.market_data_constants import *
+from cavour.marketdata.market_data_engine import MarketCurveBuilder
 
 
 class CurveAccessor:
@@ -23,9 +24,37 @@ class CurveAccessor:
 
 @dataclass
 class Model:
-    value_dt: "datetime.date"
+    value_dt: Date
     _curves_dict: Dict[str, OISCurve] = field(default_factory=dict)
     _curve_params_dict: Dict[str, dict] = field(default_factory=dict)  # ← Add this line
+    _fx_params_dict: Dict[str, dict] = field(default_factory=dict) 
+    _builder = MarketCurveBuilder(MARKET_DATA, FX_MARKET_DATA)
+    
+
+    def prebuilt_curve(
+        self,
+        curve_names: Union[str, List[str]],
+    ):
+        
+        #builder = MarketCurveBuilder(MARKET_DATA, FX_MARKET_DATA)
+
+        if isinstance(curve_names, str):
+            curve_names = [curve_names]
+
+        for curve_name in curve_names:
+            curve_inputs = self._builder.get_curve_inputs(curve_name, self.value_dt)
+            self.build_curve(**curve_inputs)
+
+    def prebuilt_fx(
+        self,
+        fx_pairs: Union[str, List[str]],
+    ):       
+
+        fx_rates = self._builder.get_fx_rates(fx_pairs, self.value_dt)
+        self._fx_params_dict.update(fx_rates)     
+
+        return fx_rates
+
 
     def build_curve(
         self,
@@ -78,6 +107,28 @@ class Model:
             "bus_day_type": bus_day_type,
             "interp_type": interp_type,
         }
+
+    def build_fx(self, currency_pairs: list[str], pxs: list[float]) -> dict:
+        result = {}
+        for pair, price in zip(currency_pairs, pxs):
+            base_code = pair[:3]
+            quote_code = pair[3:]
+
+            try:
+                base = CurrencyTypes[base_code]
+                quote = CurrencyTypes[quote_code]
+            except KeyError:
+                raise ValueError(f"Invalid currency code in pair: {pair}")
+
+            result[pair] = {
+                "base": base,
+                "quote": quote,
+                "ticker": f"{pair} Curncy",
+                "price": float(price)
+            }
+
+        self._fx_params_dict.update(result)
+
 
     def scenario(self, curve_name: str, shock: dict | float, new_name: str | None = None):
         if curve_name not in self._curve_params_dict:
