@@ -4,6 +4,7 @@
 import jax.numpy as jnp
 from jax import lax, jit, grad, hessian
 from functools import partial
+from typing import Sequence, Tuple, Dict
 from typing import Sequence
 
 from cavour.market.curves.interpolator import *
@@ -24,6 +25,42 @@ class Engine:
                  model):
 
         self.model = model
+        # cache to store precomputed curve helper arrays per curve id
+        self._curve_helper_cache: Dict[int, Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]] = {}
+
+    def _get_curve_helpers(
+        self,
+        curve_id: int,
+        swap_times: Sequence[float],
+        year_fracs: Sequence[Sequence[float]],
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Return cached arrays used during bootstrapping."""
+        if curve_id not in self._curve_helper_cache:
+            times = jnp.array(swap_times)
+            times_rounded = [round(t, 1) for t in swap_times]
+            prev_idx = []
+            acc_last = []
+            for fr in year_fracs:
+                if len(fr) == 1:
+                    prev_idx.append(-1)
+                    acc_last.append(fr[0])
+                else:
+                    last_pay = round(sum(fr[:-1]), 1)
+                    if last_pay in times_rounded:
+                        j = times_rounded.index(last_pay)
+                    else:
+                        diffs = [abs(t - last_pay) for t in swap_times]
+                        j = int(min(range(len(diffs)), key=lambda k: diffs[k]))
+                    prev_idx.append(j)
+                    acc_last.append(fr[-1])
+
+            helpers = (
+                times,
+                jnp.array(prev_idx, dtype=jnp.int32),
+                jnp.array(acc_last),
+            )
+            self._curve_helper_cache[curve_id] = helpers
+        return self._curve_helper_cache[curve_id]
 
     def valuation(self,
                   derivative):
@@ -172,11 +209,14 @@ class Engine:
     #     return times, dfs
     
 
-    def build_curve_ad(self,
-                    swap_rates: list[float],
-                    swap_times: list[float],
-                    year_fracs: list[list[float]]
-                    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+    @jit
+    def build_curve_ad(
+        self,
+        swap_rates: Sequence[float],
+        swap_times: Sequence[float],
+        year_fracs: Sequence[Sequence[float]],
+        helpers: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray] | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """
         Bootstraps an OIS curve via par-swap rates.
         Inputs as Python lists; outputs as JAX arrays.
@@ -184,30 +224,30 @@ class Engine:
 
         # 1) Convert inputs to JAX arrays
         rates = jnp.array(swap_rates)    # shape (N,)
-        times = jnp.array(swap_times)    # shape (N,)
-        N     = rates.shape[0]
-
-        # 2) Precompute prev_idx & acc_last in Python (using 1-dp rounding)
-        times_rounded = [round(t, 1) for t in swap_times]
-        prev_idx = []
-        acc_last = []
-        for i, fr in enumerate(year_fracs):
-            if len(fr) == 1:
-                prev_idx.append(-1)
-                acc_last.append(fr[0])
-            else:
-                last_pay = round(sum(fr[:-1]), 1)
-                if last_pay in times_rounded:
-                    j = times_rounded.index(last_pay)
+        if helpers is None:
+            times = jnp.array(swap_times)
+            times_rounded = [round(t, 1) for t in swap_times]
+            prev_idx = []
+            acc_last = []
+            for fr in year_fracs:
+                if len(fr) == 1:
+                    prev_idx.append(-1)
+                    acc_last.append(fr[0])
                 else:
-                    # fallback: nearest tenor
-                    diffs = [abs(t - last_pay) for t in swap_times]
-                    j = int(min(range(len(diffs)), key=lambda k: diffs[k]))
-                prev_idx.append(j)
-                acc_last.append(fr[-1])
+                    last_pay = round(sum(fr[:-1]), 1)
+                    if last_pay in times_rounded:
+                        j = times_rounded.index(last_pay)
+                    else:
+                        diffs = [abs(t - last_pay) for t in swap_times]
+                        j = int(min(range(len(diffs)), key=lambda k: diffs[k]))
+                    prev_idx.append(j)
+                    acc_last.append(fr[-1])
 
-        prev_idx = jnp.array(prev_idx, dtype=jnp.int32)  # shape (N,)
-        acc_last = jnp.array(acc_last)                   # shape (N,)
+            prev_idx = jnp.array(prev_idx, dtype=jnp.int32)
+            acc_last = jnp.array(acc_last)
+        else:
+            times, prev_idx, acc_last = helpers
+        N = rates.shape[0]
 
         # 3) JAX-friendly scan step
         def step(pv01_arr, inputs):
@@ -273,17 +313,20 @@ class Engine:
         return leg_sign * leg_pv
     
     def value_fixed_leg(self,
-                        swap_rates, 
-                        swap_times, 
+                        swap_rates,
+                        swap_times,
                         year_fracs,
                         fixed_leg_details,
                         value_dt: Date,
-                        interpolator_dc_type):
+                        interpolator_dc_type,
+                        helpers=None):
         
         #swap_rates =  [x*1e-4  for x in swap_rates]
 
+        if helpers is None:
+            helpers = self._get_curve_helpers(id(swap_times), swap_times, year_fracs)
         # — build the curve —
-        times, dfs = self.build_curve_ad(swap_rates, swap_times, year_fracs)
+        times, dfs = self.build_curve_ad(swap_rates, swap_times, year_fracs, helpers)
         interp = InterpolatorAd(interpolator_dc_type)
         interp.fit(times=times, dfs=dfs)
 
@@ -319,20 +362,22 @@ class Engine:
         return pure_fn(swap_rates)   # we only differentiate w.r.t. swap_rates
 
     def valuation_fixed_leg(self,
-                        swap_rates, 
-                        swap_times, 
+                        swap_rates,
+                        swap_times,
                         year_fracs,
                         fixed_leg_details,
                         value_dt: Date,
                         interpolator_dc_type):
-        
+        helpers = self._get_curve_helpers(id(swap_times), swap_times, year_fracs)
+
         val = self.value_fixed_leg(
-                        swap_rates, 
-                        swap_times, 
+                        swap_rates,
+                        swap_times,
                         year_fracs,
                         fixed_leg_details,
                         value_dt,
-                        interpolator_dc_type
+                        interpolator_dc_type,
+                        helpers
         )
 
         valuation = Valuation(amount=val.item(),
@@ -341,20 +386,22 @@ class Engine:
         return valuation
 
     def delta_fixed_leg(self,
-                    swap_rates, 
-                    swap_times, 
+                    swap_rates,
+                    swap_times,
                     year_fracs,
                     fixed_leg_details,
                     value_dt: Date,
                     interpolator_dc_type): # Gradient w.r.t. swap_rates
-    
+        helpers = self._get_curve_helpers(id(swap_times), swap_times, year_fracs)
+
         grad_price = grad(lambda sr: self.value_fixed_leg(
             sr,
-            swap_times, 
+            swap_times,
             year_fracs,
             fixed_leg_details,
             value_dt,
-            interpolator_dc_type))
+            interpolator_dc_type,
+            helpers))
         
         sensitivities = grad_price(swap_rates)
 
@@ -369,21 +416,23 @@ class Engine:
     
         return delta
     
-    def gamma_fixed_leg(self, 
-                        swap_rates, 
-                        swap_times, 
+    def gamma_fixed_leg(self,
+                        swap_rates,
+                        swap_times,
                         year_fracs,
                         fixed_leg_details,
                         value_dt: Date,
                         interpolator_dc_type):  # Hessian w.r.t. swap_rates
+        helpers = self._get_curve_helpers(id(swap_times), swap_times, year_fracs)
 
         hess_price = hessian(lambda sr: self.value_fixed_leg(
             sr,
-            swap_times, 
+            swap_times,
             year_fracs,
             fixed_leg_details,
             value_dt,
-            interpolator_dc_type))
+            interpolator_dc_type,
+            helpers))
         
         gammas = hess_price(swap_rates)
 
@@ -475,13 +524,16 @@ class Engine:
                     value_dt,
                     discount_curve_type,
                     index_curve_type = None,
-                    first_fixing_rate = None):
+                    first_fixing_rate = None,
+                    helpers=None):
         """
         Compute the floating‐leg PV, building both discount and index
         InterpolatorAd() objects from their interp‐type strings.
         """
         # 1) Build the discount curve
-        times, dfs = self.build_curve_ad(swap_rates, swap_times, year_fracs)
+        if helpers is None:
+            helpers = self._get_curve_helpers(id(swap_times), swap_times, year_fracs)
+        times, dfs = self.build_curve_ad(swap_rates, swap_times, year_fracs, helpers)
         disc_interp = InterpolatorAd(discount_curve_type)
         disc_interp.fit(times=times, dfs=dfs)
 
@@ -557,6 +609,8 @@ class Engine:
                     index_curve_type = None,
                     first_fixing_rate = None):
 
+        helpers = self._get_curve_helpers(id(swap_times), swap_times, year_fracs)
+
         val = self.value_float_leg(
                     swap_rates,
                     swap_times,
@@ -565,7 +619,8 @@ class Engine:
                     value_dt,
                     discount_curve_type,
                     index_curve_type,
-                    first_fixing_rate)
+                    first_fixing_rate,
+                    helpers)
         
         valuation = Valuation(amount=val.item(),
                               currency=floating_leg_details._currency)
@@ -581,6 +636,8 @@ class Engine:
                     discount_curve_type,
                     index_curve_type = None,
                     first_fixing_rate = None):
+
+        helpers = self._get_curve_helpers(id(swap_times), swap_times, year_fracs)
         
         # Gradient w.r.t. swap_rates:
         delta = grad(lambda sr: self.value_float_leg(
@@ -589,7 +646,8 @@ class Engine:
             value_dt,
             discount_curve_type,
             index_curve_type,
-            first_fixing_rate
+            first_fixing_rate,
+            helpers
         ))
 
         sensitivities = delta(swap_rates)
@@ -614,6 +672,8 @@ class Engine:
                     discount_curve_type,
                     index_curve_type = None,
                     first_fixing_rate = None):
+
+        helpers = self._get_curve_helpers(id(swap_times), swap_times, year_fracs)
         
         # Gradient w.r.t. swap_rates:
         hess_price = hessian(lambda sr: self.value_float_leg(
@@ -622,7 +682,8 @@ class Engine:
             value_dt,
             discount_curve_type,
             index_curve_type,
-            first_fixing_rate
+            first_fixing_rate,
+            helpers
         ))
 
         gammas = hess_price(swap_rates)
