@@ -208,6 +208,45 @@ class SwapFixedLeg:
 
         return leg_pv
     
+
+##########################################################################
+
+    def print_payments(self):
+        """ Prints the fixed leg dates, accrual factors, discount factors,
+        cash amounts, their present value and their cumulative PV using the
+        last valuation performed. """
+
+        print("START DATE:", self._effective_dt)
+        print("MATURITY DATE:", self._maturity_dt)
+        print("COUPON (%):", self._cpn * 100)
+        print("FREQUENCY:", str(self._freq_type))
+        print("DAY COUNT:", str(self._dc_type))
+
+        if len(self._payments) == 0:
+            print("Payments not calculated.")
+            return
+
+        header = ["PAY_NUM", "PAY_dt", "ACCR_START", "ACCR_END",
+                  "DAYS", "YEARFRAC", "RATE", "PMNT"]
+
+        rows = []
+        num_flows = len(self._payment_dts)
+        for i_flow in range(0, num_flows):
+            rows.append([
+                i_flow + 1,
+                self._payment_dts[i_flow],
+                self._start_accrued_dts[i_flow],
+                self._end_accrued_dts[i_flow],
+                self._accrued_days[i_flow],
+                round(self._year_fracs[i_flow], 4),
+                round(self._rates[i_flow] * 100.0, 4),
+                round(self._payments[i_flow], 2),
+            ])
+
+        table = format_table(header, rows)
+        print("\nPAYMENTS SCHEDULE:")
+        print(table)
+    
 ###############################################################################
 
     def print_valuation(self):

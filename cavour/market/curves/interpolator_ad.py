@@ -111,7 +111,12 @@ class InterpolatorAd:
                 return jnp.interp(tt, x, d)
             else:
                 raise LibError("Invalid interpolation scheme.")
-        return jnp.where(isinstance(t, jnp.ndarray), jax.vmap(_eval_scalar)(t) , _eval_scalar(t))
+        #return jnp.where(isinstance(t, jnp.ndarray), jax.vmap(_eval_scalar)(t) , _eval_scalar(t))
+        tt = jnp.atleast_1d(t)
+        out = jax.vmap(_eval_scalar)(tt)
+        if tt.shape == (1,):
+            return out[0]
+        return out
 
     @partial(jax.jit, static_argnums=(0,))
     def interpolate(self, t: float):

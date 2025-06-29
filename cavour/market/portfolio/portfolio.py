@@ -14,7 +14,7 @@ class Portfolio:
     def add_position(self, position: Position) -> None:
         self._positions.append(position)
 
-    @property
+    #@property
     def positions(self) -> List[Position]:
         return list(self._positions)
 
