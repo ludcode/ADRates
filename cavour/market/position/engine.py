@@ -1,10 +1,10 @@
-
 "Valuation Engine"
 
+import numpy as np
 import jax.numpy as jnp
-from jax import lax, jit, grad, hessian
+from jax import lax, jit, grad, hessian, jacrev, linearize
 from functools import partial
-from typing import Sequence
+from typing import Sequence, Any, Dict
 
 from cavour.market.curves.interpolator import *
 from cavour.utils.helpers import to_tenor, times_from_dates
@@ -24,6 +24,55 @@ class Engine:
                  model):
 
         self.model = model
+        # cache bootstrapped curves keyed by curve name
+        self._curve_cache: Dict[Any, Dict[str, Any]] = {}
+
+    def compute(self, derivative, request_list):
+        """Return analytics for the given derivative and requested measures."""
+        reqs = set(request_list)
+
+        if derivative.derivative_type != InstrumentTypes.OIS_SWAP:
+            raise LibError(f"{derivative.derivative_type} not yet implemented")
+
+        ir_model = getattr(self.model.curves, derivative._floating_index.name)
+
+        fixed = self._fixed_leg_analytics(
+            ir_model.swap_rates,
+            ir_model.swap_times,
+            ir_model.year_fracs,
+            derivative._fixed_leg,
+            ir_model._value_dt,
+            ir_model._interp_type,
+            reqs,
+        )
+
+        floating = self._float_leg_analytics(
+            ir_model.swap_rates,
+            ir_model.swap_times,
+            ir_model.year_fracs,
+            derivative._float_leg,
+            ir_model._value_dt,
+            ir_model._interp_type,
+            ir_model._interp_type,
+            None,
+            reqs,
+        )
+
+        value = None
+        if RequestTypes.VALUE in reqs:
+            value = fixed.get("value") + floating.get("value")
+
+        delta = None
+        if RequestTypes.DELTA in reqs:
+            delta = fixed.get("delta") + floating.get("delta")
+
+        gamma = None
+        if RequestTypes.GAMMA in reqs:
+            gamma = fixed.get("gamma") + floating.get("gamma")
+
+        #risk = Risk([delta]) if delta is not None else None
+
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma)
 
     def valuation(self,
                   derivative):
@@ -119,57 +168,6 @@ class Engine:
 
         else:
             raise LibError(f"{self.derivative.derivative_type} not yet implemented")
-
-
-    # def build_curve_ad(self, swap_rates, swap_times, year_fracs):
-
-    #     times = [] #jnp.array([])
-    #     dfs = [] #jnp.array([])
-
-    #     pv01 = 0.0
-    #     df_settle = 1 
-
-    #     pv01_dict = {}
-    #     pv01 = 0
-
-    #     def calculate_single_df(pv01, i, target_maturity=None, step=0):
-    #         if target_maturity is None:
-    #             t_mat = swap_times[i]
-    #             #swap_rate = swap_rates[i]
-    #         else:
-    #             t_mat = target_maturity
-    #             #swap_rate = interpolate_loglinear(t_mat)
-    #         swap_rate = swap_rates[i]
-
-    #         if len(year_fracs[i]) == 1:
-    #             acc = year_fracs[i][0]
-    #             pv01_end = (acc * swap_rate + 1.0)
-    #             df_mat = (df_settle) / pv01_end
-    #             pv01 = acc * df_mat
-    #         else:
-    #             acc = year_fracs[i][-1-step]
-    #             last_payment = sum(year_fracs[i][:-1-step])
-    #             if round(last_payment , 1) not in pv01_dict:
-    #                 step += 1
-    #                 pv01_dict[round(last_payment,1)] = calculate_single_df(pv01, i, last_payment, step)
-
-    #             pv01_end = (acc * swap_rate + 1)
-    #             df_mat = (df_settle - swap_rate * pv01_dict[round(last_payment,1)]) / pv01_end
-    #             pv01 = pv01_dict[round(last_payment,1)] + acc * df_mat
-
-    #         times.append(t_mat)
-    #         dfs.append(df_mat)
-
-    #         pv01_dict[round(t_mat,1)] = pv01
-
-    #         step = 0
-
-    #         return pv01
-        
-    #     for i in range(0, len(swap_rates)):
-    #         pv01 = calculate_single_df(pv01, i)
-
-    #     return times, dfs
     
 
     def build_curve_ad(self,
@@ -209,6 +207,7 @@ class Engine:
         prev_idx = jnp.array(prev_idx, dtype=jnp.int32)  # shape (N,)
         acc_last = jnp.array(acc_last)                   # shape (N,)
 
+
         # 3) JAX-friendly scan step
         def step(pv01_arr, inputs):
             i, r = inputs
@@ -233,23 +232,43 @@ class Engine:
 
         # 5) Return JAX arrays
         return times, dfs_arr
+
+    def _cached_curve(self, key, swap_rates, swap_times, year_fracs, interp_type):
+        """Bootstrap the curve once and cache DFS, Jacobian and Hessian."""
+        cache = self._curve_cache.get(key)
+        if cache is not None:
+            return cache
+
+        build = lambda r: self.build_curve_ad(r, swap_times, year_fracs)[1]
+        rates = jnp.array(swap_rates)
+        times = jnp.array(swap_times)
+        dfs = build(rates)
+
+        jac = jacrev(build)(rates)
+        hess = hessian(build)(rates)
+        cache = {
+            "times": times,
+            "dfs": dfs,
+            "jac": jac,
+            "hess": hess,
+        }
+        self._curve_cache[key] = cache
+        return cache
         
     def _price_fixed_leg_jax(self,
-                            swap_rates,                  # [..., N]
+                            dfs,
+                            times,
+                            interp_type,
                             payment_times,               # [M]
                             payments,                    # [M]
                             principal: float,            # scalar
                             notional: float,             # scalar
                             leg_sign: float,             # +1 or −1
-                            value_time: float,           # scalar
-                            discount_curve_interpolator  # static object
+                            value_time: float            # scalar
                             ):
-        # reconstruct the curve DFs at the knots:
-        #times, dfs = self.build_curve_ad(swap_rates, swap_times, year_fracs)
-        # discount at valuation date:    shape [...]
-        df_val   = discount_curve_interpolator.interpolate(value_time)
-        # discount at each payment date: shape [..., M]
-        df_pmts  = discount_curve_interpolator.interpolate(payment_times)
+        interp = InterpolatorAd(interp_type)
+        df_val   = interp.simple_interpolate(value_time, times, dfs, interp_type.value)
+        df_pmts  = interp.simple_interpolate(payment_times, times, dfs, interp_type.value)
 
         # build a mask of “after valuation date” over your M flows
         mask     = payment_times > value_time   # [M]
@@ -273,8 +292,8 @@ class Engine:
         return leg_sign * leg_pv
     
     def value_fixed_leg(self,
-                        swap_rates, 
-                        swap_times, 
+                        swap_rates,
+                        swap_times,
                         year_fracs,
                         fixed_leg_details,
                         value_dt: Date,
@@ -282,10 +301,10 @@ class Engine:
         
         #swap_rates =  [x*1e-4  for x in swap_rates]
 
-        # — build the curve —
-        times, dfs = self.build_curve_ad(swap_rates, swap_times, year_fracs)
-        interp = InterpolatorAd(interpolator_dc_type)
-        interp.fit(times=times, dfs=dfs)
+        curve_key = tuple(swap_times)
+        cache = self._cached_curve(curve_key, swap_rates, swap_times, year_fracs, interpolator_dc_type)
+        times = cache["times"]
+        dfs = cache["dfs"]
 
         # — extract all the “static” pieces from your custom class ONCE —
         #    (these are plain Python numbers or JAX arrays)
@@ -308,106 +327,157 @@ class Engine:
         # — now call a tiny pure-JAX routine —
         pure_fn = partial(
             self._price_fixed_leg_jax,
+            dfs=dfs,
+            times=times,
+            interp_type=interpolator_dc_type,
             payment_times=payment_times,
             payments=payments,
             principal=principal,
             notional=notional,
             leg_sign=leg_sign,
             value_time=value_time,
-            discount_curve_interpolator=interp,
         )
-        return pure_fn(swap_rates)   # we only differentiate w.r.t. swap_rates
+        return pure_fn()
 
-    def valuation_fixed_leg(self,
-                        swap_rates, 
-                        swap_times, 
-                        year_fracs,
-                        fixed_leg_details,
-                        value_dt: Date,
-                        interpolator_dc_type):
-        
-        val = self.value_fixed_leg(
-                        swap_rates, 
-                        swap_times, 
-                        year_fracs,
-                        fixed_leg_details,
-                        value_dt,
-                        interpolator_dc_type
+    def _fixed_leg_analytics(
+        self,
+        swap_rates,
+        swap_times,
+        year_fracs,
+        fixed_leg_details,
+        value_dt: Date,
+        interpolator_dc_type,
+        requests,
+    ):
+        """Common routine for PV/Delta/Gamma of the fixed leg."""
+
+        curve_key = tuple(swap_times)
+        cache = self._cached_curve(
+            curve_key, swap_rates, swap_times, year_fracs, interpolator_dc_type
+        )
+        times = cache["times"]
+        dfs = cache["dfs"]
+        jac = cache["jac"]
+        hess_curve = cache["hess"]
+
+        dc_type = fixed_leg_details._dc_type
+        payment_times = jnp.array(
+            [times_from_dates(dt, value_dt, dc_type) for dt in fixed_leg_details._payment_dts]
+        )
+        payments = jnp.array(fixed_leg_details._payments)
+        principal = fixed_leg_details._principal
+        notional = fixed_leg_details._notional
+        leg_sign = +1.0 if fixed_leg_details._leg_type == SwapTypes.RECEIVE else -1.0
+        value_time = times_from_dates(value_dt, value_dt, dc_type)
+
+        pv_fn = partial(
+            self._price_fixed_leg_jax,
+            times=times,
+            interp_type=interpolator_dc_type,
+            payment_times=payment_times,
+            payments=payments,
+            principal=principal,
+            notional=notional,
+            leg_sign=leg_sign,
+            value_time=value_time,
         )
 
-        valuation = Valuation(amount=val.item(),
-                              currency=fixed_leg_details._currency)
-        
-        return valuation
+        out = {}
+        if RequestTypes.VALUE in requests:
+            val = pv_fn(dfs)
+            out["value"] = Valuation(amount=float(val), currency=fixed_leg_details._currency)
 
-    def delta_fixed_leg(self,
-                    swap_rates, 
-                    swap_times, 
-                    year_fracs,
-                    fixed_leg_details,
-                    value_dt: Date,
-                    interpolator_dc_type): # Gradient w.r.t. swap_rates
-    
-        grad_price = grad(lambda sr: self.value_fixed_leg(
-            sr,
-            swap_times, 
+        need_grad = RequestTypes.DELTA in requests or RequestTypes.GAMMA in requests
+        grad_dfs = None
+        if need_grad:
+            grad_dfs = grad(lambda d: pv_fn(d))(dfs)
+
+        if RequestTypes.DELTA in requests:
+            sensitivities = jnp.dot(grad_dfs, jac)
+            sensies = [float(x) * 1e-4 for x in sensitivities]
+            out["delta"] = Delta(
+                risk_ladder=sensies,
+                tenors=to_tenor(swap_times),
+                currency=fixed_leg_details._currency,
+                curve_type=CurveTypes.GBP_OIS_SONIA,
+            )
+
+        if RequestTypes.GAMMA in requests:
+            hess_dfs = hessian(lambda d: pv_fn(d))(dfs)
+            term1 = jac.T @ hess_dfs @ jac
+            term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
+            gammas = term1 + term2
+            gammas = np.array(gammas, dtype=np.float64) * 1e-8
+            out["gamma"] = Gamma(gammas, swap_times)
+
+        return out
+
+    def valuation_fixed_leg(
+        self,
+        swap_rates,
+        swap_times,
+        year_fracs,
+        fixed_leg_details,
+        value_dt: Date,
+        interpolator_dc_type,
+    ):
+        res = self._fixed_leg_analytics(
+            swap_rates,
+            swap_times,
             year_fracs,
             fixed_leg_details,
             value_dt,
-            interpolator_dc_type))
-        
-        sensitivities = grad_price(swap_rates)
+            interpolator_dc_type,
+            {RequestTypes.VALUE},
+        )
+        return res["value"]
 
-        sensies = [x * 1e-4 for x in sensitivities]
-
-        tenors = to_tenor(swap_times)
-
-        delta= Delta(risk_ladder=sensies, 
-              tenors=tenors,
-              currency=CurrencyTypes.GBP, 
-              curve_type=CurveTypes.GBP_OIS_SONIA)
-    
-        return delta
-    
-    def gamma_fixed_leg(self, 
-                        swap_rates, 
-                        swap_times, 
-                        year_fracs,
-                        fixed_leg_details,
-                        value_dt: Date,
-                        interpolator_dc_type):  # Hessian w.r.t. swap_rates
-
-        hess_price = hessian(lambda sr: self.value_fixed_leg(
-            sr,
-            swap_times, 
+    def delta_fixed_leg(
+        self,
+        swap_rates,
+        swap_times,
+        year_fracs,
+        fixed_leg_details,
+        value_dt: Date,
+        interpolator_dc_type,
+    ):
+        res = self._fixed_leg_analytics(
+            swap_rates,
+            swap_times,
             year_fracs,
             fixed_leg_details,
             value_dt,
-            interpolator_dc_type))
-        
-        gammas = hess_price(swap_rates)
+            interpolator_dc_type,
+            {RequestTypes.DELTA},
+        )
+        return res["delta"]
 
-        # Extract diagonal (second derivative of each rate w.r.t. itself)
-        #gamma_diag = [gammas[i, i] * 1e-4 for i in range(len(swap_rates))]
-
-        # tenors = to_tenor(swap_times)
-
-        # gamma = Gamma(risk_ladder=gamma_diag,
-        #             tenors=tenors,
-        #             currency=CurrencyTypes.GBP,
-        #             curve_type=CurveTypes.GBP_OIS_SONIA)
-
-        gammas = np.array(gammas, dtype=np.float64) * 1e-8
-
-        gamma = Gamma(gammas, swap_times)
-
-        return gamma
+    def gamma_fixed_leg(
+        self,
+        swap_rates,
+        swap_times,
+        year_fracs,
+        fixed_leg_details,
+        value_dt: Date,
+        interpolator_dc_type,
+    ):
+        res = self._fixed_leg_analytics(
+            swap_rates,
+            swap_times,
+            year_fracs,
+            fixed_leg_details,
+            value_dt,
+            interpolator_dc_type,
+            {RequestTypes.GAMMA},
+        )
+        return res["gamma"]
     
 
     def _float_leg_jax(self,
-                    swap_rates,                   # [..., N]
-                    swap_times,                   # [N]
-                    year_fracs,                   # [N]
+                    dfs,
+                    times,
+                    disc_interp_type,
+                    idx_interp_type,
                     payment_times,                # [M]
                     start_times,                  # [M]
                     end_times,                    # [M]
@@ -418,19 +488,14 @@ class Engine:
                     leg_sign: float,              # +1 or –1
                     value_time: float,            # scalar
                     first_fixing_rate: float,
-                    override_first,     # scalar
-                    discount_curve_interpolator,  # static
-                    index_curve_interpolator      # static
+                    override_first               # scalar
                     ):
-        # a) Rebuild curve DFs at the knots
-        #times, dfs = build_curve_ad(swap_rates, swap_times, year_fracs)
+        disc_interp = InterpolatorAd(disc_interp_type)
+        idx_interp  = InterpolatorAd(idx_interp_type)
 
-        # b) DF @ valuation date
-        df_val   = discount_curve_interpolator.interpolate(value_time)          # [...,]
-
-        # c) DF @ accrual start/end for forward rates
-        df_start = index_curve_interpolator.interpolate(start_times)            # [..., M]
-        df_end   = index_curve_interpolator.interpolate(end_times)              # [..., M]
+        df_val   = disc_interp.simple_interpolate(value_time, times, dfs, disc_interp_type.value)
+        df_start = idx_interp.simple_interpolate(start_times, times, dfs, idx_interp_type.value)
+        df_end   = idx_interp.simple_interpolate(end_times, times, dfs, idx_interp_type.value)
 
         # d) Vectorised forward rates
         fwd = (df_start / df_end - 1.0) / pay_alphas                 # [..., M]
@@ -449,8 +514,7 @@ class Engine:
         # e) coupon amounts
         cf_amounts = (fwd + spreads) * pay_alphas * notionals                    # [..., M]
 
-        # f) DF @ payment dates
-        df_pmts    = discount_curve_interpolator.interpolate(payment_times)      # [..., M]
+        df_pmts    = disc_interp.simple_interpolate(payment_times, times, dfs, disc_interp_type.value)
         df_rel     = df_pmts / df_val[..., None]                                 # [..., M]
 
         # g) mask out past payments
@@ -480,10 +544,10 @@ class Engine:
         Compute the floating‐leg PV, building both discount and index
         InterpolatorAd() objects from their interp‐type strings.
         """
-        # 1) Build the discount curve
-        times, dfs = self.build_curve_ad(swap_rates, swap_times, year_fracs)
-        disc_interp = InterpolatorAd(discount_curve_type)
-        disc_interp.fit(times=times, dfs=dfs)
+        curve_key = tuple(swap_times)
+        cache = self._cached_curve(curve_key, swap_rates, swap_times, year_fracs, discount_curve_type)
+        times = cache["times"]
+        dfs = cache["dfs"]
 
         # 2) Build (or default) the index curve
         if index_curve_type is None:
@@ -524,11 +588,12 @@ class Engine:
         fix0          = first_fixing_rate if override_first else 0.0
         #fix0          = first_fixing_rate or 0.0                           # scalar
 
-        # 4) Bind into a pure‐JAX function
         pure_fn = partial(
             self._float_leg_jax,
-            swap_times=swap_times,
-            year_fracs=year_fracs,
+            dfs=dfs,
+            times=times,
+            disc_interp_type=discount_curve_type,
+            idx_interp_type=index_curve_type or discount_curve_type,
             payment_times=payment_times,
             start_times=start_times,
             end_times=end_times,
@@ -540,106 +605,173 @@ class Engine:
             value_time=value_time,
             first_fixing_rate=fix0,
             override_first=override_first,
-            discount_curve_interpolator=disc_interp,
-            index_curve_interpolator=idx_interp
         )
 
-        # 5) Call it with swap_rates as the only differentiable arg
-        return pure_fn(swap_rates)
+        return pure_fn()
     
-    def valuation_float_leg(self,
-                    swap_rates,
-                    swap_times,
-                    year_fracs,
-                    floating_leg_details,
-                    value_dt,
-                    discount_curve_type,
-                    index_curve_type = None,
-                    first_fixing_rate = None):
+    def _float_leg_analytics(
+        self,
+        swap_rates,
+        swap_times,
+        year_fracs,
+        floating_leg_details,
+        value_dt,
+        discount_curve_type,
+        index_curve_type=None,
+        first_fixing_rate=None,
+        requests=None,
+    ):
+        """Common routine for PV/Delta/Gamma of the floating leg."""
 
-        val = self.value_float_leg(
-                    swap_rates,
-                    swap_times,
-                    year_fracs,
-                    floating_leg_details,
-                    value_dt,
-                    discount_curve_type,
-                    index_curve_type,
-                    first_fixing_rate)
-        
-        valuation = Valuation(amount=val.item(),
-                              currency=floating_leg_details._currency)
-        
-        return valuation
+        if requests is None:
+            requests = {RequestTypes.VALUE}
 
-    def delta_float_leg(self,
-                    swap_rates,
-                    swap_times,
-                    year_fracs,
-                    floating_leg_details,
-                    value_dt,
-                    discount_curve_type,
-                    index_curve_type = None,
-                    first_fixing_rate = None):
-        
-        # Gradient w.r.t. swap_rates:
-        delta = grad(lambda sr: self.value_float_leg(
-            sr, swap_times, year_fracs,
+        curve_key = tuple(swap_times)
+        cache = self._cached_curve(
+            curve_key, swap_rates, swap_times, year_fracs, discount_curve_type
+        )
+        times = cache["times"]
+        dfs = cache["dfs"]
+        jac = cache["jac"]
+        hess_curve = cache["hess"]
+
+        dc_type = floating_leg_details._dc_type
+        payment_times = jnp.array(
+            [times_from_dates(dt, value_dt, dc_type) for dt in floating_leg_details._payment_dts]
+        )
+        start_times = jnp.array(
+            [times_from_dates(dt0, value_dt, dc_type) for dt0 in floating_leg_details._start_accrued_dts]
+        )
+        end_times = jnp.array(
+            [times_from_dates(dt1, value_dt, dc_type) for dt1 in floating_leg_details._end_accrued_dts]
+        )
+        pay_alphas = jnp.array(floating_leg_details._year_fracs)
+        spreads = jnp.full_like(pay_alphas, floating_leg_details._spread)
+        notionals = jnp.array(
+            floating_leg_details._notional_array or [floating_leg_details._notional] * len(pay_alphas)
+        )
+        principal = floating_leg_details._principal
+        leg_sign = +1.0 if floating_leg_details._leg_type == SwapTypes.RECEIVE else -1.0
+        value_time = times_from_dates(value_dt, value_dt, dc_type)
+        override_first = first_fixing_rate is not None
+        fix0 = first_fixing_rate if override_first else 0.0
+
+        pv_fn = partial(
+            self._float_leg_jax,
+            times=times,
+            disc_interp_type=discount_curve_type,
+            idx_interp_type=index_curve_type or discount_curve_type,
+            payment_times=payment_times,
+            start_times=start_times,
+            end_times=end_times,
+            pay_alphas=pay_alphas,
+            spreads=spreads,
+            notionals=notionals,
+            principal=principal,
+            leg_sign=leg_sign,
+            value_time=value_time,
+            first_fixing_rate=fix0,
+            override_first=override_first,
+        )
+
+        out = {}
+        if RequestTypes.VALUE in requests:
+            val = pv_fn(dfs)
+            out["value"] = Valuation(amount=float(val), currency=floating_leg_details._currency)
+
+        need_grad = RequestTypes.DELTA in requests or RequestTypes.GAMMA in requests
+        grad_dfs = None
+        if need_grad:
+            grad_dfs = grad(lambda d: pv_fn(d))(dfs)
+
+        if RequestTypes.DELTA in requests:
+            sensitivities = jnp.dot(grad_dfs, jac)
+            sensies = [float(x) * 1e-4 for x in sensitivities]
+            out["delta"] = Delta(
+                risk_ladder=sensies,
+                tenors=to_tenor(swap_times),
+                currency=floating_leg_details._currency,
+                curve_type=CurveTypes.GBP_OIS_SONIA,
+            )
+
+        if RequestTypes.GAMMA in requests:
+            hess_dfs = hessian(lambda d: pv_fn(d))(dfs)
+            term1 = jac.T @ hess_dfs @ jac
+            term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
+            gammas = term1 + term2
+            gammas = np.array(gammas, dtype=np.float64) * 1e-8
+            out["gamma"] = Gamma(gammas, swap_times)
+
+        return out
+
+    def valuation_float_leg(
+        self,
+        swap_rates,
+        swap_times,
+        year_fracs,
+        floating_leg_details,
+        value_dt,
+        discount_curve_type,
+        index_curve_type=None,
+        first_fixing_rate=None,
+    ):
+        res = self._float_leg_analytics(
+            swap_rates,
+            swap_times,
+            year_fracs,
             floating_leg_details,
             value_dt,
             discount_curve_type,
             index_curve_type,
-            first_fixing_rate
-        ))
+            first_fixing_rate,
+            {RequestTypes.VALUE},
+        )
+        return res["value"]
 
-        sensitivities = delta(swap_rates)
-
-        sensies = [x * 1e-4 for x in sensitivities]
-    
-        tenors = to_tenor(swap_times)
-
-        delta= Delta(risk_ladder=sensies, 
-              tenors=tenors,
-              currency=CurrencyTypes.GBP, 
-              curve_type=CurveTypes.GBP_OIS_SONIA)
-    
-        return delta
-    
-    def gamma_float_leg(self,
-                    swap_rates,
-                    swap_times,
-                    year_fracs,
-                    floating_leg_details,
-                    value_dt,
-                    discount_curve_type,
-                    index_curve_type = None,
-                    first_fixing_rate = None):
-        
-        # Gradient w.r.t. swap_rates:
-        hess_price = hessian(lambda sr: self.value_float_leg(
-            sr, swap_times, year_fracs,
+    def delta_float_leg(
+        self,
+        swap_rates,
+        swap_times,
+        year_fracs,
+        floating_leg_details,
+        value_dt,
+        discount_curve_type,
+        index_curve_type=None,
+        first_fixing_rate=None,
+    ):
+        res = self._float_leg_analytics(
+            swap_rates,
+            swap_times,
+            year_fracs,
             floating_leg_details,
             value_dt,
             discount_curve_type,
             index_curve_type,
-            first_fixing_rate
-        ))
+            first_fixing_rate,
+            {RequestTypes.DELTA},
+        )
+        return res["delta"]
 
-        gammas = hess_price(swap_rates)
-
-        # sensies = [x * 1e-4 for x in sensitivities]
-    
-        # tenors = to_tenor(swap_times)
-
-        # delta= Delta(risk_ladder=sensies, 
-        #       tenors=tenors,
-        #       currency=CurrencyTypes.GBP, 
-        #       curve_type=CurveTypes.GBP_OIS_SONIA)
-    
-        gammas = np.array(gammas, dtype=np.float64) * 1e-8
-
-        gamma = Gamma(gammas, swap_times)
-
-        return gamma
-
-
+    def gamma_float_leg(
+        self,
+        swap_rates,
+        swap_times,
+        year_fracs,
+        floating_leg_details,
+        value_dt,
+        discount_curve_type,
+        index_curve_type=None,
+        first_fixing_rate=None,
+    ):
+        res = self._float_leg_analytics(
+            swap_rates,
+            swap_times,
+            year_fracs,
+            floating_leg_details,
+            value_dt,
+            discount_curve_type,
+            index_curve_type,
+            first_fixing_rate,
+            {RequestTypes.GAMMA},
+        )
+        return res["gamma"]
