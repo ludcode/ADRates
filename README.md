@@ -32,5 +32,3 @@ cd ADRates
 pip install -r requirements.txt
 
 
-
-

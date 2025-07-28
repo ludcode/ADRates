@@ -38,6 +38,7 @@ class SwapFloatLeg:
                  bd_type: BusDayAdjustTypes = BusDayAdjustTypes.FOLLOWING,
                  dg_type: DateGenRuleTypes = DateGenRuleTypes.BACKWARD,
                  end_of_month: bool = False,
+                 notional_exchange: bool = False,
                  floating_index: CurveTypes = CurveTypes.GBP_OIS_SONIA,
                  currency: CurrencyTypes = CurrencyTypes.GBP):        
         """ Create the fixed leg of a swap contract giving the contract start
@@ -70,7 +71,7 @@ class SwapFloatLeg:
         self._spread = spread
         self._floating_index = floating_index
         self._currency = currency
-
+        self._notional_exchange = notional_exchange
         self._dc_type = dc_type
         self._cal_type = cal_type
         self._bd_type = bd_type
@@ -231,6 +232,17 @@ class SwapFloatLeg:
             self._payment_pvs[-1] += payment_pv
             leg_pv += payment_pv
             self._cumulative_pvs[-1] = leg_pv
+
+        if self._notional_exchange:
+            if self._effective_dt > value_dt:
+                df_start = discount_curve.df(self._effective_dt, self._dc_type) / df_value
+                leg_pv += self._notional * df_start
+            if pmnt_dt > value_dt:
+                df_end = discount_curve.df(self._termination_dt, self._dc_type) / df_value
+                end_pv = -self._notional * df_end
+                leg_pv += end_pv
+                self._payment_pvs[-1] += end_pv
+                self._cumulative_pvs[-1] = leg_pv
 
         if self._leg_type == SwapTypes.PAY:
             leg_pv = leg_pv * (-1.0)
