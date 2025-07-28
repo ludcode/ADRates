@@ -12,6 +12,7 @@ import jax
 
 from ...utils.error import LibError
 from ...utils.date import Date
+from ...utils.day_count import DayCount
 from ...utils.helpers import (check_argument_types,
                               _func_name, 
                               label_to_string, 
@@ -93,10 +94,14 @@ class OISCurve(DiscountCurve):
         # I use the last coupon date for the swap rate interpolation as this
         # may be different from the maturity date due to a holiday adjustment
         # and the swap rates need to align with the coupon payment dates
+
+        dcc = DayCount(self._dc_type)
+        days_in_year = dcc.days_in_year()
+
         for swap in self._used_swaps:
             swap_rate = swap._fixed_coupon
             maturity_dt = swap._adjusted_fixed_dts[-1]
-            tswap = (maturity_dt - self._value_dt) / gDaysInYear
+            tswap = (maturity_dt - self._value_dt) / days_in_year
             year_frac = swap._fixed_leg._year_fracs
             swap_times.append(tswap)
             swap_rates.append(swap_rate)

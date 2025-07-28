@@ -289,6 +289,45 @@ class DayCount:
             raise LibError(str(self._type) +
                            " is not one of DayCountTypes")
 
+
+    def days_in_year(self) -> int:
+        """
+        Return the fixed denominator (days per year) for this day-count convention.
+        Raises LibError if the convention’s denominator depends on the specific dates.
+        """
+        t = self._type
+
+        # 30/360 variants and ACT/360 all use a 360-day year
+        if t in {
+            DayCountTypes.THIRTY_360_BOND,
+            DayCountTypes.THIRTY_E_360,
+            DayCountTypes.THIRTY_E_360_ISDA,
+            DayCountTypes.THIRTY_E_PLUS_360,
+            DayCountTypes.ACT_360
+        }:
+            return 360
+
+        # ACT/365F always uses 365
+        if t is DayCountTypes.ACT_365F:
+            return 365
+
+        # SIMPLE uses the global gDaysInYear
+        if t is DayCountTypes.SIMPLE:
+            return gDaysInYear
+
+        # These truly vary by year or by coupon‐period length, so we can’t
+        # pick a single constant without dates:
+        if t in {DayCountTypes.ACT_ACT_ISDA, DayCountTypes.ZERO}:
+            raise LibError("ACT/ACT (ISDA or ZERO) requires the actual dates to compute days in year")
+
+        if t is DayCountTypes.ACT_365L:
+            raise LibError("ACT/365L depends on whether the period spans a leap day")
+
+        if t is DayCountTypes.ACT_ACT_ICMA:
+            raise LibError("ACT/ACT ICMA needs the full coupon-period dates and frequency")
+
+        raise LibError(f"No fixed days-in-year defined for convention {t}")
+
 ###############################################################################
 
     def __repr__(self):

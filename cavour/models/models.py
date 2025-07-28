@@ -29,7 +29,7 @@ class Model:
     _curve_params_dict: Dict[str, dict] = field(default_factory=dict)  # ← Add this line
     _fx_params_dict: Dict[str, dict] = field(default_factory=dict) 
     _builder = MarketCurveBuilder(MARKET_DATA, FX_MARKET_DATA)
-    
+    _market_data_used = {}
 
     def prebuilt_curve(
         self,
@@ -43,6 +43,10 @@ class Model:
 
         for curve_name in curve_names:
             curve_inputs = self._builder.get_curve_inputs(curve_name, self.value_dt)
+
+            # store market data
+            self._market_data_used[curve_name] = curve_inputs
+
             self.build_curve(**curve_inputs)
 
     def prebuilt_fx(
@@ -63,12 +67,13 @@ class Model:
         tenor_list: List[str],
         spot_days: int = 0,
         swap_type=SwapTypes.PAY,
-        fixed_dcc_type=DayCountTypes.ACT_365F,
+        fixed_dcc_type=DayCountTypes.ACT_360,
         fixed_freq_type=FrequencyTypes.ANNUAL,
         float_freq_type=FrequencyTypes.ANNUAL,
-        float_dc_type=DayCountTypes.ACT_365F,
+        float_dc_type=DayCountTypes.ACT_360,
         bus_day_type=BusDayAdjustTypes.MODIFIED_FOLLOWING,
-        interp_type=InterpTypes.LINEAR_ZERO_RATES
+        interp_type=InterpTypes.LINEAR_ZERO_RATES,
+        payment_lag: int = 0,
     ):
         settle_dt = self.value_dt.add_weekdays(spot_days)
         swaps = [
@@ -81,7 +86,8 @@ class Model:
                 fixed_dc_type=fixed_dcc_type,
                 bd_type=bus_day_type,
                 float_freq_type=float_freq_type,
-                float_dc_type=float_dc_type
+                float_dc_type=float_dc_type,
+                payment_lag=payment_lag
             )
             for tenor, px in zip(tenor_list, px_list)
         ]
@@ -90,7 +96,7 @@ class Model:
             value_dt=self.value_dt,
             ois_swaps=swaps,
             interp_type=interp_type,
-            check_refit=False
+            check_refit=True
         )
         self._curves_dict[name] = curve
 

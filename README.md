@@ -21,7 +21,25 @@
 Clone the repository and install dependencies:
 
 ```bash
-git clone https://github.com/ludocode/ADRates.git
+git clone https://github.com/ludcode/ADRates.git
 cd ADRates
 pip install -r requirements.txt
+
+```
+
+### Verify installation
+
+Run the unit tests to ensure everything works as expected:
+
+```bash
+pytest -q
+```
+
+## Usage Example (if you have a Bloomberg Terminal)
+
+```python
+from cavour.models.models import Model
+model = Model(value_dt=date.Date(30, 4, 2024))
+model.prebuilt_curve("GBP_OIS_SONIA")
+```
 
