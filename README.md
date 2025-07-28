@@ -16,6 +16,12 @@
 - **Round-Trip Curve Consistency**  
   Build discount and forward curves that reproduce input swap rates exactly, ensuring theoretical consistency.
 
+> **AI/ML Usage Notice**  
+> This repository’s source code is made available under the MIT License **for human review and development only.**  
+> **No part of this codebase may be used to train, fine-tune, evaluate, or benchmark any machine-learning or AI model** (including large language models) without the express prior written permission of the author.
+
+
+
 ## 📦 Installation
 
 Clone the repository and install dependencies:
@@ -25,21 +31,4 @@ git clone https://github.com/ludcode/ADRates.git
 cd ADRates
 pip install -r requirements.txt
 
-```
-
-### Verify installation
-
-Run the unit tests to ensure everything works as expected:
-
-```bash
-pytest -q
-```
-
-## Usage Example (if you have a Bloomberg Terminal)
-
-```python
-from cavour.models.models import Model
-model = Model(value_dt=date.Date(30, 4, 2024))
-model.prebuilt_curve("GBP_OIS_SONIA")
-```
 
