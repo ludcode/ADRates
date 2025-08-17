@@ -10,18 +10,18 @@ import jax.numpy as jnp
 from jax import grad, hessian
 import jax
 
-from ...utils.error import LibError
-from ...utils.date import Date
-from ...utils.day_count import DayCount
-from ...utils.helpers import (check_argument_types,
+from cavour.utils.error import LibError
+from cavour.utils.date import Date
+from cavour.utils.day_count import DayCount
+from cavour.utils.helpers import (check_argument_types,
                               _func_name, 
                               label_to_string, 
                               format_table)
-from ...utils.global_vars import gDaysInYear
-from ...market.curves.interpolator import InterpTypes, Interpolator
-from ...market.curves.discount_curve import DiscountCurve
+from cavour.utils.global_vars import gDaysInYear
+from cavour.market.curves.interpolator import InterpTypes, Interpolator
+from cavour.market.curves.discount_curve import DiscountCurve
 
-from ...trades.rates.ois import OIS
+from cavour.trades.rates.ois import OIS
 
 SWAP_TOL = 1e-10
 

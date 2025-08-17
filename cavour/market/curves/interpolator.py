@@ -9,8 +9,8 @@ from jax import lax
 import jax.numpy as jnp
 from scipy.interpolate import PchipInterpolator
 from scipy.interpolate import CubicSpline
-from ...utils.error import LibError
-from ...utils.global_vars import g_small
+from cavour.utils.error import LibError
+from cavour.utils.global_vars import g_small
 
 ###############################################################################
 

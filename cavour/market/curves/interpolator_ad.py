@@ -3,9 +3,9 @@ import jax.numpy as jnp
 from functools import partial
 from enum import Enum
 from scipy.interpolate import PchipInterpolator, CubicSpline
-from ...utils.error import LibError
-from ...utils.global_vars import g_small
-from ...utils.global_types import InterpTypes
+from cavour.utils.error import LibError
+from cavour.utils.global_vars import g_small
+from cavour.utils.global_types import InterpTypes
 
 def _compute_pchip_slopes(x, y):
     # Monotonic cubic Hermite (PCHIP) slopes

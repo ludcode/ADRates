@@ -1,4 +1,4 @@
-from ..utils.error import LibError
+from cavour.utils.error import LibError
 
 from enum import Enum
 

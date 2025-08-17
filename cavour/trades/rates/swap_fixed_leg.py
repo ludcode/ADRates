@@ -2,19 +2,19 @@
 
 ##############################################################################
 
-from ...utils.error import LibError
-from ...utils.date import Date
-from ...utils.math import ONE_MILLION
-from ...utils.day_count import DayCount, DayCountTypes
-from ...utils.frequency import FrequencyTypes
-from ...utils.global_types import CurveTypes
-from ...utils.calendar import CalendarTypes,  DateGenRuleTypes
-from ...utils.calendar import Calendar, BusDayAdjustTypes
-from ...utils.schedule import Schedule
-from ...utils.helpers import format_table, label_to_string, check_argument_types
-from ...utils.global_types import SwapTypes, InstrumentTypes
-from ...utils.currency import CurrencyTypes
-from ...market.curves.discount_curve import DiscountCurve
+from cavour.utils.error import LibError
+from cavour.utils.date import Date
+from cavour.utils.math import ONE_MILLION
+from cavour.utils.day_count import DayCount, DayCountTypes
+from cavour.utils.frequency import FrequencyTypes
+from cavour.utils.global_types import CurveTypes
+from cavour.utils.calendar import CalendarTypes,  DateGenRuleTypes
+from cavour.utils.calendar import Calendar, BusDayAdjustTypes
+from cavour.utils.schedule import Schedule
+from cavour.utils.helpers import format_table, label_to_string, check_argument_types
+from cavour.utils.global_types import SwapTypes, InstrumentTypes
+from cavour.utils.currency import CurrencyTypes
+from cavour.market.curves.discount_curve import DiscountCurve
 
 ##########################################################################
 

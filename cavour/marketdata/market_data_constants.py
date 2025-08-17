@@ -116,7 +116,15 @@ MARKET_DATA = {
             "40Y": "BPXOQQ40 BGN Curncy",
             "50Y": "BPXOQQ50 BGN Curncy"
         },
-        "conventions": {},
+        "conventions": {
+            "fixed_day_count": DayCountTypes.ACT_360,
+            "fixed_frequency": FrequencyTypes.ANNUAL,
+            "business_day_adjustment": BusDayAdjustTypes.MODIFIED_FOLLOWING,
+            "float_frequency": FrequencyTypes.ANNUAL,
+            "float_day_count": DayCountTypes.ACT_360,
+            "interp_type": InterpTypes.LINEAR_ZERO_RATES,
+            "payment_lag" : 2
+        },
         "currency": "GBPUSD",
         "type": "XCCY",
         "index": "SONIA-SOFR"
