@@ -61,6 +61,7 @@ class CalendarTypes(Enum):
     TARGET = 13
     UNITED_STATES = 14
     UNITED_KINGDOM = 15
+    INTERSECTION = 16
 
 
 class DateGenRuleTypes(Enum):
@@ -78,7 +79,8 @@ class Calendar:
     specified calendar. """
 
     def __init__(self,
-                 cal_type: CalendarTypes):
+                 cal_type: CalendarTypes,
+                 constituent_calendars=None):
         """ Create a calendar based on a specified calendar type. """
 
         if cal_type not in CalendarTypes:
@@ -87,6 +89,7 @@ class Calendar:
                 str(cal_type))
 
         self._cal_type = cal_type
+        self._constituent_calendars = constituent_calendars or []
 
     ###########################################################################
 
@@ -213,6 +216,10 @@ class Calendar:
         """ Determines if a date is a business day according to the specified
         calendar. If it is it returns True, otherwise False. """
 
+        # Handle intersection calendar
+        if self._cal_type == CalendarTypes.INTERSECTION:
+            return all(cal.is_business_day(dt) for cal in self._constituent_calendars)
+
         # For all calendars so far, SAT and SUN are not business days
         # If this ever changes I will need to add a filter here.
         if dt.is_weekend():
@@ -230,6 +237,10 @@ class Calendar:
         """ Determines if a date is a Holiday according to the specified
         calendar. Weekends are not holidays unless the holiday falls on a
         weekend date. """
+
+        # Handle intersection calendar - a date is a holiday if it's a holiday in ANY calendar
+        if self._cal_type == CalendarTypes.INTERSECTION:
+            return any(cal.is_holiday(dt) for cal in self._constituent_calendars)
 
         start_dt = Date(1, 1, dt.y())
         self._day_in_year = dt.excel_dt() - start_dt.excel_dt() + 1
@@ -1092,5 +1103,32 @@ class Calendar:
     def __repr__(self):
         s = self._cal_type
         return s
+
+###############################################################################
+
+
+def create_calendar_intersection(*calendars):
+    """ Create a new calendar that is the intersection of 2 or more calendars.
+    A date is only a business day if it's a business day in ALL calendars.
+    
+    Args:
+        *calendars: Variable number of Calendar objects to intersect
+        
+    Returns:
+        Calendar: A new Calendar object with CalendarTypes.INTERSECTION
+        
+    Example:
+        us_cal = Calendar(CalendarTypes.UNITED_STATES)
+        uk_cal = Calendar(CalendarTypes.UNITED_KINGDOM)
+        combined_cal = create_calendar_intersection(us_cal, uk_cal)
+    """
+    if len(calendars) < 2:
+        raise LibError("Need at least 2 calendars to create intersection")
+    
+    for cal in calendars:
+        if not isinstance(cal, Calendar):
+            raise LibError("All arguments must be Calendar objects")
+    
+    return Calendar(CalendarTypes.INTERSECTION, list(calendars))
 
 ###############################################################################

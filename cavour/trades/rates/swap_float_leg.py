@@ -2,19 +2,19 @@
 
 ##############################################################################
 
-from ...utils.error import LibError
-from ...utils.date import Date
-from ...utils.math import ONE_MILLION
-from ...utils.day_count import DayCount, DayCountTypes
-from ...utils.frequency import FrequencyTypes
-from ...utils.global_types import CurveTypes
-from ...utils.calendar import CalendarTypes,  DateGenRuleTypes
-from ...utils.calendar import Calendar, BusDayAdjustTypes
-from ...utils.schedule import Schedule
-from ...utils.helpers import format_table, label_to_string, check_argument_types
-from ...utils.global_types import SwapTypes
-from ...utils.currency import CurrencyTypes
-from ...market.curves.discount_curve import DiscountCurve
+from cavour.utils.error import LibError
+from cavour.utils.date import Date
+from cavour.utils.math import ONE_MILLION
+from cavour.utils.day_count import DayCount, DayCountTypes
+from cavour.utils.frequency import FrequencyTypes
+from cavour.utils.global_types import CurveTypes
+from cavour.utils.calendar import CalendarTypes,  DateGenRuleTypes
+from cavour.utils.calendar import Calendar, BusDayAdjustTypes
+from cavour.utils.schedule import Schedule
+from cavour.utils.helpers import format_table, label_to_string, check_argument_types
+from cavour.utils.global_types import SwapTypes
+from cavour.utils.currency import CurrencyTypes
+from cavour.market.curves.discount_curve import DiscountCurve
 
 ##########################################################################
 
@@ -178,6 +178,14 @@ class SwapFloatLeg:
 
         if not len(self._notional_array):
             self._notional_array = [self._notional] * num_payments
+        elif len(self._notional_array) != num_payments:
+            # Adjust notional array length if payment dates have been modified
+            if len(self._notional_array) < num_payments:
+                # Add notional for additional payments (e.g., from notional exchange)
+                self._notional_array = [self._notional] + self._notional_array
+            else:
+                # Trim excess notional entries
+                self._notional_array = self._notional_array[:num_payments]
 
         index_basis = index_curve._dc_type
         index_day_counter = DayCount(index_basis)
@@ -233,16 +241,51 @@ class SwapFloatLeg:
             leg_pv += payment_pv
             self._cumulative_pvs[-1] = leg_pv
 
+
+        # Add notional exchange if enabled
         if self._notional_exchange:
-            if self._effective_dt > value_dt:
+            # Notional exchange logic:
+            # At effective date: always negative (outflow)
+            # At maturity: always positive (inflow)
+            
+            start_notional_pv = 0.0
+            end_notional_pv = 0.0
+            
+            # Start notional exchange (at effective date) - always negative
+            if self._effective_dt >= value_dt:
                 df_start = discount_curve.df(self._effective_dt, self._dc_type) / df_value
-                leg_pv += self._notional * df_start
-            if pmnt_dt > value_dt:
-                df_end = discount_curve.df(self._termination_dt, self._dc_type) / df_value
-                end_pv = -self._notional * df_end
-                leg_pv += end_pv
-                self._payment_pvs[-1] += end_pv
-                self._cumulative_pvs[-1] = leg_pv
+                start_notional_amount = float(-self._notional)  # Always negative at start
+                start_notional_pv = float(-self._notional * df_start)
+                
+                # Add payment date at beginning for effective date
+                # Need to insert into ALL arrays to maintain consistent lengths
+                self._payment_dts.insert(0, self._effective_dt)
+                self._payments.insert(0, start_notional_amount)
+                self._payment_pvs.insert(0, start_notional_pv)
+                self._payment_dfs.insert(0, df_start)
+                self._rates.insert(0, 0.0)
+                self._cumulative_pvs.insert(0, start_notional_pv)
+                self._start_accrued_dts.insert(0, self._effective_dt)
+                self._end_accrued_dts.insert(0, self._effective_dt)
+                self._year_fracs.insert(0, 0.0)
+                self._accrued_days.insert(0, 0)
+                
+                # Update cumulative PVs for all subsequent payments
+                for i in range(1, len(self._cumulative_pvs)):
+                    self._cumulative_pvs[i] += start_notional_pv
+            
+            # End notional exchange (at maturity date) - always positive
+            if self._maturity_dt >= value_dt and len(self._payments) > 0:
+                df_end = discount_curve.df(self._maturity_dt, self._dc_type) / df_value
+                end_notional_amount = float(self._notional)  # Always positive at end
+                end_notional_pv = float(self._notional * df_end)
+                
+                # Add to last payment
+                self._payments[-1] += end_notional_amount
+                self._payment_pvs[-1] += end_notional_pv
+                self._cumulative_pvs[-1] += end_notional_pv
+            
+            leg_pv += start_notional_pv + end_notional_pv
 
         if self._leg_type == SwapTypes.PAY:
             leg_pv = leg_pv * (-1.0)
@@ -261,6 +304,7 @@ class SwapFloatLeg:
         print("SPREAD (bp):", self._spread * 10000)
         print("FREQUENCY:", str(self._freq_type))
         print("DAY COUNT:", str(self._dc_type))
+        print("NOTIONAL EXCHANGE:", self._notional_exchange)
 
         if len(self._payment_dts) == 0:
             print("Payments Dates not calculated.")
@@ -300,6 +344,7 @@ class SwapFloatLeg:
         print("SPREAD (BPS):", self._spread * 10000)
         print("FREQUENCY:", str(self._freq_type))
         print("DAY COUNT:", str(self._dc_type))
+        print("NOTIONAL EXCHANGE:", self._notional_exchange)
 
         if len(self._payments) == 0:
             print("Payments not calculated.")
@@ -341,6 +386,7 @@ class SwapFloatLeg:
         s += label_to_string("CALENDAR", self._cal_type)
         s += label_to_string("BUS DAY ADJUST", self._bd_type)
         s += label_to_string("DATE GEN TYPE", self._dg_type)
+        s += label_to_string("NOTIONAL EXCHANGE", self._notional_exchange)
         return s
 
 ###############################################################################

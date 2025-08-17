@@ -8,16 +8,16 @@ import jax.numpy as jnp
 
 from .interpolator import Interpolator, InterpTypes, interpolate
 
-from ...utils.date import Date
-from ...utils.error import LibError
-from ...utils.global_vars import gDaysInYear, g_small
-from ...utils.frequency import annual_frequency, FrequencyTypes
-from ...utils.day_count import DayCount, DayCountTypes
-from ...utils.math import test_monotonicity
-from ...utils.schedule import Schedule
-from ...utils.helpers import check_argument_types
-from ...utils.helpers import times_from_dates
-from ...utils.helpers import label_to_string
+from cavour.utils.date import Date
+from cavour.utils.error import LibError
+from cavour.utils.global_vars import gDaysInYear, g_small
+from cavour.utils.frequency import annual_frequency, FrequencyTypes
+from cavour.utils.day_count import DayCount, DayCountTypes
+from cavour.utils.math import test_monotonicity
+from cavour.utils.schedule import Schedule
+from cavour.utils.helpers import check_argument_types
+from cavour.utils.helpers import times_from_dates
+from cavour.utils.helpers import label_to_string
 
 
 ###############################################################################
