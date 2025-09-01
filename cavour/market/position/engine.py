@@ -1,14 +1,16 @@
 "Valuation Engine"
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 from jax import lax, jit, grad, hessian, jacrev, linearize
 from functools import partial
 from typing import Sequence, Any, Dict
 
-from cavour.market.curves.interpolator import *
+from cavour.utils.global_types import InterpTypes
 from cavour.utils.helpers import to_tenor, times_from_dates
 from cavour.utils.date import Date
+from cavour.utils.error import LibError
 from cavour.market.curves.interpolator_ad import InterpolatorAd
 from cavour.requests.results import Valuation, Gamma, Delta, AnalyticsResult
 from cavour.utils.global_types import (SwapTypes, 
@@ -36,6 +38,8 @@ class Engine:
 
         ir_model = getattr(self.model.curves, derivative._floating_index.name)
 
+        # Batch gradient computations by passing all risk requests together
+        # This allows the caching mechanism to compute gradients once and reuse them
         fixed = self._fixed_leg_analytics(
             ir_model.swap_rates,
             ir_model.swap_times,
@@ -43,7 +47,7 @@ class Engine:
             derivative._fixed_leg,
             ir_model._value_dt,
             ir_model._interp_type,
-            reqs,
+            reqs,  # Pass all requests to enable batched gradient computation
         )
 
         floating = self._float_leg_analytics(
@@ -55,7 +59,7 @@ class Engine:
             ir_model._interp_type,
             ir_model._interp_type,
             None,
-            reqs,
+            reqs,  # Pass all requests to enable batched gradient computation
         )
 
         value = None
@@ -170,6 +174,7 @@ class Engine:
             raise LibError(f"{self.derivative.derivative_type} not yet implemented")
     
 
+    @partial(jit, static_argnums=(0,))
     def build_curve_ad(self,
                     swap_rates: list[float],
                     swap_times: list[float],
@@ -185,27 +190,54 @@ class Engine:
         times = jnp.array(swap_times)    # shape (N,)
         N     = rates.shape[0]
 
-        # 2) Precompute prev_idx & acc_last in Python (using 1-dp rounding)
-        times_rounded = [round(t, 1) for t in swap_times]
-        prev_idx = []
-        acc_last = []
-        for i, fr in enumerate(year_fracs):
-            if len(fr) == 1:
-                prev_idx.append(-1)
-                acc_last.append(fr[0])
-            else:
-                last_pay = round(sum(fr[:-1]), 1)
-                if last_pay in times_rounded:
-                    j = times_rounded.index(last_pay)
-                else:
-                    # fallback: nearest tenor
-                    diffs = [abs(t - last_pay) for t in swap_times]
-                    j = int(min(range(len(diffs)), key=lambda k: diffs[k]))
-                prev_idx.append(j)
-                acc_last.append(fr[-1])
-
-        prev_idx = jnp.array(prev_idx, dtype=jnp.int32)  # shape (N,)
-        acc_last = jnp.array(acc_last)                   # shape (N,)
+        # 2) Precompute prev_idx & acc_last - keep EXACT same logic but JAX-traceable
+        times_rounded_jax = jnp.round(times, 1)  # JAX version of rounding
+        
+        # Pre-process year_fracs data structures for JAX compatibility
+        max_len = max(len(fr) for fr in year_fracs)
+        year_fracs_lengths = jnp.array([len(fr) for fr in year_fracs])
+        
+        # Pad year_fracs to enable JAX operations (pad with zeros - won't affect sums)
+        year_fracs_padded = jnp.array([
+            fr + [0.0] * (max_len - len(fr)) for fr in year_fracs
+        ])
+        
+        def compute_prev_idx_acc_last(i):
+            fr_len = year_fracs_lengths[i]
+            
+            # Case 1: if len(fr) == 1 → prev_idx = -1, acc_last = fr[0]
+            case1_prev_idx = -1
+            case1_acc_last = year_fracs_padded[i, 0]
+            
+            # Case 2: len(fr) > 1 → compute sum(fr[:-1]) and find index
+            # Sum all but last: sum(fr[:-1]) = sum first (fr_len-1) elements
+            cumsum = jnp.cumsum(year_fracs_padded[i])
+            last_pay_unrounded = jnp.where(fr_len > 1, cumsum[fr_len-2], 0.0)
+            last_pay_rounded = jnp.round(last_pay_unrounded, 1)
+            
+            # Check if last_pay_rounded in times_rounded (exact match search)
+            matches = jnp.isclose(times_rounded_jax, last_pay_rounded, atol=1e-10)
+            has_exact_match = jnp.any(matches)
+            exact_match_idx = jnp.argmax(matches)  # index of first match
+            
+            # Fallback: nearest tenor (minimum absolute difference)
+            diffs = jnp.abs(times - last_pay_rounded)
+            nearest_idx = jnp.argmin(diffs)
+            
+            # Select index: use exact match if found, otherwise nearest
+            case2_prev_idx = jnp.where(has_exact_match, exact_match_idx, nearest_idx)
+            case2_acc_last = year_fracs_padded[i, fr_len-1]  # last element: fr[-1]
+            
+            # Final selection between case 1 and case 2
+            prev_idx_val = jnp.where(fr_len == 1, case1_prev_idx, case2_prev_idx)
+            acc_last_val = jnp.where(fr_len == 1, case1_acc_last, case2_acc_last)
+            
+            return prev_idx_val, acc_last_val
+        
+        # Apply to all indices using vmap for efficiency
+        results = jax.vmap(compute_prev_idx_acc_last)(jnp.arange(N))
+        prev_idx = results[0].astype(jnp.int32)  # shape (N,)
+        acc_last = results[1]                    # shape (N,)
 
 
         # 3) JAX-friendly scan step
@@ -239,22 +271,64 @@ class Engine:
         if cache is not None:
             return cache
 
-        build = lambda r: self.build_curve_ad(r, swap_times, year_fracs)[1]
+        # Create JIT-compiled versions for massive speedup
+        @jit
+        def build(r):
+            return self.build_curve_ad(r, swap_times, year_fracs)[1]
+        
+        @jit  
+        def jac_fn(r):
+            return jacrev(build)(r)
+            
+        @jit
+        def hess_fn(r):
+            return hessian(build)(r)
+        
         rates = jnp.array(swap_rates)
         times = jnp.array(swap_times)
+        
+        # These will compile on first call, then be blazing fast
         dfs = build(rates)
-
-        jac = jacrev(build)(rates)
-        hess = hessian(build)(rates)
+        jac = jac_fn(rates)  
+        hess = hess_fn(rates)
         cache = {
             "times": times,
             "dfs": dfs,
             "jac": jac,
             "hess": hess,
+            "gradient_cache": {},  # Cache for leg-specific gradients
         }
         self._curve_cache[key] = cache
         return cache
+    
+    def _get_cached_gradients(self, cache, pv_fn, dfs, leg_signature, compute_hessian=False):
+        """Get or compute gradients for a pricing function and cache them."""
+        gradient_cache = cache["gradient_cache"]
         
+        if leg_signature in gradient_cache:
+            cached_grads = gradient_cache[leg_signature]
+            grad_dfs = cached_grads["grad_dfs"]
+            hess_dfs = cached_grads.get("hess_dfs")
+            
+            # If hessian is requested but not cached, compute it now
+            if compute_hessian and hess_dfs is None:
+                hess_dfs = hessian(lambda d: pv_fn(d))(dfs)
+                cached_grads["hess_dfs"] = hess_dfs
+                
+        else:
+            # Compute gradients (always compute both if hessian is needed for efficiency)
+            grad_dfs = grad(lambda d: pv_fn(d))(dfs)
+            hess_dfs = hessian(lambda d: pv_fn(d))(dfs) if compute_hessian else None
+            
+            # Cache the results
+            gradient_cache[leg_signature] = {
+                "grad_dfs": grad_dfs,
+                "hess_dfs": hess_dfs
+            }
+        
+        return grad_dfs, hess_dfs
+        
+    @partial(jit, static_argnums=(0, 3))  # self and interp_type are static
     def _price_fixed_leg_jax(self,
                             dfs,
                             times,
@@ -388,9 +462,16 @@ class Engine:
             out["value"] = Valuation(amount=float(val), currency=fixed_leg_details._currency)
 
         need_grad = RequestTypes.DELTA in requests or RequestTypes.GAMMA in requests
-        grad_dfs = None
+        compute_hessian = RequestTypes.GAMMA in requests
+        
         if need_grad:
-            grad_dfs = grad(lambda d: pv_fn(d))(dfs)
+            # Create a unique signature for this fixed leg
+            leg_signature = ("fixed", hash(tuple(payment_times.tolist() + payments.tolist())), 
+                           principal, notional, leg_sign, value_time)
+            
+            grad_dfs, hess_dfs = self._get_cached_gradients(
+                cache, pv_fn, dfs, leg_signature, compute_hessian
+            )
 
         if RequestTypes.DELTA in requests:
             sensitivities = jnp.dot(grad_dfs, jac)
@@ -403,7 +484,6 @@ class Engine:
             )
 
         if RequestTypes.GAMMA in requests:
-            hess_dfs = hessian(lambda d: pv_fn(d))(dfs)
             term1 = jac.T @ hess_dfs @ jac
             term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
             gammas = term1 + term2
@@ -473,6 +553,7 @@ class Engine:
         return res["gamma"]
     
 
+    @partial(jit, static_argnums=(0, 3, 4))  # self, disc_interp_type, idx_interp_type
     def _float_leg_jax(self,
                     dfs,
                     times,
@@ -680,9 +761,18 @@ class Engine:
             out["value"] = Valuation(amount=float(val), currency=floating_leg_details._currency)
 
         need_grad = RequestTypes.DELTA in requests or RequestTypes.GAMMA in requests
-        grad_dfs = None
+        compute_hessian = RequestTypes.GAMMA in requests
+        
         if need_grad:
-            grad_dfs = grad(lambda d: pv_fn(d))(dfs)
+            # Create a unique signature for this floating leg
+            leg_signature = ("float", 
+                           hash(tuple(payment_times.tolist() + start_times.tolist() + end_times.tolist())), 
+                           hash(tuple(pay_alphas.tolist() + spreads.tolist() + notionals.tolist())),
+                           principal, leg_sign, value_time, fix0, override_first)
+            
+            grad_dfs, hess_dfs = self._get_cached_gradients(
+                cache, pv_fn, dfs, leg_signature, compute_hessian
+            )
 
         if RequestTypes.DELTA in requests:
             sensitivities = jnp.dot(grad_dfs, jac)
@@ -695,7 +785,6 @@ class Engine:
             )
 
         if RequestTypes.GAMMA in requests:
-            hess_dfs = hessian(lambda d: pv_fn(d))(dfs)
             term1 = jac.T @ hess_dfs @ jac
             term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
             gammas = term1 + term2
