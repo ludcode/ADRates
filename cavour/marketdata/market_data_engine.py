@@ -1,8 +1,25 @@
+import os
+
+# When Bloomberg is disabled (e.g., on Mac), stub 'blpapi' so xbbg import won't explode
+if os.getenv("BLOOMBERG_DISABLED") == "1":
+    import sys, types
+    sys.modules.setdefault("blpapi", types.ModuleType("blpapi"))
+
+try:
+    stop #from xbbg import blp  # type: ignore
+except Exception:
+    class _BLPStub:
+        def __getattr__(self, name):
+            raise ImportError("xbbg/blpapi not available on this machine")
+    blp = _BLPStub()
+
 from typing import Dict, Optional, Tuple, List
-from xbbg import blp
-from cavour.utils import *
+from cavour.utils.date import Date
+from cavour.utils.global_types import SwapTypes
 import heapq
 import math
+
+
 
 
 class MarketCurveBuilder:

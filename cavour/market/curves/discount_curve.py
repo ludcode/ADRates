@@ -102,21 +102,24 @@ class DiscountCurve:
         dates. The day count is used to calculate the elapsed year fraction."""
 
         if isinstance(times, float):
-            times = np.array([times])
+            times = jnp.array([times])
+        else:
+            times = jnp.asarray(times)
 
-        t = np.maximum(times, g_small)
+        t = jnp.maximum(times, g_small)
+        rates = jnp.asarray(rates)
 
         f = annual_frequency(freq_type)
 
         if freq_type == FrequencyTypes.CONTINUOUS:
-            df = np.exp(-rates * t)
+            df = jnp.exp(-rates * t)
         elif freq_type == FrequencyTypes.SIMPLE:
             df = 1.0 / (1.0 + rates * t)
         elif freq_type == FrequencyTypes.ANNUAL or \
                 freq_type == FrequencyTypes.SEMI_ANNUAL or \
                 freq_type == FrequencyTypes.QUARTERLY or \
                 freq_type == FrequencyTypes.MONTHLY:
-            df = 1.0 / np.power(1.0 + rates / f, f * t)
+            df = 1.0 / jnp.power(1.0 + rates / f, f * t)
         else:
             raise LibError("Unknown Frequency type")
 
@@ -156,22 +159,20 @@ class DiscountCurve:
         times = times_from_dates(
             date_list, self._value_dt, dc_type)
 
-        for i in range(0, num_dates):
+        # Convert to JAX arrays for vectorized computation
+        times = jnp.asarray(times)
+        df_array = jnp.asarray(df_list)
+        
+        t = jnp.maximum(times, g_small)
 
-            df = df_list[i]
+        if freq_type == FrequencyTypes.CONTINUOUS:
+            zero_rates = -jnp.log(df_array) / t
+        elif freq_type == FrequencyTypes.SIMPLE:
+            zero_rates = (1.0 / df_array - 1.0) / t
+        else:
+            zero_rates = (jnp.power(df_array, -1.0 / (t * f)) - 1.0) * f
 
-            t = max(times[i], g_small)
-
-            if freq_type == FrequencyTypes.CONTINUOUS:
-                r = -np.log(df) / t
-            elif freq_type == FrequencyTypes.SIMPLE:
-                r = (1.0 / df - 1.0) / t
-            else:
-                r = (np.power(df, -1.0 / (t * f)) - 1.0) * f
-
-            zero_rates.append(r)
-
-        return np.array(zero_rates)
+        return zero_rates
 
     ###########################################################################
 
@@ -304,81 +305,6 @@ class DiscountCurve:
         else:
             return np.array(dfs)
         
-    ###########################################################################
-
-    def df_ad(self,
-           dt: (list, float),
-           day_count=DayCountTypes.ACT_ACT_ISDA):
-        ''' Function to calculate a discount factor from a date or a
-        vector of dates. The day count determines how dates get converted to
-        years. I allow this to default to ACT_ACT_ISDA unless specified. '''
-
-        #times = times_from_dates(dt, self._value_dt, day_count)
-        dfs = self._df_ad(dt)
-
-        if isinstance(dfs, float):
-            return dfs
-        else:
-            return jnp.array(dfs)
-
-    ###########################################################################
-
-    def _df_ad(self,
-            t: (float, np.ndarray)):
-        
-        """ Hidden function to calculate a discount factor from a time or a
-        vector of times. Discourage usage in favour of passing in dates. """
-
-        # if self._interp_type is InterpTypes.FLAT_FWD_RATES or \
-        #         self._interp_type is InterpTypes.LINEAR_ZERO_RATES or \
-        #         self._interp_type is InterpTypes.LINEAR_FWD_RATES:
-
-        #     df = interpolate(t,
-        #                      self._times,
-        #                      self._dfs,
-        #                      self._interp_type.value)
-
-        # else:
-
-        #     df = self._interpolator.interpolate(t)
-
-        df = self._linear_forward_interp(
-            t = t,
-            times = self._times,
-            dfs = self._dfs
-        )
-
-        return df
-    
-    ###########################################################################
-    
-    def _linear_forward_interp(self, t, times, dfs):
-        """
-        JAX-compatible linear forward rate interpolation for discount factors.
-
-        Parameters:
-        - t: Target time (scalar or array).
-        - times: JAX array of tenor times.
-        - dfs: JAX array of discount factors.
-
-        Returns:
-        - Interpolated discount factor at t.
-        """
-        # Ensure inputs are JAX arrays
-        times = jnp.asarray(times)
-        dfs = jnp.asarray(dfs)
-
-        # Compute continuously compounded forward rates between points
-        fwd_rates = -jnp.log(dfs[1:] / dfs[:-1]) / (times[1:] - times[:-1])
-
-        # Interpolate forward rates at t
-        fwd_interp = jnp.interp(t, times[:-1], fwd_rates)  # Linear interpolation of forward rates
-
-        # Compute discount factor at t using interpolated forward rate
-        t0_index = jnp.searchsorted(times, t, side="right") - 1
-        df_t = dfs[t0_index] * jnp.exp(-fwd_interp * (t - times[t0_index]))
-
-        return df_t
     ###########################################################################
 
     def _df(self,

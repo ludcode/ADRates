@@ -77,17 +77,15 @@ def grid_index(t, grid_times):
 
 def beta_vector_to_corr_matrix(betas):
     """ Convert a one-factor vector of factor weights to a square correlation
-    matrix. """
-
-    num_assets = len(betas)
-    correlation = np.ones(shape=(num_assets, num_assets))
-    for i in range(0, num_assets):
-        for j in range(0, i):
-            c = betas[i] * betas[j]
-            correlation[i, j] = c
-            correlation[j, i] = c
-
-    return np.array(correlation)
+    matrix. Optimized for JAX. """
+    
+    betas = jnp.asarray(betas)
+    # Vectorized outer product approach - much faster than loops
+    correlation = jnp.outer(betas, betas)
+    # Set diagonal to 1.0 (correlation of asset with itself)
+    correlation = correlation.at[jnp.diag_indices_from(correlation)].set(1.0)
+    
+    return correlation
 
 
 ###############################################################################
@@ -149,7 +147,7 @@ def times_from_dates(dt: (Date, list),
                 t = dc_counter.year_frac(value_dt, dt[i])[0]
             times.append(t)
 
-        return np.array(times)
+        return jnp.array(times)
 
     elif isinstance(dt, np.ndarray):
         raise LibError("You passed an ndarray instead of dates.")
@@ -326,7 +324,6 @@ def input_time(dt: Date,
 ###############################################################################
 
 
-@njit(fastmath=True, cache=True)
 def listdiff(a: np.ndarray,
              b: np.ndarray):
     """ Calculate a vector of differences between two equal sized vectors. """
@@ -334,42 +331,28 @@ def listdiff(a: np.ndarray,
     if len(a) != len(b):
         raise LibError("Cannot diff lists with different sizes")
 
-    diff = []
-    for x, y in zip(a, b):
-        diff.append(x - y)
-
-    return diff
+    return a - b
 
 
 ###############################################################################
 
 
-@njit(fastmath=True, cache=True)
 def dotproduct(xVector: np.ndarray,
                yVector: np.ndarray):
-    """ Fast calculation of dot product using Numba. """
+    """ Fast calculation of dot product using NumPy. """
 
-    dotprod = 0.0
-    n = len(xVector)
-    for i in range(0, n):
-        dotprod += xVector[i] * yVector[i]
-    return dotprod
+    return np.dot(xVector, yVector)
 
 
 ###############################################################################
 
 
-@njit(fastmath=True, cache=True)
 def frange(start: int,
            stop: int,
            step: int):
     """ fast range function that takes start value, stop value and step. """
-    x = []
-    while start <= stop:
-        x.append(start)
-        start += step
-
-    return x
+    
+    return np.arange(start, stop + step, step).tolist()
 
 
 ###############################################################################

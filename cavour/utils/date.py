@@ -860,13 +860,9 @@ class Date():
         """ returns a formatted string of the date """
         date_str = ""
 
-        if self._d < 10:
-            date_str += "0" + str(self._d) + ""
-        else:
-            date_str += "" + str(self._d) + ""
-
+        date_str += f"{self._d:02d}"
         date_str += short_month_names[self._m - 1]
-        date_str += "" + str(self._y)
+        date_str += str(self._y)
         return date_str
 
     ###########################################################################
@@ -878,15 +874,8 @@ class Date():
 
         day_name_str = short_day_names[self._weekday]
 
-        if self._d < 10:
-            day_str = "0" + str(self._d)
-        else:
-            day_str = "" + str(self._d)
-
-        if self._m < 10:
-            short_month_str = "0" + str(self._m)
-        else:
-            short_month_str = str(self._m)
+        day_str = f"{self._d:02d}"
+        short_month_str = f"{self._m:02d}"
 
         long_month_str = short_month_names[self._m - 1]
 
@@ -951,22 +940,10 @@ class Date():
 
             sep = "/"
 
-            if self._hh < 10:
-                hour_str = "0" + str(self._hh)
-            else:
-                hour_str = str(self._hh)
-
-            if self._mm < 10:
-                minute_str = "0" + str(self._mm)
-            else:
-                minute_str = str(self._mm)
-
-            if self._ss < 10:
-                second_str = "0" + str(self._ss)
-            else:
-                second_str = str(self._ss)
-
-            time_str = hour_str + ":" + minute_str + ":" + second_str
+            hour_str = f"{self._hh:02d}"
+            minute_str = f"{self._mm:02d}"
+            second_str = f"{self._ss:02d}"
+            time_str = f"{hour_str}:{minute_str}:{second_str}"
             date_str = day_str + sep + short_month_str + sep + long_year_str
             date_str = date_str + " " + time_str
             return date_str

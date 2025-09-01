@@ -1,10 +1,15 @@
-from typing import Dict, List
+from typing import Dict, List, Union
 from dataclasses import dataclass, field
 
-from cavour.utils import *
+from cavour.utils.date import Date
+from cavour.utils.global_types import SwapTypes, InterpTypes
+from cavour.utils.day_count import DayCountTypes
+from cavour.utils.frequency import FrequencyTypes
+from cavour.utils.calendar import BusDayAdjustTypes
+from cavour.utils.currency import CurrencyTypes
 from cavour.trades.rates.ois_curve import OISCurve
 from cavour.trades.rates.ois import OIS
-from cavour.marketdata.market_data_constants import *
+from cavour.marketdata.market_data_constants import MARKET_DATA, FX_MARKET_DATA
 from cavour.marketdata.market_data_engine import MarketCurveBuilder
 
 

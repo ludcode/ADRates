@@ -111,31 +111,41 @@ class InterpolatorAd:
                 return jnp.interp(tt, x, d)
             else:
                 raise LibError("Invalid interpolation scheme.")
-        #return jnp.where(isinstance(t, jnp.ndarray), jax.vmap(_eval_scalar)(t) , _eval_scalar(t))
-        tt = jnp.atleast_1d(t)
-        out = jax.vmap(_eval_scalar)(tt)
-        if tt.shape == (1,):
-            return out[0]
-        return out
+        # Optimized handling: check if input is scalar or array
+        t_array = jnp.asarray(t)
+        if jnp.ndim(t_array) == 0:
+            # Scalar input - call function directly
+            return _eval_scalar(t_array)
+        else:
+            # Array input - use vmap
+            return jax.vmap(_eval_scalar)(t_array)
 
     @partial(jax.jit, static_argnums=(0,))
     def interpolate(self, t: float):
         if self._dfs is None:
             raise LibError("Dfs have not been set.")
-        tt = jnp.atleast_1d(t)
-        # assume t >= 0; negative checks should be done before calling this JIT-compiled method
+        t_array = jnp.asarray(t)
+        
+        # Define interpolation functions for different types
         if self._interp_type == InterpTypes.PCHIP_LOG_DISCOUNT:
-            out = jax.vmap(lambda tv: jnp.exp(_pchip_eval(tv, self._times, self._pchip_y, self._pchip_d)))(tt)
+            eval_func = lambda tv: jnp.exp(_pchip_eval(tv, self._times, self._pchip_y, self._pchip_d))
         elif self._interp_type == InterpTypes.PCHIP_ZERO_RATES:
-            out = jax.vmap(lambda tv: jnp.exp(-tv * _pchip_eval(tv, self._times, self._pchip_y, self._pchip_d)))(tt)
+            eval_func = lambda tv: jnp.exp(-tv * _pchip_eval(tv, self._times, self._pchip_y, self._pchip_d))
         elif self._interp_type in (InterpTypes.FINCUBIC_ZERO_RATES,
                                    InterpTypes.NATCUBIC_ZERO_RATES,
                                    InterpTypes.NATCUBIC_LOG_DISCOUNT):
             if self._interp_type == InterpTypes.NATCUBIC_LOG_DISCOUNT:
-                func = lambda tv: jnp.exp(_cubic_eval(tv, self._times, self._cubic_coef))
+                eval_func = lambda tv: jnp.exp(_cubic_eval(tv, self._times, self._cubic_coef))
             else:
-                func = lambda tv: jnp.exp(-tv * _cubic_eval(tv, self._times, self._cubic_coef))
-            out = jax.vmap(func)(tt)
+                eval_func = lambda tv: jnp.exp(-tv * _cubic_eval(tv, self._times, self._cubic_coef))
         else:
-            out = self.simple_interpolate(tt, self._times, self._dfs, self._interp_type.value)
-        return out[0] if out.size==1 else out
+            # For other types, use simple_interpolate
+            return self.simple_interpolate(t_array, self._times, self._dfs, self._interp_type.value)
+        
+        # Optimized scalar vs array handling
+        if jnp.ndim(t_array) == 0:
+            # Scalar input - call function directly  
+            return eval_func(t_array)
+        else:
+            # Array input - use vmap
+            return jax.vmap(eval_func)(t_array)
