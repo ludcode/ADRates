@@ -177,61 +177,82 @@ class Engine:
                     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """
         Bootstraps an OIS curve via par-swap rates.
+        Matches the recursive logic from ois_curve.py by pre-expanding all intermediate points.
         Inputs as Python lists; outputs as JAX arrays.
         """
 
-        # 1) Convert inputs to JAX arrays
-        rates = jnp.array(swap_rates)    # shape (N,)
-        times = jnp.array(swap_times)    # shape (N,)
-        N     = rates.shape[0]
+        # 1) Pre-expand ALL intermediate points (not just swap maturities)
+        points = []
+        for i, (rate, fracs) in enumerate(zip(swap_rates, year_fracs)):
+            cumsum = 0.0
+            for j, frac in enumerate(fracs):
+                prev_cum = cumsum
+                cumsum += frac
+                points.append({
+                    'maturity': cumsum,                      # EXACT value for computations
+                    'maturity_key': round(cumsum, 1),       # Rounded key for matching
+                    'acc': frac,
+                    'prev_mat': prev_cum,                    # EXACT previous maturity
+                    'prev_key': round(prev_cum, 1) if j > 0 else None,  # Rounded key
+                    'rate': rate,                            # Parent swap's rate
+                    'is_final': (j == len(fracs) - 1),      # Is this the swap's final maturity?
+                    'swap_idx': i
+                })
 
-        # 2) Precompute prev_idx & acc_last in Python (using 1-dp rounding)
-        times_rounded = [round(t, 1) for t in swap_times]
-        prev_idx = []
-        acc_last = []
-        for i, fr in enumerate(year_fracs):
-            if len(fr) == 1:
-                prev_idx.append(-1)
-                acc_last.append(fr[0])
+        # 2) Sort by exact maturity
+        sorted_points = sorted(points, key=lambda x: x['maturity'])
+
+        # 3) Deduplicate using rounded keys (keep first occurrence like the recursive version)
+        seen_keys = {}
+        unique_points = []
+        for p in sorted_points:
+            key = p['maturity_key']
+            if key not in seen_keys:
+                seen_keys[key] = len(unique_points)
+                unique_points.append(p)
+
+        # 4) Build maturity_key → index mapping (for prev_idx lookup)
+        maturity_lookup = {}  # rounded_key → index in unique_points
+        for idx, p in enumerate(unique_points):
+            maturity_lookup[p['maturity_key']] = idx
+
+        # 5) Build prev_idx for each point using rounded keys
+        for p in unique_points:
+            if p['prev_key'] is None:
+                p['prev_idx'] = -1
             else:
-                last_pay = round(sum(fr[:-1]), 1)
-                if last_pay in times_rounded:
-                    j = times_rounded.index(last_pay)
-                else:
-                    # fallback: nearest tenor
-                    diffs = [abs(t - last_pay) for t in swap_times]
-                    j = int(min(range(len(diffs)), key=lambda k: diffs[k]))
-                prev_idx.append(j)
-                acc_last.append(fr[-1])
+                p['prev_idx'] = maturity_lookup.get(p['prev_key'], -1)
 
-        prev_idx = jnp.array(prev_idx, dtype=jnp.int32)  # shape (N,)
-        acc_last = jnp.array(acc_last)                   # shape (N,)
+        # 6) Convert to JAX arrays
+        n_points = len(unique_points)
+        rates = jnp.array([p['rate'] for p in unique_points])
+        accs = jnp.array([p['acc'] for p in unique_points])
+        prev_idxs = jnp.array([p['prev_idx'] for p in unique_points], dtype=jnp.int32)
 
-
-        # 3) JAX-friendly scan step
+        # 7) JAX-friendly scan through all points
         def step(pv01_arr, inputs):
-            i, r = inputs
-            pi    = prev_idx[i]
-            prev  = jnp.where(pi < 0, 0.0, pv01_arr[pi])
-            a     = acc_last[i]
+            i, rate, acc, prev_idx = inputs
+            prev_pv01 = jnp.where(prev_idx < 0, 0.0, pv01_arr[prev_idx])
 
             df_i = jnp.where(
-                pi < 0,
-                1.0 / (1.0 + r * a),
-                (1.0 - r * prev) / (1.0 + r * a)
+                prev_idx < 0,
+                1.0 / (1.0 + rate * acc),
+                (1.0 - rate * prev_pv01) / (1.0 + rate * acc)
             )
 
-            pv01_i   = prev + a * df_i
+            pv01_i = prev_pv01 + acc * df_i
             new_pv01 = pv01_arr.at[i].set(pv01_i)
             return new_pv01, df_i
 
-        # 4) Run the scan
-        init_pv01 = jnp.zeros_like(rates)
-        idxs       = jnp.arange(N)
-        _, dfs_arr = lax.scan(step, init_pv01, (idxs, rates))
+        # 8) Run the scan
+        init_pv01 = jnp.zeros(n_points)
+        idxs = jnp.arange(n_points)
+        _, all_dfs = lax.scan(step, init_pv01, (idxs, rates, accs, prev_idxs))
 
-        # 5) Return JAX arrays
-        return times, dfs_arr
+        # 9) Return ALL unique intermediate points (not just swap maturities)
+        # This matches ois_curve.py which stores all intermediate DFs for interpolation
+        all_maturities = jnp.array([p['maturity'] for p in unique_points])
+        return all_maturities, all_dfs
 
     def _cached_curve(self, key, swap_rates, swap_times, year_fracs, interp_type):
         """Bootstrap the curve once and cache DFS, Jacobian and Hessian."""
@@ -239,13 +260,15 @@ class Engine:
         if cache is not None:
             return cache
 
-        build = lambda r: self.build_curve_ad(r, swap_times, year_fracs)[1]
+        # Build curve to get both times and DFs (including all intermediate points)
         rates = jnp.array(swap_rates)
-        times = jnp.array(swap_times)
-        dfs = build(rates)
+        times, dfs = self.build_curve_ad(rates, swap_times, year_fracs)
 
-        jac = jacrev(build)(rates)
-        hess = hessian(build)(rates)
+        # For AD, we need DFs as a function of rates only (times are constant)
+        build_dfs = lambda r: self.build_curve_ad(r, swap_times, year_fracs)[1]
+        jac = jacrev(build_dfs)(rates)
+        hess = hessian(build_dfs)(rates)
+
         cache = {
             "times": times,
             "dfs": dfs,

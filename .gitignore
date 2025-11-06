@@ -25,3 +25,6 @@ Thumbs.db
 *.tmp
 *.nbi
 *.nbc
+
+# Ignore CLAUDE.md
+CLAUDE.md

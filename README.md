@@ -1,13 +1,13 @@
 # ADRates
 
-**ADRates** is a modern, Python‐based library for building Overnight Index Swap (OIS) discount curves and computing sensitivities (delta and gamma) of interest rate swaps via Automatic Differentiation (AD).
+**ADRates** is a modern, Python‐based library for building Overnight Index Swap (OIS) discount curves and computing sensitivities (delta and gamma) of interest rate swaps via Algorithmic Differentiation (AD).
 
 ## 🚀 Features
 
 - **Robust OIS Curve Construction**  
   Flexible bootstrapping routines for building arbitrage‐free discount and forward curves from market quotes.
 
-- **Automatic Differentiation of Greeks**  
+- **Algorithmic Differentiation of Greeks**  
   Compute first‐order (delta) and second‐order (gamma) sensitivities of swap PVs directly via AD, without finite‐difference approximations.
 
 - **Modern API & Performance**  

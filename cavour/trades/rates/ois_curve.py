@@ -74,7 +74,7 @@ class OISCurve(DiscountCurve):
         """ Construct the discount curve using a bootstrap approach. This is
         the linear swap rate method that is fast and exact as it does not
         require the use of a solver. It is also market standard.
-        Adjusted for automatic differentiation """
+        Adjusted for algorithmic differentiation """
 
         self._dc_type = self._used_swaps[0]._float_leg._dc_type
         self._times = jnp.array([])
