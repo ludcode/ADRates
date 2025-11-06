@@ -2,6 +2,42 @@
 
 ##############################################################################
 
+"""
+Fixed leg implementation for interest rate swaps.
+
+Provides the SwapFixedLeg class for managing periodic fixed-rate payments
+in swap contracts. Handles schedule generation, payment calculations, and
+present value computation using ISDA conventions.
+
+Key features:
+- ISDA-compliant schedule generation with various frequencies
+- Business day adjustments and calendar handling
+- Day count convention support (ACT/365F, ACT/360, 30/360, etc.)
+- Payment lag and end-of-month adjustments
+- Detailed payment and valuation reporting
+
+Used as a component in OIS swaps, cross-currency swaps, and other
+fixed-income instruments requiring fixed cashflow legs.
+
+Example:
+    >>> # Create a fixed leg paying 4.5% annually
+    >>> effective = Date(15, 6, 2023)
+    >>> maturity = Date(15, 6, 2033)
+    >>> fixed_leg = SwapFixedLeg(
+    ...     effective_dt=effective,
+    ...     end_dt=maturity,
+    ...     leg_type=SwapTypes.PAY,
+    ...     coupon=0.045,
+    ...     freq_type=FrequencyTypes.ANNUAL,
+    ...     dc_type=DayCountTypes.ACT_365F,
+    ...     notional=1_000_000
+    ... )
+    >>>
+    >>> # Value the leg
+    >>> pv = fixed_leg.value(effective, discount_curve)
+    >>> fixed_leg.print_valuation()
+"""
+
 from cavour.utils.error import LibError
 from cavour.utils.date import Date
 from cavour.utils.math import ONE_MILLION

@@ -2,6 +2,44 @@
 
 ##############################################################################
 
+"""
+Floating leg implementation for interest rate swaps.
+
+Provides the SwapFloatLeg class for managing floating-rate payments in swap
+contracts. Supports forward rate projection from discount curves, spread
+adjustments, and optional notional exchange for cross-currency swaps.
+
+Key features:
+- Forward rate calculation from index curves
+- Support for floating spreads and first fixing rates
+- Optional notional exchange at start and maturity
+- ISDA-compliant schedule generation
+- Business day adjustments and calendar handling
+- Variable notional support for amortizing/accreting swaps
+
+Used as a component in OIS swaps, cross-currency basis swaps, and other
+floating-rate instruments.
+
+Example:
+    >>> # Create a floating leg with SOFR + 10bp spread
+    >>> effective = Date(15, 6, 2023)
+    >>> maturity = Date(15, 6, 2033)
+    >>> float_leg = SwapFloatLeg(
+    ...     effective_dt=effective,
+    ...     end_dt=maturity,
+    ...     leg_type=SwapTypes.RECEIVE,
+    ...     spread=0.001,  # 10bp spread
+    ...     freq_type=FrequencyTypes.QUARTERLY,
+    ...     dc_type=DayCountTypes.ACT_360,
+    ...     notional=1_000_000,
+    ...     notional_exchange=True  # For cross-currency swaps
+    ... )
+    >>>
+    >>> # Value the leg
+    >>> pv = float_leg.value(effective, discount_curve, index_curve)
+    >>> float_leg.print_valuation()
+"""
+
 from cavour.utils.error import LibError
 from cavour.utils.date import Date
 from cavour.utils.math import ONE_MILLION

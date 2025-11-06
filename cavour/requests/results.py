@@ -1,4 +1,16 @@
-"Class to store results"
+"""
+Result classes for storing valuation and risk analytics.
+
+Provides dataclasses for:
+- Valuation: Monetary amounts with currency
+- Delta: First-order interest rate sensitivities
+- Gamma: Second-order interest rate sensitivities
+- Risk: Container for multiple risk ladders
+- AnalyticsResult: Complete result set (PV + Greeks)
+
+All classes support arithmetic operations where appropriate and provide
+formatted output for analysis and visualization.
+"""
 
 import jax.numpy as jnp
 import numpy as np
@@ -19,7 +31,19 @@ from cavour.utils.global_types import RequestTypes, CurveTypes
 class Valuation:
     """
     A monetary amount together with its currency.
-    Supports arithmetic operations when currencies match.
+
+    Supports arithmetic operations (+, -, *, /) when currencies match.
+    Immutable dataclass suitable for use in aggregations.
+
+    Attributes:
+        amount (float): Monetary value
+        currency (CurrencyTypes): Currency denomination
+
+    Example:
+        >>> v1 = Valuation(1000.0, CurrencyTypes.GBP)
+        >>> v2 = Valuation(500.0, CurrencyTypes.GBP)
+        >>> total = v1 + v2  # Valuation(1500.0, GBP)
+        >>> scaled = v1 * 1.1  # Valuation(1100.0, GBP)
     """
     amount: float
     currency: CurrencyTypes = CurrencyTypes.NONE
@@ -84,7 +108,13 @@ class Valuation:
 @dataclass(frozen=True)
 class Value:
     """
-    A monetary amount together with its currency.
+    A simple monetary amount with currency (lightweight version of Valuation).
+
+    Used for displaying aggregated risk values without arithmetic operations.
+
+    Attributes:
+        amount (float): Monetary value
+        currency (CurrencyTypes): Currency denomination
     """
     amount: float
     currency: CurrencyTypes = CurrencyTypes.NONE
@@ -94,6 +124,18 @@ class Value:
 class Ladder:
     """
     Encapsulates a tenor->sensitivity mapping and provides a DataFrame view.
+
+    Wrapper for risk ladder data that can be exported as pandas DataFrame
+    for analysis and visualization.
+
+    Attributes:
+        data (Dict[str, float]): Mapping of tenor -> sensitivity value
+        _curve_name (str): Curve identifier for labeling
+
+    Example:
+        >>> data = {"1Y": 10.5, "5Y": -8.2, "10Y": 15.3}
+        >>> ladder = Ladder(data, "GBP_OIS_SONIA")
+        >>> df = ladder.df  # Returns pandas DataFrame
     """
     def __init__(self, data: Dict[str, float], curve_name: str):
         self.data = data
@@ -126,7 +168,30 @@ class Ladder:
 @dataclass(frozen=True)
 class Delta:
     """
-    A delta risk ladder for a given curve.
+    First-order interest rate sensitivity (delta) for a given curve.
+
+    Represents how the position value changes with respect to 1bp parallel
+    shifts in each tenor of the curve. Computed via automatic differentiation.
+
+    Attributes:
+        risk_ladder (jnp.ndarray): Sensitivities for each tenor (shape: [N])
+        tenors (List[str]): Tenor labels (e.g., ["1M", "3M", "1Y"])
+        currency (CurrencyTypes): Currency of the sensitivities
+        curve_type (CurveTypes): Curve identifier (e.g., GBP_OIS_SONIA)
+
+    Properties:
+        value: Sum of ladder as Value object
+        ladder: Ladder object for DataFrame export
+
+    Example:
+        >>> delta = Delta(
+        ...     risk_ladder=jnp.array([10.2, -5.3, 15.8]),
+        ...     tenors=["1Y", "5Y", "10Y"],
+        ...     currency=CurrencyTypes.GBP,
+        ...     curve_type=CurveTypes.GBP_OIS_SONIA
+        ... )
+        >>> total = delta.value  # Sum of sensitivities
+        >>> df = delta.ladder.df  # Export to DataFrame
     """
     risk_ladder: jnp.ndarray       # shape [..., N]
     tenors:       List[str]        # length N
@@ -202,8 +267,38 @@ class Delta:
 @dataclass(frozen=True)
 class Gamma:
     """
-    A gamma risk ladder (second-order sensitivity) for a given curve.
-    Units: value per bp^2, typically scaled by 1e8.
+    Second-order interest rate sensitivity (gamma) for a given curve.
+
+    Represents how delta changes with respect to rate movements (curvature).
+    Stored as a matrix showing cross-tenor sensitivities. Computed via
+    automatic differentiation (Hessian).
+
+    Attributes:
+        risk_ladder (jnp.ndarray): Gamma matrix (shape: [N, N]) or vector [N]
+        tenors (List[str]): Tenor labels
+        currency (CurrencyTypes): Currency of sensitivities (default: GBP)
+        curve_type (CurveTypes): Curve identifier (default: GBP_OIS_SONIA)
+
+    Properties:
+        value: Sum of gamma matrix as Value object
+        matrix: Display gamma as formatted table (prints to console)
+        to_dict: Export gamma as nested dictionary
+
+    Methods:
+        plot(): Display interactive Plotly heatmap
+
+    Note:
+        Units are value per bp^2, typically scaled by 1e8.
+
+    Example:
+        >>> gamma = Gamma(
+        ...     risk_ladder=jnp.array([[0.5, 0.1], [0.1, 0.8]]),
+        ...     tenors=["1Y", "5Y"],
+        ...     currency=CurrencyTypes.GBP,
+        ...     curve_type=CurveTypes.GBP_OIS_SONIA
+        ... )
+        >>> gamma.plot()  # Interactive heatmap
+        >>> gamma.matrix  # Formatted table output
     """
     risk_ladder: jnp.ndarray       # shape [N] or [N, N]
     tenors:       List[str]        # length N
@@ -339,12 +434,28 @@ class Gamma:
 class Risk:
     """
     Container for multiple per-curve Delta and Gamma ladders.
-    Allows access like:
-        risk.SONIA.value
-        risk.SONIA.ladder  (for Delta)
-        risk.SONIA.matrix  (for Gamma)
-    Or:
-        risk(CurveTypes.GBP_OIS_SONIA) => Delta or Gamma
+
+    Provides convenient attribute and callable access to risk by curve.
+    Automatically creates attributes from curve names for easy access.
+
+    Args:
+        ladders (Iterable[Union[Delta, Gamma]]): List of Delta or Gamma objects
+
+    Access patterns:
+        1. Attribute: risk.GBP_OIS_SONIA.value
+        2. Attribute: risk.GBP_OIS_SONIA.ladder (for Delta)
+        3. Attribute: risk.GBP_OIS_SONIA.matrix (for Gamma)
+        4. Callable: risk(CurveTypes.GBP_OIS_SONIA)
+
+    Example:
+        >>> delta1 = Delta([10, -5], ["1Y", "5Y"], CurrencyTypes.GBP, CurveTypes.GBP_OIS_SONIA)
+        >>> delta2 = Delta([8, -3], ["1Y", "5Y"], CurrencyTypes.USD, CurveTypes.USD_OIS_SOFR)
+        >>> risk = Risk([delta1, delta2])
+        >>> gbp_sens = risk.GBP_OIS_SONIA  # Attribute access
+        >>> usd_sens = risk(CurveTypes.USD_OIS_SOFR)  # Callable access
+
+    Raises:
+        ValueError: If duplicate curve names provided
     """
     def __init__(self, ladders: Iterable[Union[Delta, Gamma]]):
         self._by_curve = {}  # type: Dict[str, Union[Delta, Gamma]]
@@ -375,17 +486,35 @@ class Risk:
 
 class AnalyticsResult:
     """
-    Holds a Valuation-typed PV and its associated greeks (risk ladders).
-    Access via:
-       res.value  -> Value (wrapped in Valuation)
-       res.risk   -> Risk
-       res.gamma  -> jnp.ndarray or None
+    Complete analytics result set containing valuation and Greeks.
+
+    Central result container returned by position.compute() calls. Holds
+    present value, delta, and gamma sensitivities computed via automatic
+    differentiation.
+
+    Args:
+        value (Optional[Valuation]): Present value with currency
+        risk (Optional[Risk]): Delta risk ladders
+        gamma (Optional[Gamma]): Gamma (second-order) sensitivities
+
+    Properties:
+        value: Valuation object (present value)
+        risk: Risk container with delta ladders
+        gamma: Gamma matrix
+
+    Example:
+        >>> swap = OIS(value_dt, "10Y", 0.04)
+        >>> pos = swap.position(model)
+        >>> result = pos.compute([RequestTypes.VALUE, RequestTypes.DELTA, RequestTypes.GAMMA])
+        >>> print(result.value)  # Valuation(amount=1234.56, currency=GBP)
+        >>> print(result.risk.GBP_OIS_SONIA)  # Delta ladder
+        >>> result.gamma.plot()  # Interactive gamma heatmap
     """
     def __init__(
         self,
         value: Optional[Valuation] = None,
         risk: Optional[Risk] = None,
-        gamma: Optional[Gamma] = None, #still need to develop it
+        gamma: Optional[Gamma] = None,
     ):
         # store inputs directly
         self._value = value

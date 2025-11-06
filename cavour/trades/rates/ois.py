@@ -2,6 +2,37 @@
 
 ##############################################################################
 
+"""
+Overnight Index Swap (OIS) implementation for valuing fixed-for-floating swaps.
+
+Provides the OIS class for creating, valuing, and analyzing overnight index swap
+contracts where a fixed rate is exchanged for a floating rate based on compounded
+overnight index rates (e.g., SONIA, SOFR, ESTR).
+
+Key features:
+- Fixed vs floating leg construction using ISDA conventions
+- Par swap rate calculation
+- PV01 and IR01 sensitivity computation
+- Support for various compounding methods
+- Integration with automatic differentiation for Greeks calculation
+
+Example:
+    >>> # Create a 10Y GBP SONIA swap
+    >>> value_dt = Date(15, 6, 2023)
+    >>> swap = OIS(
+    ...     effective_dt=value_dt,
+    ...     term_dt_or_tenor="10Y",
+    ...     fixed_leg_type=SwapTypes.PAY,
+    ...     fixed_coupon=0.045,
+    ...     fixed_freq_type=FrequencyTypes.ANNUAL,
+    ...     fixed_dc_type=DayCountTypes.ACT_365F
+    ... )
+    >>>
+    >>> # Value the swap
+    >>> pv = swap.value(value_dt, ois_curve)
+    >>> par_rate = swap.swap_rate(value_dt, ois_curve)
+"""
+
 import numpy as np
 import jax.numpy as jnp
 from jax import grad, hessian

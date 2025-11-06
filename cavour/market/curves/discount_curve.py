@@ -2,6 +2,13 @@
 
 ###############################################################################
 
+"""
+Discount curve implementation with multiple interpolation schemes.
+
+This module provides the core DiscountCurve class for pricing interest rate
+derivatives. Supports conversion between discount factors, zero rates, forward
+rates, and swap rates using various interpolation methods.
+"""
 
 import numpy as np
 import jax.numpy as jnp
@@ -87,6 +94,7 @@ class DiscountCurve:
     ###########################################################################
 
     def value_dt(self):
+        """Returns the valuation date of the discount curve."""
         return self._value_dt
 
     ###########################################################################
@@ -309,10 +317,20 @@ class DiscountCurve:
     def df_ad(self,
            dt: (list, float),
            day_count=DayCountTypes.ACT_ACT_ISDA):
-        ''' Function to calculate a discount factor from a date or a
-        vector of dates. The day count determines how dates get converted to
-        years. I allow this to default to ACT_ACT_ISDA unless specified. '''
+        """
+        JAX-compatible discount factor calculation from times.
 
+        This method is designed for automatic differentiation and uses
+        JAX arrays internally. For standard usage, prefer df() which
+        accepts Date objects.
+
+        Args:
+            dt (list | float): Time(s) in years from valuation date
+            day_count (DayCountTypes): Day count convention (default: ACT_ACT_ISDA)
+
+        Returns:
+            jnp.ndarray: Discount factor(s) at specified time(s)
+        """
         #times = times_from_dates(dt, self._value_dt, day_count)
         dfs = self._df_ad(dt)
 
@@ -325,9 +343,21 @@ class DiscountCurve:
 
     def _df_ad(self,
             t: (float, np.ndarray)):
-        
-        """ Hidden function to calculate a discount factor from a time or a
-        vector of times. Discourage usage in favour of passing in dates. """
+        """
+        JAX-compatible discount factor calculation from times (internal).
+
+        This method is designed for automatic differentiation and uses
+        JAX arrays internally. For public API, use df_ad() instead.
+
+        Args:
+            t (float | jnp.ndarray): Time(s) in years from valuation date
+
+        Returns:
+            jnp.ndarray: Discount factor(s) at specified time(s)
+
+        Note:
+            Currently uses linear forward rate interpolation for AD compatibility.
+        """
 
         # if self._interp_type is InterpTypes.FLAT_FWD_RATES or \
         #         self._interp_type is InterpTypes.LINEAR_ZERO_RATES or \
@@ -356,13 +386,17 @@ class DiscountCurve:
         """
         JAX-compatible linear forward rate interpolation for discount factors.
 
-        Parameters:
-        - t: Target time (scalar or array).
-        - times: JAX array of tenor times.
-        - dfs: JAX array of discount factors.
+        Args:
+            t (float | jnp.ndarray): Target time(s) for interpolation
+            times (jnp.ndarray): Array of tenor times from the curve
+            dfs (jnp.ndarray): Array of discount factors at tenor points
 
         Returns:
-        - Interpolated discount factor at t.
+            jnp.ndarray: Interpolated discount factor(s) at time t
+
+        Note:
+            Uses piecewise constant forward rates between curve points.
+            Suitable for automatic differentiation with JAX.
         """
         # Ensure inputs are JAX arrays
         times = jnp.asarray(times)

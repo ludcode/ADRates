@@ -2,6 +2,46 @@
 
 ##############################################################################
 
+"""
+OIS curve construction via cashflow-based bootstrapping.
+
+Provides the OISCurve class for building discount curves from overnight index
+swap (OIS) market quotes. Uses a cashflow-based bootstrapping approach that
+solves directly for discount factors without requiring iterative solvers.
+
+Key features:
+- JAX-compatible automatic differentiation for computing sensitivities
+- Multiple interpolation schemes (flat forward, linear zero rates, cubic)
+- Exact reproduction of input swap rates (within tolerance)
+- Dense discount factor grid for accurate interpolation
+- Support for various day count conventions
+
+The bootstrapping algorithm:
+1. Builds discount factors sequentially for each swap maturity
+2. Uses par swap condition: PV(fixed leg) = PV(floating leg)
+3. Solves directly: D_m = (1 - r_i × PV01_prev) / (1 + r_i × α_m)
+4. Stores intermediate discount factors for dense interpolation grid
+
+Example:
+    >>> # Create OIS swaps at market rates
+    >>> swaps = [
+    ...     OIS(value_dt, "1Y", SwapTypes.PAY, 0.045, ...),
+    ...     OIS(value_dt, "2Y", SwapTypes.PAY, 0.047, ...),
+    ...     OIS(value_dt, "5Y", SwapTypes.PAY, 0.050, ...)
+    ... ]
+    >>>
+    >>> # Bootstrap curve
+    >>> curve = OISCurve(
+    ...     value_dt=value_dt,
+    ...     ois_swaps=swaps,
+    ...     interp_type=InterpTypes.LINEAR_ZERO_RATES,
+    ...     check_refit=True  # Verify swap rates are reproduced
+    ... )
+    >>>
+    >>> # Query discount factors
+    >>> df_1y = curve.df(value_dt.add_years(1))
+"""
+
 import numpy as np
 from scipy import optimize
 from scipy.interpolate import interp1d

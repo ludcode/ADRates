@@ -1,6 +1,24 @@
+"""
+Market data constants for OIS curves and FX rates.
+
+This module defines Bloomberg ticker mappings and market conventions for:
+- OIS curves (SONIA, SOFR)
+- Cross-currency basis swaps (XCCY)
+- FX spot rates
+
+Each curve definition includes:
+- tickers: Mapping of tenors to Bloomberg tickers
+- conventions: Day count, frequency, business day adjustments
+- currency: Base currency for the curve
+- type: Instrument type (OIS, XCCY)
+- index: Reference rate (SONIA, SOFR, etc.)
+"""
+
 from cavour.utils import *
 
 
+# OIS curve and XCCY basis swap market data configurations
+# Structure: {curve_name: {tickers, conventions, currency, type, index}}
 MARKET_DATA = {
     "GBP_OIS_SONIA" : {
         "tickers": {'1D': 'SONIO/N Index',
@@ -131,6 +149,9 @@ MARKET_DATA = {
 }
 }
 
+# FX spot rate configurations
+# Structure: {pair_name: {base, quote, ticker}}
+# Includes major USD pairs and European cross rates
 FX_MARKET_DATA = {
     # USD Majors
     "EURUSD": {

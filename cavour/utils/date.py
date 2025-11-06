@@ -1,3 +1,37 @@
+"""
+Date handling and manipulation for financial calculations.
+
+Provides the Date class and supporting utilities for working with dates in
+quantitative finance. Includes business day arithmetic, date formatting,
+and Excel date serial number compatibility.
+
+Key features:
+- Immutable Date class with arithmetic operations
+- Multiple date format support (Bloomberg, US, UK)
+- Excel date serial number compatibility (including 1900 leap year bug)
+- Business day and calendar day arithmetic
+- Tenor string parsing (e.g., "1Y", "3M", "2W")
+- Leap year detection and date validation
+- Fast date difference calculations
+
+The Date class is optimized for performance using Numba JIT compilation
+where possible and maintains compatibility with Excel date conventions
+for interoperability with financial systems.
+
+Example:
+    >>> # Create dates
+    >>> dt1 = Date(15, 6, 2023)
+    >>> dt2 = Date(15, 12, 2023)
+    >>>
+    >>> # Date arithmetic
+    >>> dt3 = dt1.add_months(6)
+    >>> dt4 = dt1.add_tenor("1Y")
+    >>> days_diff = dt2 - dt1
+    >>>
+    >>> # Business day operations
+    >>> dt5 = dt1.add_weekdays(5)
+"""
+
 from collections.abc import Iterable
 from functools import partial
 from enum import Enum

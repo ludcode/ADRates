@@ -1,3 +1,45 @@
+"""
+Payment schedule generation following ISDA conventions.
+
+Provides the Schedule class for generating coupon payment dates for
+fixed-income instruments following ISDA 2006 standards.
+
+Key features:
+- Forward and backward date generation rules
+- Automatic business day adjustments
+- End-of-month conventions
+- Stub period handling (short stubs at start or end)
+- Multiple payment frequencies (annual, semi-annual, quarterly, monthly)
+- Calendar-aware date adjustments
+
+Date generation rules:
+- BACKWARD: Start from termination date, step backward
+- FORWARD: Start from effective date, step forward
+
+The schedule ensures that:
+1. First element (index 0) is the previous coupon date (PCD)
+2. Second element (index 1) is the next coupon date (NCD)
+3. All dates are business-day adjusted per calendar
+4. End-of-month rules are applied if specified
+
+Example:
+    >>> # Create a quarterly payment schedule
+    >>> effective = Date(15, 6, 2023)
+    >>> termination = Date(15, 6, 2033)
+    >>>
+    >>> schedule = Schedule(
+    ...     effective_dt=effective,
+    ...     termination_dt=termination,
+    ...     freq_type=FrequencyTypes.QUARTERLY,
+    ...     cal_type=CalendarTypes.UNITED_KINGDOM,
+    ...     bd_type=BusDayAdjustTypes.MODIFIED_FOLLOWING,
+    ...     dg_type=DateGenRuleTypes.BACKWARD,
+    ...     end_of_month=False
+    ... )
+    >>>
+    >>> # Access adjusted payment dates
+    >>> payment_dates = schedule._adjusted_dts
+"""
 
 from .error import LibError
 from .date import Date

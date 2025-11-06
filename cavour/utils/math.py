@@ -2,6 +2,48 @@
 
 ###############################################################################
 
+"""
+Mathematical utilities and statistical functions.
+
+Provides optimized mathematical and statistical functions using Numba JIT
+compilation for performance-critical calculations in quantitative finance.
+
+Key functions:
+- Normal distribution: N(), nprime(), normcdf(), norminvcdf()
+- Bivariate normal: phi2(), M() for option pricing
+- Trivariate normal: phi3() for barrier options
+- Matrix operations: cholesky(), corr_matrix_generator()
+- Array utilities: scale(), maximum(), maxaxis(), minaxis()
+- Validation: test_monotonicity(), test_range()
+- Financial: accrued_interpolator(), npv()
+
+Statistical functions are optimized using:
+- Numba JIT compilation with fastmath and caching
+- Vectorized operations for array inputs
+- Multiple CDF approximations (fast vs accurate)
+
+Constants:
+- ONE_MILLION, TEN_MILLION, ONE_BILLION: Common notional values
+- PI, inv_root_two_pi: Mathematical constants
+
+The Normal CDF function N(x) uses Hull's approximation accurate to
+6 decimal places, with vectorized version n_vect() for array operations.
+
+Example:
+    >>> # Normal CDF calculation
+    >>> prob = N(1.96)  # ~0.975
+    >>>
+    >>> # Bivariate normal for options
+    >>> bv_prob = M(h1=1.0, h2=1.0, rho=0.5)
+    >>>
+    >>> # Inverse normal CDF
+    >>> z_score = norminvcdf(0.975)  # ~1.96
+    >>>
+    >>> # Array operations
+    >>> x = np.array([1.0, 2.0, 3.0])
+    >>> scaled = scale(x, 100)  # Multiply all by 100
+    >>> is_monotonic = test_monotonicity(x)  # True
+"""
 
 # from math import exp, sqrt, fabs, log
 from numba import njit, boolean, int64, float64, vectorize

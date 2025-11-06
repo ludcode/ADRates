@@ -2,6 +2,15 @@
 
 ##############################################################################
 
+"""
+Single cashflow valuation for fixed payment instruments.
+
+Provides the SingleFixedCashflow class for pricing standalone fixed cashflows
+with business day adjustments, payment lags, and calendar handling.
+
+Used as a building block for more complex instruments like bonds and swaps.
+"""
+
 from typing import Union
 
 from cavour.utils.error import LibError
@@ -22,7 +31,38 @@ from cavour.market.curves.discount_curve import DiscountCurve
 
 
 class SingleFixedCashflow:
-    """Represents a single fixed cashflow at a specified payment date."""
+    """
+    Represents a single fixed cashflow at a specified payment date.
+
+    Used as a building block for pricing bonds, swaps, and other fixed-income
+    instruments. Handles business day adjustments, payment lags, and calendar
+    conventions automatically.
+
+    Attributes:
+        _effective_dt (Date): Accrual start date for the cashflow
+        _payment_dt (Date): Adjusted payment date after lag and business day conventions
+        _leg_type (SwapTypes): PAY (negative PV) or RECEIVE (positive PV)
+        _amount (float): Fixed payment amount in currency units
+        _dc_type (DayCountTypes): Day count convention for discounting
+        _payment_lag (int): Business day lag applied to payment date
+        _currency (CurrencyTypes): Currency denomination
+
+    Example:
+        >>> # Create a £1,000,000 payment 6 months from today
+        >>> effective = Date(15, 6, 2023)
+        >>> cashflow = SingleFixedCashflow(
+        ...     effective_dt=effective,
+        ...     payment_dt="6M",
+        ...     leg_type=SwapTypes.RECEIVE,
+        ...     amount=1_000_000.0,
+        ...     dc_type=DayCountTypes.ACT_365F
+        ... )
+        >>>
+        >>> # Value the cashflow
+        >>> value_dt = Date(15, 6, 2023)
+        >>> pv = cashflow.value(value_dt, discount_curve)
+        >>> print(f"Present Value: {pv:,.2f}")
+    """
 
     def __init__(self,
                  effective_dt: Date,                # accrual start date

@@ -2,6 +2,44 @@
 
 ##############################################################################
 
+"""
+Helper utilities for sensitivity calculations and data formatting.
+
+Provides utility functions for:
+- Converting discount factor sensitivities to zero/par rate sensitivities
+- Grid index lookups for time-based calculations
+- Correlation matrix generation
+- Table formatting for output display
+- Type checking for function arguments
+- Present value calculations (PV01)
+
+Key functions:
+- convert_sensitivities(): Transforms DF deltas/gammas to zero rate and par rate Greeks
+- format_table(): Creates formatted ASCII tables for display
+- check_argument_types(): Validates function argument types at runtime
+- beta_vector_to_corr_matrix(): Generates correlation matrices from factor loadings
+- pv01_times(): Calculates coupon payment times for PV01 computation
+
+The sensitivity conversion uses the chain rule:
+- Delta_zero = Delta_df × (∂DF/∂zero_rate)
+- Gamma_zero = Gamma_df × (∂DF/∂zero_rate)²
+- Similar transformations for par rates
+
+Example:
+    >>> # Convert DF sensitivities to zero rates
+    >>> delta_zero, gamma_zero, delta_par, gamma_par = convert_sensitivities(
+    ...     dfs=jnp.array([0.99, 0.98, 0.97]),
+    ...     times=jnp.array([0.5, 1.0, 1.5]),
+    ...     delta_df=jnp.array([100, 200, 300]),
+    ...     gamma_df=jnp.array([[1, 0, 0], [0, 2, 0], [0, 0, 3]])
+    ... )
+    >>>
+    >>> # Format output table
+    >>> header = ["Tenor", "Delta", "Gamma"]
+    >>> rows = [["1Y", 100.5, 2.3], ["2Y", 200.2, 4.1]]
+    >>> print(format_table(header, rows))
+"""
+
 import sys
 import math
 import numpy as np

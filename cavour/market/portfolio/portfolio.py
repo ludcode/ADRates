@@ -9,13 +9,31 @@ class Portfolio:
     """Container aggregating multiple :class:`Position` objects."""
 
     def __init__(self, positions: Iterable[Position] | None = None) -> None:
+        """
+        Initialize portfolio with optional list of positions.
+
+        Args:
+            positions (Iterable[Position] | None): Initial positions to add
+        """
         self._positions: List[Position] = list(positions or [])
 
     def add_position(self, position: Position) -> None:
+        """
+        Add a position to the portfolio.
+
+        Args:
+            position (Position): Position object containing derivative and model
+        """
         self._positions.append(position)
 
     #@property
     def positions(self) -> List[Position]:
+        """
+        Get a copy of all positions in the portfolio.
+
+        Returns:
+            List[Position]: List of Position objects
+        """
         return list(self._positions)
 
     def compute(self, request_list: Iterable[RequestTypes]) -> AnalyticsResult:
