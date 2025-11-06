@@ -176,9 +176,32 @@ class Engine:
                     year_fracs: list[list[float]]
                     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """
-        Bootstraps an OIS curve via par-swap rates.
-        Matches the recursive logic from ois_curve.py by pre-expanding all intermediate points.
-        Inputs as Python lists; outputs as JAX arrays.
+        Bootstraps an OIS curve via par-swap rates using JAX-compatible operations.
+
+        Matches the recursive logic from ois_curve.py by pre-expanding all intermediate
+        cashflow points (not just swap maturities) and deduplicating using rounded keys.
+
+        Args:
+            swap_rates (list[float]): Par swap rates for each maturity
+            swap_times (list[float]): Swap maturities in years
+            year_fracs (list[list[float]]): Year fractions for each swap's cashflows
+
+        Returns:
+            tuple[jnp.ndarray, jnp.ndarray]:
+                - all_maturities: All unique intermediate times including swap maturities
+                - all_dfs: Discount factors at all intermediate times
+
+        Implementation:
+            1. Pre-expands all intermediate cashflow points from all swaps
+            2. Deduplicates using rounded maturity keys (1 decimal place)
+            3. Builds dependency graph via prev_idx mapping
+            4. Sequential bootstrap via lax.scan
+            5. Returns dense grid for interpolation (not just swap maturities)
+
+        Note:
+            Each intermediate point inherits its parent swap's rate, matching
+            the recursive version's behavior. Rounding is used only for dictionary
+            key matching, not for actual computations.
         """
 
         # 1) Pre-expand ALL intermediate points (not just swap maturities)

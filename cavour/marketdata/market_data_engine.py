@@ -1,3 +1,11 @@
+"""
+Market data engine for fetching Bloomberg data and computing FX cross rates.
+
+Provides two main classes:
+- MarketCurveBuilder: Fetches OIS curve and FX data from Bloomberg
+- FXRoutingEngine: Computes cross FX rates using graph-based routing
+"""
+
 from typing import Dict, Optional, Tuple, List
 from xbbg import blp
 from cavour.utils import *
@@ -6,12 +14,52 @@ import math
 
 
 class MarketCurveBuilder:
+    """
+    Fetches market data from Bloomberg for curve construction.
+
+    Uses xbbg library to retrieve historical prices for OIS swaps and FX rates
+    based on predefined ticker mappings and market conventions.
+
+    Attributes:
+        market_data (Dict[str, dict]): OIS curve definitions with tickers and conventions
+        fx_market_data (Dict[str, dict]): FX pair definitions with tickers
+    """
     def __init__(self, market_data: Dict[str, dict],
                  fx_market_data: Dict[str, dict]):
+        """
+        Initialize the market data builder.
+
+        Args:
+            market_data (Dict[str, dict]): Curve definitions from MARKET_DATA constant
+            fx_market_data (Dict[str, dict]): FX definitions from FX_MARKET_DATA constant
+        """
         self.market_data = market_data
         self.fx_market_data = fx_market_data
 
     def get_curve_inputs(self, curve_key: str, value_date: Date):
+        """
+        Fetch curve construction inputs from Bloomberg.
+
+        Retrieves swap rates for all tenors defined in the curve configuration
+        and packages them with market conventions for curve building.
+
+        Args:
+            curve_key (str): Curve name (e.g., "GBP_OIS_SONIA", "USD_OIS_SOFR")
+            value_date (Date): Valuation date for market data retrieval
+
+        Returns:
+            dict: Curve construction parameters including:
+                - name: Curve identifier
+                - px_list: List of swap rates retrieved from Bloomberg
+                - tenor_list: List of tenors (e.g., ["1M", "3M", "1Y"])
+                - spot_days: Settlement lag
+                - swap_type: Pay or receive fixed
+                - Market conventions (day count, frequency, etc.)
+
+        Raises:
+            KeyError: If curve_key not found in market_data
+            Exception: If Bloomberg connection fails or data unavailable
+        """
         value_dt = value_date.datetime()
         curve_def = self.market_data[curve_key]
         tickers_dict = curve_def["tickers"]
@@ -47,8 +95,25 @@ class MarketCurveBuilder:
             "bus_day_type": conventions["business_day_adjustment"],
             "interp_type": conventions["interp_type"]
         }
-    
+
     def get_fx_rates(self, fx_key: list[str], value_date: Date):
+        """
+        Fetch FX spot rates from Bloomberg.
+
+        Args:
+            fx_key (list[str]): List of FX pairs (e.g., ["EURUSD", "GBPUSD"])
+                               or ["ALL"] to fetch all available pairs
+            value_date (Date): Valuation date for FX rate retrieval
+
+        Returns:
+            dict: FX rate data with structure:
+                {pair: {base, quote, ticker, price}}
+
+        Example:
+            >>> builder.get_fx_rates(["EURUSD"], Date(15, 6, 2023))
+            {'EURUSD': {'base': CurrencyTypes.EUR, 'quote': CurrencyTypes.USD,
+                        'ticker': 'EURUSD Curncy', 'price': 1.0856}}
+        """
         value_dt = value_date.datetime()
         field = "PX_LAST"
 
@@ -85,15 +150,44 @@ class MarketCurveBuilder:
 
         return fx_return
 
-    
+
 
 class FXRoutingEngine:
+    """
+    Computes cross FX rates using graph-based shortest path routing.
+
+    Uses Dijkstra's algorithm to find optimal conversion paths through
+    available FX pairs. Supports manual routing overrides for specific
+    currencies (e.g., force PLN to convert via EUR).
+
+    Attributes:
+        _fx_rates (Dict[str, float]): Direct FX rates (e.g., EURUSD = 1.08)
+        _graph (Dict[str, Dict[str, float]]): Adjacency list for graph traversal
+        _overrides (Dict[str, str]): Manual routing rules (e.g., PLN -> EUR)
+
+    Example:
+        >>> engine = FXRoutingEngine()
+        >>> engine.set_fx_rate("EURUSD", 1.08)
+        >>> engine.set_fx_rate("GBPUSD", 1.25)
+        >>> rate = engine.get_cross_rate("GBP", "EUR")  # Returns 1.157
+    """
     def __init__(self):
         self._fx_rates: Dict[str, float] = {}         # e.g., EURUSD = 1.08
         self._graph: Dict[str, Dict[str, float]] = {} # adjacency list: EUR -> {USD: 1.08}
         self._overrides: Dict[str, str] = {}          # manual override: PLN -> EUR
 
     def set_fx_rate(self, pair: str, rate: float):
+        """
+        Add an FX rate to the routing graph.
+
+        Args:
+            pair (str): Currency pair (e.g., "EURUSD")
+            rate (float): Exchange rate (e.g., 1.08 means 1 EUR = 1.08 USD)
+
+        Note:
+            Automatically creates bidirectional edges in the graph
+            (e.g., EUR->USD and USD->EUR with inverted rate).
+        """
         pair = pair.upper()
         ccy1, ccy2 = pair[:3], pair[3:]
         self._fx_rates[pair] = rate
@@ -103,13 +197,48 @@ class FXRoutingEngine:
         self._graph.setdefault(ccy2, {})[ccy1] = 1.0 / rate
 
     def set_bulk_fx_rates(self, fx_dict: Dict[str, float]):
+        """
+        Add multiple FX rates at once.
+
+        Args:
+            fx_dict (Dict[str, float]): Dictionary of {pair: rate}
+        """
         for k, v in fx_dict.items():
             self.set_fx_rate(k, v)
 
     def set_override(self, ccy: str, via: str):
+        """
+        Force a currency to route through an intermediate currency.
+
+        Args:
+            ccy (str): Currency to override (e.g., "PLN")
+            via (str): Intermediate currency (e.g., "EUR")
+
+        Example:
+            >>> engine.set_override("PLN", "EUR")
+            >>> # PLN->USD will now route as PLN->EUR->USD
+        """
         self._overrides[ccy.upper()] = via.upper()
 
     def _dijkstra(self, src: str, tgt: str) -> Tuple[Optional[float], List[str]]:
+        """
+        Find shortest path and exchange rate between two currencies.
+
+        Uses Dijkstra's algorithm in log space to find the optimal conversion path.
+        Log transformation converts multiplication (chaining FX rates) into addition.
+
+        Args:
+            src (str): Source currency code (e.g., "EUR")
+            tgt (str): Target currency code (e.g., "USD")
+
+        Returns:
+            tuple: (exchange_rate, path)
+                - exchange_rate: Float or None if no path exists
+                - path: List of currency codes in conversion path
+
+        Note:
+            Returns (None, []) if either currency not in graph.
+        """
         src, tgt = src.upper(), tgt.upper()
         if src not in self._graph or tgt not in self._graph:
             return None, []
@@ -135,6 +264,20 @@ class FXRoutingEngine:
         return None, []
 
     def get_cross_rate(self, from_ccy: str, to_ccy: str) -> Optional[float]:
+        """
+        Get the cross exchange rate between two currencies.
+
+        Args:
+            from_ccy (str): Source currency code
+            to_ccy (str): Target currency code
+
+        Returns:
+            Optional[float]: Exchange rate or None if no path exists
+
+        Example:
+            >>> engine.get_cross_rate("GBP", "EUR")
+            1.157
+        """
         from_ccy, to_ccy = from_ccy.upper(), to_ccy.upper()
 
         # Check if override forces from_ccy to go via intermediate
@@ -152,6 +295,22 @@ class FXRoutingEngine:
         return self._dijkstra(from_ccy, to_ccy)[0]
 
     def get_cross_rate_with_path(self, from_ccy: str, to_ccy: str) -> Tuple[Optional[float], List[str]]:
+        """
+        Get cross exchange rate with the conversion path.
+
+        Args:
+            from_ccy (str): Source currency code
+            to_ccy (str): Target currency code
+
+        Returns:
+            tuple: (exchange_rate, path)
+                - exchange_rate: Float or None if no path exists
+                - path: List of currency codes showing conversion route
+
+        Example:
+            >>> engine.get_cross_rate_with_path("GBP", "JPY")
+            (188.5, ['GBP', 'USD', 'JPY'])
+        """
         from_ccy, to_ccy = from_ccy.upper(), to_ccy.upper()
 
         via = self._overrides.get(from_ccy)

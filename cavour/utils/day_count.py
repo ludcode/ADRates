@@ -2,6 +2,47 @@
 
 ##############################################################################
 
+"""
+Day count conventions for accrual and year fraction calculations.
+
+Provides day count convention implementations following ISDA definitions
+for calculating year fractions between dates. These conventions are critical
+for accurate coupon and interest accrual calculations.
+
+Supported conventions:
+- THIRTY_360_BOND: 30/360 Bond Basis (ISDA 4.16f)
+- THIRTY_E_360: 30E/360 Eurobond Basis (ISDA 4.16g)
+- THIRTY_E_360_ISDA: 30E/360 ISDA variant (ISDA 4.16h)
+- THIRTY_E_PLUS_360: 30E+/360 with day 31 roll adjustment
+- ACT_ACT_ISDA: Actual/Actual ISDA (splits leap years)
+- ACT_ACT_ICMA: Actual/Actual ICMA (for bonds)
+- ACT_365F: Actual/365 Fixed
+- ACT_360: Actual/360 (money market basis)
+- ACT_365L: Actual/365 Leap (accounts for leap years)
+- SIMPLE: Actual divided by gDaysInYear
+
+Each convention defines how to:
+1. Count days between two dates (numerator)
+2. Determine the basis/denominator for annualization
+3. Calculate the year fraction used in present value calculations
+
+References:
+- ISDA 2006 Definitions (sections 4.16)
+- OpenGamma documentation
+- Wikipedia Day Count Convention article
+
+Example:
+    >>> # Calculate year fraction for a bond accrual period
+    >>> dc = DayCount(DayCountTypes.ACT_365F)
+    >>> dt1 = Date(15, 6, 2023)
+    >>> dt2 = Date(15, 12, 2023)
+    >>>
+    >>> # Get year fraction, numerator, and denominator
+    >>> year_frac, num_days, denom = dc.year_frac(dt1, dt2)
+    >>> print(f"Year fraction: {year_frac}")
+    >>> print(f"Days: {num_days}/{denom}")
+"""
+
 from .date import Date
 from .date import datediff
 from .date import is_leap_year

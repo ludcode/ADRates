@@ -1,3 +1,46 @@
+"""
+Calendar and business day adjustment utilities.
+
+Provides calendar handling for regional and country-specific holiday conventions
+and business day adjustment methods following ISDA standards.
+
+Key features:
+- Multiple calendar types (UK, US, TARGET, Japan, etc.)
+- Business day adjustment conventions (Following, Modified Following, etc.)
+- Holiday checking for specific calendars
+- Calendar intersection for multi-currency trades
+- Easter holiday calculations
+- Weekend detection
+
+Business day adjustment types:
+- NONE: No adjustment
+- FOLLOWING: Move to next business day
+- MODIFIED_FOLLOWING: Following, but stay in same month
+- PRECEDING: Move to previous business day
+- MODIFIED_PRECEDING: Preceding, but stay in same month
+
+Supported calendars:
+- WEEKEND: Saturday and Sunday only
+- UNITED_KINGDOM: UK bank holidays
+- UNITED_STATES: US holidays
+- TARGET: European Central Bank TARGET system
+- JAPAN, AUSTRALIA, CANADA, and others
+
+Example:
+    >>> # Create a UK calendar
+    >>> calendar = Calendar(CalendarTypes.UNITED_KINGDOM)
+    >>>
+    >>> # Check if a date is a business day
+    >>> dt = Date(25, 12, 2023)  # Christmas
+    >>> is_bday = calendar.is_business_day(dt)  # False
+    >>>
+    >>> # Adjust a date to next business day
+    >>> adjusted = calendar.adjust(dt, BusDayAdjustTypes.FOLLOWING)
+    >>>
+    >>> # Add business days
+    >>> dt2 = calendar.add_business_days(dt, 5)
+"""
+
 import datetime
 from enum import Enum
 from .date import Date

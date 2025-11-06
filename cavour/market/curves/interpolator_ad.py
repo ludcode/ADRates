@@ -1,3 +1,17 @@
+"""
+JAX-compatible interpolation schemes for automatic differentiation.
+
+Provides InterpolatorAd class with various interpolation methods:
+- FLAT_FWD_RATES: Piecewise flat forward rates (market standard)
+- LINEAR_ZERO_RATES: Linear interpolation on zero rates
+- LINEAR_FWD_RATES: Linear interpolation on discount factors
+- PCHIP_LOG_DISCOUNT: Monotonic Hermite splines on log(DF)
+- PCHIP_ZERO_RATES: Monotonic Hermite splines on zero rates
+- Cubic spline variants (natural, financial)
+
+All methods support reverse-mode AD via JAX for computing sensitivities.
+"""
+
 import jax
 import jax.numpy as jnp
 from functools import partial
@@ -8,7 +22,19 @@ from cavour.utils.global_vars import g_small
 from cavour.utils.global_types import InterpTypes
 
 def _compute_pchip_slopes(x, y):
-    # Monotonic cubic Hermite (PCHIP) slopes
+    """
+    Compute monotonic cubic Hermite (PCHIP) slopes for shape-preserving interpolation.
+
+    Args:
+        x (jnp.ndarray): Time points (must be strictly increasing)
+        y (jnp.ndarray): Values at time points
+
+    Returns:
+        jnp.ndarray: Derivative values at each point ensuring monotonicity
+
+    Note:
+        Uses weighted harmonic mean to preserve monotonicity between points.
+    """
     h = x[1:] - x[:-1]
     m = (y[1:] - y[:-1]) / h
     d = jnp.empty_like(y)
@@ -27,6 +53,18 @@ def _compute_pchip_slopes(x, y):
 
 @jax.jit
 def _pchip_eval(t, x, y, d):
+    """
+    Evaluate PCHIP interpolation at target time using Hermite basis functions.
+
+    Args:
+        t (float): Target time for evaluation
+        x (jnp.ndarray): Knot points
+        y (jnp.ndarray): Values at knots
+        d (jnp.ndarray): Derivative values at knots
+
+    Returns:
+        float: Interpolated value at time t
+    """
     idx = jnp.clip(jnp.searchsorted(x, t) - 1, 0, x.size-2)
     x0 = x[idx]; x1 = x[idx+1]
     y0 = y[idx]; y1 = y[idx+1]
@@ -41,6 +79,17 @@ def _pchip_eval(t, x, y, d):
 
 @jax.jit
 def _cubic_eval(t, x, c_coef):
+    """
+    Evaluate cubic spline at target time using precomputed coefficients.
+
+    Args:
+        t (float): Target time
+        x (jnp.ndarray): Knot points
+        c_coef (jnp.ndarray): Cubic coefficients (4 x n-1 array)
+
+    Returns:
+        float: Interpolated value
+    """
     idx = jnp.clip(jnp.searchsorted(x, t) - 1, 0, x.size-2)
     u = t - x[idx]
     c0 = c_coef[0, idx]; c1 = c_coef[1, idx]
@@ -49,6 +98,17 @@ def _cubic_eval(t, x, c_coef):
 
 @jax.jit
 def _linear_interp(t, x, y):
+    """
+    Linear interpolation between curve points.
+
+    Args:
+        t (float): Target time
+        x (jnp.ndarray): Time points
+        y (jnp.ndarray): Values at time points
+
+    Returns:
+        float: Linearly interpolated value at t
+    """
     idx = jnp.clip(jnp.searchsorted(x, t) - 1, 0, x.size-2)
     x0 = x[idx]; x1 = x[idx+1]
     y0 = y[idx]; y1 = y[idx+1]
@@ -56,6 +116,23 @@ def _linear_interp(t, x, y):
     return (1 - w)*y0 + w*y1
 
 class InterpolatorAd:
+    """
+    JAX-compatible interpolator for automatic differentiation of curves.
+
+    Supports multiple interpolation schemes via InterpTypes enum. The fit()
+    method precomputes coefficients for complex methods (PCHIP, cubic splines),
+    while simple methods compute on-the-fly in simple_interpolate().
+
+    All methods are JIT-compiled for performance and support reverse-mode AD.
+
+    Attributes:
+        _interp_type (InterpTypes): Interpolation scheme
+        _times (jnp.ndarray): Fitted time points
+        _dfs (jnp.ndarray): Fitted discount factors
+        _pchip_y (jnp.ndarray): Transformed values for PCHIP
+        _pchip_d (jnp.ndarray): PCHIP slopes
+        _cubic_coef (jnp.ndarray): Cubic spline coefficients
+    """
     def __init__(self, interpolator_type: InterpTypes):
         self._interp_type = interpolator_type
         self._times = None
@@ -65,6 +142,18 @@ class InterpolatorAd:
         self._cubic_coef = None
 
     def fit(self, times, dfs):
+        """
+        Precompute interpolation coefficients for the given curve points.
+
+        Args:
+            times (array-like): Time points in years
+            dfs (array-like): Discount factors at each time point
+
+        Note:
+            For PCHIP and cubic methods, computes transformed values (log, zero rates)
+            and spline coefficients. Simple methods (flat forward, linear) do not
+            require preprocessing.
+        """
         x = jnp.array(times)
         d = jnp.array(dfs)
         self._times = x
@@ -96,6 +185,26 @@ class InterpolatorAd:
 
     @partial(jax.jit, static_argnums=(0,4))
     def simple_interpolate(self, t, times, dfs, method):
+        """
+        Fast interpolation for simple methods (flat forward, linear zero/forward rates).
+
+        Args:
+            t (float | jnp.ndarray): Target time(s) for interpolation
+            times (jnp.ndarray): Curve time points
+            dfs (jnp.ndarray): Discount factors at curve points
+            method (int): InterpTypes enum value
+
+        Returns:
+            float | jnp.ndarray: Interpolated discount factor(s)
+
+        Raises:
+            LibError: If method is not one of LINEAR_ZERO_RATES, FLAT_FWD_RATES,
+                      or LINEAR_FWD_RATES
+
+        Note:
+            This method is JIT-compiled with static method argument. For complex
+            methods (PCHIP, cubic), use interpolate() instead.
+        """
         x = jnp.array(times)
         d = jnp.array(dfs)
         def _eval_scalar(tt):
@@ -120,6 +229,21 @@ class InterpolatorAd:
 
     @partial(jax.jit, static_argnums=(0,))
     def interpolate(self, t: float):
+        """
+        General interpolation method supporting all InterpTypes.
+
+        Requires fit() to be called first for complex methods. Dispatches to
+        appropriate evaluation function based on self._interp_type.
+
+        Args:
+            t (float | jnp.ndarray): Target time(s) in years
+
+        Returns:
+            float | jnp.ndarray: Interpolated discount factor(s)
+
+        Raises:
+            LibError: If fit() has not been called (self._dfs is None)
+        """
         if self._dfs is None:
             raise LibError("Dfs have not been set.")
         tt = jnp.atleast_1d(t)
