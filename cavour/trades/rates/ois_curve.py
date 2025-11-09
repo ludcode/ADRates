@@ -178,13 +178,13 @@ class OISCurve(DiscountCurve):
             else:
                 acc = self._used_swaps[i]._fixed_leg._year_fracs[-1-step]
                 last_payment = sum(self._used_swaps[i]._fixed_leg._year_fracs[:-1-step])
-                if round(last_payment , 1) not in pv01_dict:
+                if round(last_payment , 2) not in pv01_dict:
                     step += 1
-                    pv01_dict[round(last_payment,1)] = calculate_single_df(pv01, i, last_payment, step)
+                    pv01_dict[round(last_payment,2)] = calculate_single_df(pv01, i, last_payment, step)
 
                 pv01_end = (acc * swap_rate + 1)
-                df_mat = (df_settle - swap_rate * pv01_dict[round(last_payment,1)]) / pv01_end
-                pv01 = pv01_dict[round(last_payment,1)] + acc * df_mat
+                df_mat = (df_settle - swap_rate * pv01_dict[round(last_payment,2)]) / pv01_end
+                pv01 = pv01_dict[round(last_payment,2)] + acc * df_mat
 
             self._times = jnp.append(self._times, t_mat)
             self._dfs = jnp.append(self._dfs, df_mat)
@@ -192,7 +192,7 @@ class OISCurve(DiscountCurve):
             if target_maturity is None:
                self._repr_dfs = jnp.append(self._repr_dfs, df_mat)
 
-            pv01_dict[round(t_mat,1)] = pv01
+            pv01_dict[round(t_mat,2)] = pv01
 
             step = 0
 
@@ -306,20 +306,20 @@ class OISCurve(DiscountCurve):
             else:
                 acc = self._used_swaps[i]._fixed_leg._year_fracs[-1]
                 last_payment = sum(self._used_swaps[i]._fixed_leg._year_fracs[:-1-step])
-                if round(last_payment , 1) not in pv01_dict:
+                if round(last_payment , 2) not in pv01_dict:
                     step += 1
-                    pv01_dict[round(last_payment,1)] = calculate_single_df(pv01, i, last_payment, step)
+                    pv01_dict[round(last_payment,2)] = calculate_single_df(pv01, i, last_payment, step)
 
                 pv01_end = (acc * swap_rate + 1)
-                df_mat = (df_settle - swap_rate * pv01_dict[round(last_payment,1)]) / pv01_end
+                df_mat = (df_settle - swap_rate * pv01_dict[round(last_payment,2)]) / pv01_end
                 zero_rate = (1 / df_mat)**(1 / t_mat) - 1
-                pv01 = pv01_dict[round(last_payment,1)] + acc * df_mat
+                pv01 = pv01_dict[round(last_payment,2)] + acc * df_mat
 
             self._times = np.append(self._times, t_mat)
             self._dfs = np.append(self._dfs, df_mat)
             self._interpolator.fit(self._times, self._dfs)
 
-            pv01_dict[round(t_mat,1)] = pv01
+            pv01_dict[round(t_mat,2)] = pv01
 
             step = 0
 

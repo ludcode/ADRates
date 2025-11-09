@@ -8,6 +8,7 @@ cavourvenv/
 cavourvenv
 .venv/
 env/
+.claude/
 
 # Ignore Python cache and build artifacts
 __pycache__/
