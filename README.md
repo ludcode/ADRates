@@ -1,6 +1,6 @@
 # ADRates
 
-**Cavour** is a modern, Python-based quantitative finance library for building Overnight Index Swap (OIS) discount curves and computing sensitivities (delta and gamma) of interest rate swaps via Algorithmic Differentiation (AD). This is a fundamental difference with the typical Quant approach of bumping curves.
+**ADRates** is a modern, Python-based quantitative finance library for building Overnight Index Swap (OIS) discount curves and computing sensitivities (delta and gamma) of interest rate swaps via Algorithmic Differentiation (AD). This is a fundamental difference with the typical Quant approach of bumping curves.
 
 ## 🚀 Features
 

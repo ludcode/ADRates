@@ -193,15 +193,16 @@ class Engine:
 
         Implementation:
             1. Pre-expands all intermediate cashflow points from all swaps
-            2. Deduplicates using rounded maturity keys (1 decimal place)
+            2. Deduplicates using rounded maturity keys (2 decimal places)
             3. Builds dependency graph via prev_idx mapping
             4. Sequential bootstrap via lax.scan
             5. Returns dense grid for interpolation (not just swap maturities)
 
         Note:
             Each intermediate point inherits its parent swap's rate, matching
-            the recursive version's behavior. Rounding is used only for dictionary
-            key matching, not for actual computations.
+            the recursive version's behavior. Rounding to 2 decimals supports
+            quarterly swaps (0.25) and is used only for dictionary key matching,
+            not for actual computations.
         """
 
         # 1) Pre-expand ALL intermediate points (not just swap maturities)
@@ -213,10 +214,10 @@ class Engine:
                 cumsum += frac
                 points.append({
                     'maturity': cumsum,                      # EXACT value for computations
-                    'maturity_key': round(cumsum, 1),       # Rounded key for matching
+                    'maturity_key': round(cumsum, 4),       # Rounded key for matching (4 decimals to avoid collisions)
                     'acc': frac,
                     'prev_mat': prev_cum,                    # EXACT previous maturity
-                    'prev_key': round(prev_cum, 1) if j > 0 else None,  # Rounded key
+                    'prev_key': round(prev_cum, 4) if j > 0 else None,  # Rounded key (4 decimals)
                     'rate': rate,                            # Parent swap's rate
                     'is_final': (j == len(fracs) - 1),      # Is this the swap's final maturity?
                     'swap_idx': i
@@ -313,8 +314,8 @@ class Engine:
                             value_time: float            # scalar
                             ):
         interp = InterpolatorAd(interp_type)
-        df_val   = interp.simple_interpolate(value_time, times, dfs, interp_type.value)
-        df_pmts  = interp.simple_interpolate(payment_times, times, dfs, interp_type.value)
+        df_val   = jnp.atleast_1d(interp.simple_interpolate(value_time, times, dfs, interp_type.value))
+        df_pmts  = jnp.atleast_1d(interp.simple_interpolate(payment_times, times, dfs, interp_type.value))
 
         # build a mask of “after valuation date” over your M flows
         mask     = payment_times > value_time   # [M]
@@ -431,12 +432,14 @@ class Engine:
         out = {}
         if RequestTypes.VALUE in requests:
             val = pv_fn(dfs)
-            out["value"] = Valuation(amount=float(val), currency=fixed_leg_details._currency)
+            # Convert to scalar - handles both scalar and (1,) array cases
+            val_scalar = float(jnp.atleast_1d(val).item() if jnp.ndim(val) == 0 else val.squeeze())
+            out["value"] = Valuation(amount=val_scalar, currency=fixed_leg_details._currency)
 
         need_grad = RequestTypes.DELTA in requests or RequestTypes.GAMMA in requests
         grad_dfs = None
         if need_grad:
-            grad_dfs = grad(lambda d: pv_fn(d))(dfs)
+            grad_dfs = grad(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
 
         if RequestTypes.DELTA in requests:
             sensitivities = jnp.dot(grad_dfs, jac)
@@ -449,7 +452,7 @@ class Engine:
             )
 
         if RequestTypes.GAMMA in requests:
-            hess_dfs = hessian(lambda d: pv_fn(d))(dfs)
+            hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
             term1 = jac.T @ hess_dfs @ jac
             term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
             gammas = term1 + term2
@@ -539,9 +542,9 @@ class Engine:
         disc_interp = InterpolatorAd(disc_interp_type)
         idx_interp  = InterpolatorAd(idx_interp_type)
 
-        df_val   = disc_interp.simple_interpolate(value_time, times, dfs, disc_interp_type.value)
-        df_start = idx_interp.simple_interpolate(start_times, times, dfs, idx_interp_type.value)
-        df_end   = idx_interp.simple_interpolate(end_times, times, dfs, idx_interp_type.value)
+        df_val   = jnp.atleast_1d(disc_interp.simple_interpolate(value_time, times, dfs, disc_interp_type.value))
+        df_start = jnp.atleast_1d(idx_interp.simple_interpolate(start_times, times, dfs, idx_interp_type.value))
+        df_end   = jnp.atleast_1d(idx_interp.simple_interpolate(end_times, times, dfs, idx_interp_type.value))
 
         # d) Vectorised forward rates
         fwd = (df_start / df_end - 1.0) / pay_alphas                 # [..., M]
@@ -560,7 +563,7 @@ class Engine:
         # e) coupon amounts
         cf_amounts = (fwd + spreads) * pay_alphas * notionals                    # [..., M]
 
-        df_pmts    = disc_interp.simple_interpolate(payment_times, times, dfs, disc_interp_type.value)
+        df_pmts    = jnp.atleast_1d(disc_interp.simple_interpolate(payment_times, times, dfs, disc_interp_type.value))
         df_rel     = df_pmts / df_val[..., None]                                 # [..., M]
 
         # g) mask out past payments
@@ -723,12 +726,14 @@ class Engine:
         out = {}
         if RequestTypes.VALUE in requests:
             val = pv_fn(dfs)
-            out["value"] = Valuation(amount=float(val), currency=floating_leg_details._currency)
+            # Convert to scalar - handles both scalar and (1,) array cases
+            val_scalar = float(jnp.atleast_1d(val).item() if jnp.ndim(val) == 0 else val.squeeze())
+            out["value"] = Valuation(amount=val_scalar, currency=floating_leg_details._currency)
 
         need_grad = RequestTypes.DELTA in requests or RequestTypes.GAMMA in requests
         grad_dfs = None
         if need_grad:
-            grad_dfs = grad(lambda d: pv_fn(d))(dfs)
+            grad_dfs = grad(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
 
         if RequestTypes.DELTA in requests:
             sensitivities = jnp.dot(grad_dfs, jac)
@@ -741,7 +746,7 @@ class Engine:
             )
 
         if RequestTypes.GAMMA in requests:
-            hess_dfs = hessian(lambda d: pv_fn(d))(dfs)
+            hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
             term1 = jac.T @ hess_dfs @ jac
             term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
             gammas = term1 + term2
