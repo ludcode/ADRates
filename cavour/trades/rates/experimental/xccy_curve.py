@@ -13,7 +13,7 @@ from cavour.utils.currency import CurrencyTypes
 from cavour.utils.global_vars import gDaysInYear
 from cavour.market.curves.discount_curve import DiscountCurve
 from cavour.trades.rates.swap_float_leg import SwapFloatLeg
-from cavour.utils.calendar import CalendarTypes,  DateGenRuleTypes
+from cavour.utils.calendar import CalendarTypes, DateGenRuleTypes, Calendar
 
 ##############################################################################
 
@@ -40,10 +40,12 @@ class XCCYCurve:
                  target_freq_type: FrequencyTypes = FrequencyTypes.QUARTERLY,
                  collateral_freq_type: FrequencyTypes = FrequencyTypes.QUARTERLY,
                  target_dc_type: DayCountTypes = DayCountTypes.ACT_365F,
-                 collateral_dc_type: DayCountTypes = DayCountTypes.ACT_360):
+                 collateral_dc_type: DayCountTypes = DayCountTypes.ACT_360,
+                 target_calendar = None,
+                 collateral_calendar = None):
         """
         Initialize XCCY curve with basis spread data and underlying OIS curves.
-        
+
         Parameters:
         -----------
         value_dt : Date
@@ -66,16 +68,24 @@ class XCCYCurve:
             Floating index for target currency leg
         collateral_index : CurveTypes
             Floating index for collateral currency leg
-        freq_type : FrequencyTypes
-            Payment frequency for both legs
-        dc_type : DayCountTypes
-            Day count convention for both legs
+        target_freq_type : FrequencyTypes
+            Payment frequency for target leg
+        collateral_freq_type : FrequencyTypes
+            Payment frequency for collateral leg
+        target_dc_type : DayCountTypes
+            Day count convention for target leg
+        collateral_dc_type : DayCountTypes
+            Day count convention for collateral leg
+        target_calendar : Calendar, optional
+            Calendar for target leg (defaults to WEEKEND if not provided)
+        collateral_calendar : Calendar, optional
+            Calendar for collateral leg (defaults to WEEKEND if not provided)
         """
         
         # Validate input lengths
         if len(basis_tenors) != len(basis_spreads):
             raise LibError("basis_tenors and basis_spreads must have the same length")
-        
+
         self._value_dt = value_dt
         self._target_ois_curve = target_ois_curve
         self._collateral_ois_curve = collateral_ois_curve
@@ -90,7 +100,17 @@ class XCCYCurve:
         self._collateral_freq_type = collateral_freq_type
         self._target_dc_type = target_dc_type
         self._collateral_dc_type = collateral_dc_type
-        
+
+        # Set calendars (default to WEEKEND if not provided)
+        # Store Calendar objects for advanced use (e.g., intersection calendars)
+        self._target_calendar = target_calendar if target_calendar is not None else Calendar(CalendarTypes.WEEKEND)
+        self._collateral_calendar = collateral_calendar if collateral_calendar is not None else Calendar(CalendarTypes.WEEKEND)
+
+        # Extract CalendarTypes for passing to SwapFloatLeg (which expects enum, not Calendar object)
+        # For simple calendars, use the type directly. For intersection, store the Calendar itself.
+        self._target_cal_type = target_calendar._cal_type if target_calendar is not None else CalendarTypes.WEEKEND
+        self._collateral_cal_type = collateral_calendar._cal_type if collateral_calendar is not None else CalendarTypes.WEEKEND
+
         # Bootstrap the XCCY curve
        #self._xccy_curve = self._bootstrap_xccy_curve()
     
@@ -103,7 +123,7 @@ class XCCYCurve:
             spread=basis_spread,
             freq_type=self._target_freq_type,
             dc_type=self._target_dc_type,
-            cal_type = CalendarTypes.UNITED_KINGDOM,
+            cal_type=self._target_cal_type,
             notional=notional,
             notional_exchange=notional_exchange,
             floating_index=self._target_index,
@@ -119,7 +139,7 @@ class XCCYCurve:
             spread=0.0,
             freq_type=self._collateral_freq_type,
             dc_type=self._collateral_dc_type,
-            cal_type = CalendarTypes.UNITED_STATES,
+            cal_type=self._collateral_cal_type,
             notional=notional,
             notional_exchange=notional_exchange,
             floating_index=self._collateral_index,
@@ -335,11 +355,15 @@ def bootstrap_xccy_curve(value_dt: Date,
                         collateral_currency: CurrencyTypes = CurrencyTypes.USD,
                         target_index: CurveTypes = CurveTypes.GBP_OIS_SONIA,
                         collateral_index: CurveTypes = CurveTypes.USD_OIS_SOFR,
-                        freq_type: FrequencyTypes = FrequencyTypes.QUARTERLY,
-                        dc_type: DayCountTypes = DayCountTypes.ACT_360) -> DiscountCurve:
+                        target_freq_type: FrequencyTypes = FrequencyTypes.QUARTERLY,
+                        collateral_freq_type: FrequencyTypes = FrequencyTypes.QUARTERLY,
+                        target_dc_type: DayCountTypes = DayCountTypes.ACT_365F,
+                        collateral_dc_type: DayCountTypes = DayCountTypes.ACT_360,
+                        target_calendar = None,
+                        collateral_calendar = None) -> DiscountCurve:
     """
     Convenience function to bootstrap XCCY curve and return the DiscountCurve directly.
-    
+
     Parameters:
     -----------
     value_dt : Date
@@ -362,11 +386,19 @@ def bootstrap_xccy_curve(value_dt: Date,
         Floating index for target currency leg
     collateral_index : CurveTypes
         Floating index for collateral currency leg
-    freq_type : FrequencyTypes
-        Payment frequency for both legs
-    dc_type : DayCountTypes
-        Day count convention for both legs
-        
+    target_freq_type : FrequencyTypes
+        Payment frequency for target leg
+    collateral_freq_type : FrequencyTypes
+        Payment frequency for collateral leg
+    target_dc_type : DayCountTypes
+        Day count convention for target leg
+    collateral_dc_type : DayCountTypes
+        Day count convention for collateral leg
+    target_calendar : Calendar, optional
+        Calendar for target leg (defaults to WEEKEND if not provided)
+    collateral_calendar : Calendar, optional
+        Calendar for collateral leg (defaults to WEEKEND if not provided)
+
     Returns:
     --------
     DiscountCurve: Bootstrapped cross-currency discount curve
@@ -382,10 +414,14 @@ def bootstrap_xccy_curve(value_dt: Date,
         collateral_currency=collateral_currency,
         target_index=target_index,
         collateral_index=collateral_index,
-        freq_type=freq_type,
-        dc_type=dc_type
+        target_freq_type=target_freq_type,
+        collateral_freq_type=collateral_freq_type,
+        target_dc_type=target_dc_type,
+        collateral_dc_type=collateral_dc_type,
+        target_calendar=target_calendar,
+        collateral_calendar=collateral_calendar
     )
-    
+
     return xccy_curve_builder.get_curve()
 
 ##############################################################################

@@ -186,7 +186,9 @@ def test_manual_swap_repricing(gbp_model, gbp_value_date, gbp_market_data, gbp_c
 
         try:
             pos = swap.position(gbp_model)
-            res = pos.compute([RequestTypes.VALUE])
+            res = pos.compute([RequestTypes.VALUE,
+                               RequestTypes.DELTA,
+                               RequestTypes.GAMMA])
             value = res.value.amount
 
             # Check if swap reprices within tolerance

@@ -439,7 +439,7 @@ class Engine:
         need_grad = RequestTypes.DELTA in requests or RequestTypes.GAMMA in requests
         grad_dfs = None
         if need_grad:
-            grad_dfs = grad(lambda d: pv_fn(d))(dfs)
+            grad_dfs = grad(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
 
         if RequestTypes.DELTA in requests:
             sensitivities = jnp.dot(grad_dfs, jac)
@@ -452,7 +452,7 @@ class Engine:
             )
 
         if RequestTypes.GAMMA in requests:
-            hess_dfs = hessian(lambda d: pv_fn(d))(dfs)
+            hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
             term1 = jac.T @ hess_dfs @ jac
             term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
             gammas = term1 + term2
@@ -733,7 +733,7 @@ class Engine:
         need_grad = RequestTypes.DELTA in requests or RequestTypes.GAMMA in requests
         grad_dfs = None
         if need_grad:
-            grad_dfs = grad(lambda d: pv_fn(d))(dfs)
+            grad_dfs = grad(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
 
         if RequestTypes.DELTA in requests:
             sensitivities = jnp.dot(grad_dfs, jac)
@@ -746,7 +746,7 @@ class Engine:
             )
 
         if RequestTypes.GAMMA in requests:
-            hess_dfs = hessian(lambda d: pv_fn(d))(dfs)
+            hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
             term1 = jac.T @ hess_dfs @ jac
             term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
             gammas = term1 + term2
