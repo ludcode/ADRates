@@ -178,6 +178,13 @@ class Model:
             ... )
         """
         settle_dt = self.value_dt.add_weekdays(spot_days)
+
+        # Extract curve type and currency from the curve name
+        curve_type = CurveTypes[name]
+        # Extract currency from the first 3 characters of the curve name (e.g., "GBP" from "GBP_OIS_SONIA")
+        currency_code = name.split('_')[0]
+        currency = CurrencyTypes[currency_code]
+
         swaps = [
             OIS(
                 effective_dt=settle_dt,
@@ -186,6 +193,8 @@ class Model:
                 fixed_coupon=px / 100,
                 fixed_freq_type=fixed_freq_type,
                 fixed_dc_type=fixed_dcc_type,
+                floating_index=curve_type,
+                currency=currency,
                 bd_type=bus_day_type,
                 float_freq_type=float_freq_type,
                 float_dc_type=float_dc_type,

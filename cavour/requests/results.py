@@ -276,8 +276,8 @@ class Gamma:
     Attributes:
         risk_ladder (jnp.ndarray): Gamma matrix (shape: [N, N]) or vector [N]
         tenors (List[str]): Tenor labels
-        currency (CurrencyTypes): Currency of sensitivities (default: GBP)
-        curve_type (CurveTypes): Curve identifier (default: GBP_OIS_SONIA)
+        currency (CurrencyTypes): Currency of sensitivities
+        curve_type (CurveTypes): Curve identifier
 
     Properties:
         value: Sum of gamma matrix as Value object
@@ -302,8 +302,8 @@ class Gamma:
     """
     risk_ladder: jnp.ndarray       # shape [N] or [N, N]
     tenors:       List[str]        # length N
-    currency:     CurrencyTypes = CurrencyTypes.GBP
-    curve_type:   CurveTypes = CurveTypes.GBP_OIS_SONIA
+    currency:     CurrencyTypes
+    curve_type:   CurveTypes
 
     def __post_init__(self):
         arr = self.risk_ladder

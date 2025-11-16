@@ -369,7 +369,7 @@ class OISCurve(DiscountCurve):
                 round(self.swap_times[i],4),
                 round(self.year_fracs[i][-1],4),
                 round(self.swap_rates[i],4),
-                round(self._repr_dfs[i],4),
+                round(self._repr_dfs[i+1],4),
             ])
 
         table = format_table(header, rows)

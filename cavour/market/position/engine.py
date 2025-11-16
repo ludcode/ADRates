@@ -448,7 +448,7 @@ class Engine:
                 risk_ladder=sensies,
                 tenors=to_tenor(swap_times),
                 currency=fixed_leg_details._currency,
-                curve_type=CurveTypes.GBP_OIS_SONIA,
+                curve_type=fixed_leg_details._floating_index,
             )
 
         if RequestTypes.GAMMA in requests:
@@ -742,7 +742,7 @@ class Engine:
                 risk_ladder=sensies,
                 tenors=to_tenor(swap_times),
                 currency=floating_leg_details._currency,
-                curve_type=CurveTypes.GBP_OIS_SONIA,
+                curve_type=floating_leg_details._floating_index,
             )
 
         if RequestTypes.GAMMA in requests:
