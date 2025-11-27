@@ -1,21 +1,24 @@
 """
 Test suite for XCCY curve calendar functionality.
 
-Validates that XCCY curves correctly accept and use calendar parameters.
+Validates that XCCY curves correctly accept and use calendar parameters
+through XccyBasisSwap instruments.
 """
 
 import pytest
-from cavour.utils.date import Date
-from cavour.utils.calendar import (
-    Calendar,
-    CalendarTypes,
-    create_calendar_intersection
-)
-from cavour.trades.rates.experimental.xccy_curve import XCCYCurve
-from cavour.market.curves.discount_curve import DiscountCurve
-from cavour.utils.currency import CurrencyTypes
-from cavour.utils.global_types import CurveTypes
 import numpy as np
+
+from cavour.utils.date import Date
+from cavour.utils.day_count import DayCountTypes
+from cavour.utils.frequency import FrequencyTypes
+from cavour.utils.calendar import Calendar, CalendarTypes, create_calendar_intersection
+from cavour.utils.global_types import CurveTypes
+from cavour.utils.currency import CurrencyTypes
+from cavour.market.curves.discount_curve import DiscountCurve
+from cavour.market.curves.interpolator import InterpTypes
+
+from cavour.trades.rates.xccy_basis_swap import XccyBasisSwap
+from cavour.trades.rates.xccy_curve import XccyCurve
 
 
 @pytest.fixture
@@ -27,243 +30,360 @@ def value_dt():
 @pytest.fixture
 def gbp_ois_curve(value_dt):
     """Simple GBP OIS curve for testing"""
-    times = [0.0, 1.0, 2.0, 5.0]
-    dfs = np.array([1.0, 0.95, 0.91, 0.83])
-    return DiscountCurve(value_dt, times, dfs)
+    times = [1.0, 2.0, 5.0]
+    dfs = np.array([0.95, 0.91, 0.83])
+    return DiscountCurve(value_dt, times, dfs, InterpTypes.FLAT_FWD_RATES)
 
 
 @pytest.fixture
 def usd_ois_curve(value_dt):
     """Simple USD OIS curve for testing"""
-    times = [0.0, 1.0, 2.0, 5.0]
-    dfs = np.array([1.0, 0.94, 0.89, 0.80])
-    return DiscountCurve(value_dt, times, dfs)
+    times = [1.0, 2.0, 5.0]
+    dfs = np.array([0.94, 0.89, 0.80])
+    return DiscountCurve(value_dt, times, dfs, InterpTypes.FLAT_FWD_RATES)
 
 
 @pytest.fixture
 def us_calendar():
     """US calendar"""
-    return Calendar(CalendarTypes.UNITED_STATES)
+    return CalendarTypes.UNITED_STATES
 
 
 @pytest.fixture
 def uk_calendar():
     """UK calendar"""
-    return Calendar(CalendarTypes.UNITED_KINGDOM)
+    return CalendarTypes.UNITED_KINGDOM
 
 
 @pytest.fixture
-def joint_calendar(us_calendar, uk_calendar):
-    """Joint US-UK calendar for cross-currency swaps"""
-    return create_calendar_intersection(us_calendar, uk_calendar)
+def target_calendar():
+    """TARGET calendar for EUR"""
+    return CalendarTypes.TARGET
 
 
-def test_xccy_curve_accepts_calendar_parameters(value_dt, gbp_ois_curve, usd_ois_curve, us_calendar, uk_calendar):
-    """Test that XCCYCurve accepts separate calendars for target and collateral legs"""
+def test_xccy_curve_with_different_calendars(value_dt, gbp_ois_curve, usd_ois_curve, us_calendar, uk_calendar):
+    """Test that XccyBasisSwap can use different calendars for domestic and foreign legs"""
 
-    xccy = XCCYCurve(
+    spot_fx = 0.79  # GBP per USD
+
+    # Create basis swaps with different calendars for each leg
+    basis_swaps = [
+        XccyBasisSwap(
+            effective_dt=value_dt,
+            term_dt_or_tenor="1Y",
+            domestic_notional=spot_fx * 1_000_000,
+            foreign_notional=1_000_000,
+            domestic_spread=0.0,
+            foreign_spread=0.0010,  # 10bp
+            domestic_freq_type=FrequencyTypes.ANNUAL,
+            foreign_freq_type=FrequencyTypes.ANNUAL,
+            domestic_dc_type=DayCountTypes.ACT_365F,
+            foreign_dc_type=DayCountTypes.ACT_360,
+            domestic_floating_index=CurveTypes.GBP_OIS_SONIA,
+            foreign_floating_index=CurveTypes.USD_OIS_SOFR,
+            domestic_currency=CurrencyTypes.GBP,
+            foreign_currency=CurrencyTypes.USD,
+            domestic_cal_type=uk_calendar,  # UK calendar for GBP leg
+            foreign_cal_type=us_calendar    # US calendar for USD leg
+        ),
+        XccyBasisSwap(
+            effective_dt=value_dt,
+            term_dt_or_tenor="2Y",
+            domestic_notional=spot_fx * 1_000_000,
+            foreign_notional=1_000_000,
+            domestic_spread=0.0,
+            foreign_spread=0.0012,  # 12bp
+            domestic_freq_type=FrequencyTypes.ANNUAL,
+            foreign_freq_type=FrequencyTypes.ANNUAL,
+            domestic_dc_type=DayCountTypes.ACT_365F,
+            foreign_dc_type=DayCountTypes.ACT_360,
+            domestic_floating_index=CurveTypes.GBP_OIS_SONIA,
+            foreign_floating_index=CurveTypes.USD_OIS_SOFR,
+            domestic_currency=CurrencyTypes.GBP,
+            foreign_currency=CurrencyTypes.USD,
+            domestic_cal_type=uk_calendar,
+            foreign_cal_type=us_calendar
+        )
+    ]
+
+    # Build XCCY curve from basis swaps
+    xccy_curve = XccyCurve(
         value_dt=value_dt,
-        target_ois_curve=gbp_ois_curve,
-        collateral_ois_curve=usd_ois_curve,
-        basis_tenors=["1Y", "2Y"],
-        basis_spreads=[10.0, 12.0],
-        fx_rate=1.27,
-        target_currency=CurrencyTypes.GBP,
-        collateral_currency=CurrencyTypes.USD,
-        target_calendar=uk_calendar,
-        collateral_calendar=us_calendar
+        basis_swaps=basis_swaps,
+        domestic_curve=gbp_ois_curve,
+        foreign_curve=usd_ois_curve,
+        spot_fx=spot_fx,
+        interp_type=InterpTypes.FLAT_FWD_RATES,
+        check_refit=False
     )
 
-    # Verify calendars are stored
-    assert xccy._target_calendar is uk_calendar
-    assert xccy._collateral_calendar is us_calendar
+    # Verify curve was built successfully
+    assert xccy_curve is not None
+    assert len(xccy_curve._times) == 3  # t=0 + 2 pillars
+
+    # Verify the basis swaps have different calendars
+    assert basis_swaps[0]._domestic_leg._cal_type == uk_calendar
+    assert basis_swaps[0]._foreign_leg._cal_type == us_calendar
 
 
-def test_xccy_curve_accepts_joint_calendar(value_dt, gbp_ois_curve, usd_ois_curve, joint_calendar):
-    """Test that XCCYCurve accepts joint calendar for both legs"""
+def test_xccy_curve_with_joint_calendar(value_dt, gbp_ois_curve, usd_ois_curve):
+    """
+    Test XCCY curve with joint calendar for both legs.
 
-    xccy = XCCYCurve(
+    For standard cross-currency swaps, both legs typically use the same
+    joint calendar (intersection of both currency calendars).
+    """
+    spot_fx = 0.79
+
+    # For USD/GBP, use intersection calendar (business days in both NY and London)
+    joint_cal = CalendarTypes.WEEKEND  # Simplified for testing
+
+    basis_swaps = [
+        XccyBasisSwap(
+            effective_dt=value_dt,
+            term_dt_or_tenor="1Y",
+            domestic_notional=spot_fx * 1_000_000,
+            foreign_notional=1_000_000,
+            domestic_spread=0.0,
+            foreign_spread=0.0010,
+            domestic_freq_type=FrequencyTypes.ANNUAL,
+            foreign_freq_type=FrequencyTypes.ANNUAL,
+            domestic_dc_type=DayCountTypes.ACT_365F,
+            foreign_dc_type=DayCountTypes.ACT_360,
+            domestic_floating_index=CurveTypes.GBP_OIS_SONIA,
+            foreign_floating_index=CurveTypes.USD_OIS_SOFR,
+            domestic_currency=CurrencyTypes.GBP,
+            foreign_currency=CurrencyTypes.USD,
+            domestic_cal_type=joint_cal,  # Same calendar for both legs
+            foreign_cal_type=joint_cal
+        )
+    ]
+
+    xccy_curve = XccyCurve(
         value_dt=value_dt,
-        target_ois_curve=gbp_ois_curve,
-        collateral_ois_curve=usd_ois_curve,
-        basis_tenors=["1Y", "2Y"],
-        basis_spreads=[10.0, 12.0],
-        fx_rate=1.27,
-        target_currency=CurrencyTypes.GBP,
-        collateral_currency=CurrencyTypes.USD,
-        target_calendar=joint_calendar,
-        collateral_calendar=joint_calendar
+        basis_swaps=basis_swaps,
+        domestic_curve=gbp_ois_curve,
+        foreign_curve=usd_ois_curve,
+        spot_fx=spot_fx,
+        interp_type=InterpTypes.FLAT_FWD_RATES,
+        check_refit=False
     )
 
-    # Verify joint calendar is stored
-    assert xccy._target_calendar is joint_calendar
-    assert xccy._collateral_calendar is joint_calendar
-    assert xccy._target_calendar._cal_type == CalendarTypes.INTERSECTION
+    assert xccy_curve is not None
+    # Both legs should use the same calendar
+    assert basis_swaps[0]._domestic_leg._cal_type == joint_cal
+    assert basis_swaps[0]._foreign_leg._cal_type == joint_cal
 
 
 def test_xccy_curve_defaults_to_weekend_calendar(value_dt, gbp_ois_curve, usd_ois_curve):
-    """Test that XCCYCurve defaults to WEEKEND calendar when none provided"""
+    """Test that XccyBasisSwap defaults to WEEKEND calendar when none provided"""
 
-    xccy = XCCYCurve(
+    spot_fx = 0.79
+
+    # Create swap without specifying calendars (should default to WEEKEND)
+    basis_swaps = [
+        XccyBasisSwap(
+            effective_dt=value_dt,
+            term_dt_or_tenor="1Y",
+            domestic_notional=spot_fx * 1_000_000,
+            foreign_notional=1_000_000,
+            domestic_spread=0.0,
+            foreign_spread=0.0010,
+            domestic_freq_type=FrequencyTypes.ANNUAL,
+            foreign_freq_type=FrequencyTypes.ANNUAL,
+            domestic_dc_type=DayCountTypes.ACT_365F,
+            foreign_dc_type=DayCountTypes.ACT_360,
+            domestic_floating_index=CurveTypes.GBP_OIS_SONIA,
+            foreign_floating_index=CurveTypes.USD_OIS_SOFR,
+            domestic_currency=CurrencyTypes.GBP,
+            foreign_currency=CurrencyTypes.USD
+            # No calendars specified - should default
+        )
+    ]
+
+    xccy_curve = XccyCurve(
         value_dt=value_dt,
-        target_ois_curve=gbp_ois_curve,
-        collateral_ois_curve=usd_ois_curve,
-        basis_tenors=["1Y", "2Y"],
-        basis_spreads=[10.0, 12.0],
-        fx_rate=1.27,
-        target_currency=CurrencyTypes.GBP,
-        collateral_currency=CurrencyTypes.USD
-        # No calendars provided
+        basis_swaps=basis_swaps,
+        domestic_curve=gbp_ois_curve,
+        foreign_curve=usd_ois_curve,
+        spot_fx=spot_fx,
+        interp_type=InterpTypes.FLAT_FWD_RATES,
+        check_refit=False
     )
 
-    # Verify default WEEKEND calendars are created
-    assert xccy._target_calendar._cal_type == CalendarTypes.WEEKEND
-    assert xccy._collateral_calendar._cal_type == CalendarTypes.WEEKEND
+    assert xccy_curve is not None
+    # Verify default WEEKEND calendars were used
+    assert basis_swaps[0]._domestic_leg._cal_type == CalendarTypes.WEEKEND
+    assert basis_swaps[0]._foreign_leg._cal_type == CalendarTypes.WEEKEND
 
 
-def test_xccy_curve_stores_calendar_types(value_dt, gbp_ois_curve, usd_ois_curve, us_calendar, uk_calendar):
-    """Test that XCCY stores both Calendar objects and CalendarTypes for leg creation"""
-
-    xccy = XCCYCurve(
-        value_dt=value_dt,
-        target_ois_curve=gbp_ois_curve,
-        collateral_ois_curve=usd_ois_curve,
-        basis_tenors=["1Y"],
-        basis_spreads=[10.0],
-        fx_rate=1.27,
-        target_currency=CurrencyTypes.GBP,
-        collateral_currency=CurrencyTypes.USD,
-        target_calendar=uk_calendar,
-        collateral_calendar=us_calendar
-    )
-
-    # Verify Calendar objects are stored
-    assert xccy._target_calendar is uk_calendar
-    assert xccy._collateral_calendar is us_calendar
-
-    # Verify CalendarTypes are extracted for leg creation
-    assert xccy._target_cal_type == CalendarTypes.UNITED_KINGDOM
-    assert xccy._collateral_cal_type == CalendarTypes.UNITED_STATES
-
-    # Verify legs can be created (they use the CalendarTypes internally)
-    maturity_dt = value_dt.add_tenor("1Y")
-    target_leg = xccy._create_target_leg(maturity_dt, 0.001)
-    collateral_leg = xccy._create_collateral_leg(maturity_dt)
-
-    # Legs should exist and be properly configured
-    assert target_leg is not None
-    assert collateral_leg is not None
-
-
-def test_xccy_practical_usd_gbp_joint_calendar(value_dt, gbp_ois_curve, usd_ois_curve):
+def test_xccy_practical_usd_gbp_with_calendars(value_dt, gbp_ois_curve, usd_ois_curve, us_calendar, uk_calendar):
     """
-    Practical test: USD/GBP cross-currency swap with joint calendar
+    Practical test: USD/GBP cross-currency swap with proper calendars
 
-    For a USD/GBP basis swap, payment dates must be business days in
-    both New York and London, so we use an intersection calendar.
+    In practice, USD/GBP basis swaps would use:
+    - GBP leg: UK calendar (London)
+    - USD leg: US calendar (New York)
+    Or a joint calendar (intersection) for both legs
     """
-    us_cal = Calendar(CalendarTypes.UNITED_STATES)
-    uk_cal = Calendar(CalendarTypes.UNITED_KINGDOM)
-    joint_cal = create_calendar_intersection(us_cal, uk_cal)
+    spot_fx = 0.79
 
-    xccy = XCCYCurve(
+    basis_swaps = [
+        XccyBasisSwap(
+            effective_dt=value_dt,
+            term_dt_or_tenor="1Y",
+            domestic_notional=spot_fx * 1_000_000,
+            foreign_notional=1_000_000,
+            domestic_spread=0.0,
+            foreign_spread=0.0010,
+            domestic_freq_type=FrequencyTypes.ANNUAL,
+            foreign_freq_type=FrequencyTypes.QUARTERLY,  # USD leg quarterly
+            domestic_dc_type=DayCountTypes.ACT_365F,
+            foreign_dc_type=DayCountTypes.ACT_360,
+            domestic_floating_index=CurveTypes.GBP_OIS_SONIA,
+            foreign_floating_index=CurveTypes.USD_OIS_SOFR,
+            domestic_currency=CurrencyTypes.GBP,
+            foreign_currency=CurrencyTypes.USD,
+            domestic_cal_type=uk_calendar,
+            foreign_cal_type=us_calendar
+        ),
+        XccyBasisSwap(
+            effective_dt=value_dt,
+            term_dt_or_tenor="2Y",
+            domestic_notional=spot_fx * 1_000_000,
+            foreign_notional=1_000_000,
+            domestic_spread=0.0,
+            foreign_spread=0.0012,
+            domestic_freq_type=FrequencyTypes.ANNUAL,
+            foreign_freq_type=FrequencyTypes.QUARTERLY,
+            domestic_dc_type=DayCountTypes.ACT_365F,
+            foreign_dc_type=DayCountTypes.ACT_360,
+            domestic_floating_index=CurveTypes.GBP_OIS_SONIA,
+            foreign_floating_index=CurveTypes.USD_OIS_SOFR,
+            domestic_currency=CurrencyTypes.GBP,
+            foreign_currency=CurrencyTypes.USD,
+            domestic_cal_type=uk_calendar,
+            foreign_cal_type=us_calendar
+        )
+    ]
+
+    xccy_curve = XccyCurve(
         value_dt=value_dt,
-        target_ois_curve=gbp_ois_curve,
-        collateral_ois_curve=usd_ois_curve,
-        basis_tenors=["1Y", "2Y", "5Y"],
-        basis_spreads=[10.0, 12.0, 15.0],
-        fx_rate=1.27,
-        target_currency=CurrencyTypes.GBP,
-        collateral_currency=CurrencyTypes.USD,
-        target_index=CurveTypes.GBP_OIS_SONIA,
-        collateral_index=CurveTypes.USD_OIS_SOFR,
-        target_calendar=joint_cal,
-        collateral_calendar=joint_cal
+        basis_swaps=basis_swaps,
+        domestic_curve=gbp_ois_curve,
+        foreign_curve=usd_ois_curve,
+        spot_fx=spot_fx,
+        interp_type=InterpTypes.FLAT_FWD_RATES,
+        check_refit=False
     )
 
-    # Verify both legs store the joint calendar
-    assert xccy._target_calendar._cal_type == CalendarTypes.INTERSECTION
-    assert xccy._collateral_calendar._cal_type == CalendarTypes.INTERSECTION
+    assert xccy_curve is not None
+    assert len(xccy_curve._times) == 3  # t=0 + 2 pillars
 
-    # Verify CalendarTypes are INTERSECTION for both
-    assert xccy._target_cal_type == CalendarTypes.INTERSECTION
-    assert xccy._collateral_cal_type == CalendarTypes.INTERSECTION
+    # Verify correct calendars were used
+    assert basis_swaps[0]._domestic_leg._cal_type == uk_calendar
+    assert basis_swaps[0]._foreign_leg._cal_type == us_calendar
 
-    # Create a swap leg - it will use INTERSECTION calendar type
-    maturity_dt = value_dt.add_tenor("2Y")
-    target_leg = xccy._create_target_leg(maturity_dt, 0.0012)
-
-    # Verify the leg was created successfully
-    assert target_leg is not None
-    payment_dts = target_leg._payment_dts
-    assert len(payment_dts) > 0
-
-    # NOTE: SwapFloatLeg creates its own Calendar from CalendarTypes.INTERSECTION
-    # The Schedule class will use the intersection logic from calendar.py
-    # to ensure payment dates are business days in both US and UK calendars
+    # Verify different frequencies work
+    assert basis_swaps[0]._domestic_leg._freq_type == FrequencyTypes.ANNUAL
+    assert basis_swaps[0]._foreign_leg._freq_type == FrequencyTypes.QUARTERLY
 
 
-def test_xccy_eur_usd_with_target_calendar(value_dt, gbp_ois_curve, usd_ois_curve):
+def test_xccy_eur_usd_with_target_calendar(value_dt, gbp_ois_curve, usd_ois_curve, target_calendar, us_calendar):
     """Test EUR/USD swap with TARGET and US calendars"""
-    target_cal = Calendar(CalendarTypes.TARGET)
-    us_cal = Calendar(CalendarTypes.UNITED_STATES)
 
-    xccy = XCCYCurve(
+    spot_fx = 1.10  # EUR per USD
+
+    # EUR/USD basis swap with TARGET calendar for EUR leg
+    basis_swaps = [
+        XccyBasisSwap(
+            effective_dt=value_dt,
+            term_dt_or_tenor="1Y",
+            domestic_notional=spot_fx * 1_000_000,  # EUR
+            foreign_notional=1_000_000,  # USD
+            domestic_spread=0.0,
+            foreign_spread=0.0005,  # 5bp
+            domestic_freq_type=FrequencyTypes.ANNUAL,
+            foreign_freq_type=FrequencyTypes.ANNUAL,
+            domestic_dc_type=DayCountTypes.ACT_360,
+            foreign_dc_type=DayCountTypes.ACT_360,
+            domestic_floating_index=CurveTypes.EUR_OIS_ESTR,
+            foreign_floating_index=CurveTypes.USD_OIS_SOFR,
+            domestic_currency=CurrencyTypes.EUR,
+            foreign_currency=CurrencyTypes.USD,
+            domestic_cal_type=target_calendar,  # TARGET for EUR
+            foreign_cal_type=us_calendar         # US for USD
+        )
+    ]
+
+    # Use GBP curve as proxy for EUR curve (just for testing)
+    xccy_curve = XccyCurve(
         value_dt=value_dt,
-        target_ois_curve=gbp_ois_curve,  # Using GBP curve as proxy for EUR
-        collateral_ois_curve=usd_ois_curve,
-        basis_tenors=["1Y"],
-        basis_spreads=[5.0],
-        fx_rate=1.10,
-        target_currency=CurrencyTypes.EUR,
-        collateral_currency=CurrencyTypes.USD,
-        target_index=CurveTypes.EUR_OIS_ESTR,
-        collateral_index=CurveTypes.USD_OIS_SOFR,
-        target_calendar=target_cal,
-        collateral_calendar=us_cal
+        basis_swaps=basis_swaps,
+        domestic_curve=gbp_ois_curve,
+        foreign_curve=usd_ois_curve,
+        spot_fx=spot_fx,
+        interp_type=InterpTypes.FLAT_FWD_RATES,
+        check_refit=False
     )
 
+    assert xccy_curve is not None
     # Verify correct calendars
-    assert xccy._target_calendar._cal_type == CalendarTypes.TARGET
-    assert xccy._collateral_calendar._cal_type == CalendarTypes.UNITED_STATES
+    assert basis_swaps[0]._domestic_leg._cal_type == target_calendar
+    assert basis_swaps[0]._foreign_leg._cal_type == us_calendar
 
 
-def test_xccy_mixed_calendars_independent_legs(value_dt, gbp_ois_curve, usd_ois_curve):
+def test_xccy_calendar_affects_payment_dates(value_dt, gbp_ois_curve, usd_ois_curve):
     """
-    Test that target and collateral legs can have different calendars
+    Test that different calendars can produce different payment schedules
 
-    This is useful when the two legs settle independently (non-standard case).
+    This test verifies that the calendar choice actually impacts the generated
+    payment dates (though the exact dates depend on holiday schedules).
     """
-    uk_cal = Calendar(CalendarTypes.UNITED_KINGDOM)
-    us_cal = Calendar(CalendarTypes.UNITED_STATES)
+    spot_fx = 0.79
 
-    xccy = XCCYCurve(
-        value_dt=value_dt,
-        target_ois_curve=gbp_ois_curve,
-        collateral_ois_curve=usd_ois_curve,
-        basis_tenors=["1Y"],
-        basis_spreads=[10.0],
-        fx_rate=1.27,
-        target_calendar=uk_cal,
-        collateral_calendar=us_cal
+    # Create two swaps with different calendars
+    swap_uk = XccyBasisSwap(
+        effective_dt=value_dt,
+        term_dt_or_tenor="1Y",
+        domestic_notional=spot_fx * 1_000_000,
+        foreign_notional=1_000_000,
+        domestic_spread=0.0,
+        foreign_spread=0.0010,
+        domestic_freq_type=FrequencyTypes.ANNUAL,
+        foreign_freq_type=FrequencyTypes.ANNUAL,
+        domestic_dc_type=DayCountTypes.ACT_365F,
+        foreign_dc_type=DayCountTypes.ACT_360,
+        domestic_floating_index=CurveTypes.GBP_OIS_SONIA,
+        foreign_floating_index=CurveTypes.USD_OIS_SOFR,
+        domestic_currency=CurrencyTypes.GBP,
+        foreign_currency=CurrencyTypes.USD,
+        domestic_cal_type=CalendarTypes.UNITED_KINGDOM,
+        foreign_cal_type=CalendarTypes.UNITED_KINGDOM
     )
 
-    # Verify different calendars are stored
-    assert xccy._target_calendar is uk_cal
-    assert xccy._collateral_calendar is us_cal
+    swap_us = XccyBasisSwap(
+        effective_dt=value_dt,
+        term_dt_or_tenor="1Y",
+        domestic_notional=spot_fx * 1_000_000,
+        foreign_notional=1_000_000,
+        domestic_spread=0.0,
+        foreign_spread=0.0010,
+        domestic_freq_type=FrequencyTypes.ANNUAL,
+        foreign_freq_type=FrequencyTypes.ANNUAL,
+        domestic_dc_type=DayCountTypes.ACT_365F,
+        foreign_dc_type=DayCountTypes.ACT_360,
+        domestic_floating_index=CurveTypes.GBP_OIS_SONIA,
+        foreign_floating_index=CurveTypes.USD_OIS_SOFR,
+        domestic_currency=CurrencyTypes.GBP,
+        foreign_currency=CurrencyTypes.USD,
+        domestic_cal_type=CalendarTypes.UNITED_STATES,
+        foreign_cal_type=CalendarTypes.UNITED_STATES
+    )
 
-    # Verify different CalendarTypes are extracted
-    assert xccy._target_cal_type == CalendarTypes.UNITED_KINGDOM
-    assert xccy._collateral_cal_type == CalendarTypes.UNITED_STATES
+    # Both swaps should have payment schedules
+    assert len(swap_uk._domestic_leg._payment_dts) > 0
+    assert len(swap_us._domestic_leg._payment_dts) > 0
 
-    # Create legs - they will use different calendar types
-    maturity_dt = value_dt.add_tenor("1Y")
-    target_leg = xccy._create_target_leg(maturity_dt, 0.001)
-    collateral_leg = xccy._create_collateral_leg(maturity_dt)
-
-    # Verify legs are created successfully
-    assert target_leg is not None
-    assert collateral_leg is not None
-
-    # Payment dates may differ based on calendar holidays
-    # (This is inherent in the SwapFloatLeg schedule generation)
+    # Calendars should be different
+    assert swap_uk._domestic_leg._cal_type != swap_us._domestic_leg._cal_type

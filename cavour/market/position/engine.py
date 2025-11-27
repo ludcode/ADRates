@@ -457,7 +457,12 @@ class Engine:
             term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
             gammas = term1 + term2
             gammas = np.array(gammas, dtype=np.float64) * 1e-8
-            out["gamma"] = Gamma(gammas, swap_times)
+            out["gamma"] = Gamma(
+                risk_ladder=gammas,
+                tenors=to_tenor(swap_times),
+                currency=fixed_leg_details._currency,
+                curve_type=fixed_leg_details._floating_index,
+            )
 
         return out
 
@@ -751,7 +756,12 @@ class Engine:
             term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
             gammas = term1 + term2
             gammas = np.array(gammas, dtype=np.float64) * 1e-8
-            out["gamma"] = Gamma(gammas, swap_times)
+            out["gamma"] = Gamma(
+                risk_ladder=gammas,
+                tenors=to_tenor(swap_times),
+                currency=floating_leg_details._currency,
+                curve_type=floating_leg_details._floating_index,
+            )
 
         return out
 

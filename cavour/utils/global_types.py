@@ -57,6 +57,7 @@ class InstrumentTypes(Enum):
     SWAP_FIXED_LEG = 1
     SWAP_FLOAT_LEG = 2
     OIS_SWAP = 3
+    XCCY_SWAP = 4
 
 class RequestTypes(Enum):
     VALUE = 1
