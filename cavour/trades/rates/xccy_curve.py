@@ -65,7 +65,7 @@ import jax
 
 from cavour.utils.error import LibError
 from cavour.utils.date import Date
-from cavour.utils.day_count import DayCount
+from cavour.utils.day_count import DayCount, DayCountTypes
 from cavour.utils.helpers import (check_argument_types,
                               _func_name,
                               label_to_string,
@@ -159,9 +159,10 @@ class XccyCurve(DiscountCurve):
         Extracts basis spreads, maturities, and day count conventions from
         the calibration basis swaps. Initializes curve data structures.
         """
-        # Use foreign leg day count for curve time calculations
-        # (convention: foreign leg typically carries the basis)
-        self._dc_type = self._used_swaps[0]._foreign_leg._dc_type
+        # Use ACT/365F for curve time calculations (consistent with DiscountCurve/gDaysInYear)
+        # This ensures that df() queries return correct values
+        from cavour.utils.global_vars import gDaysInYear
+        self._dc_type = DayCountTypes.ACT_365F
 
         self._times = jnp.array([])
         self._dfs = jnp.array([])
@@ -176,14 +177,12 @@ class XccyCurve(DiscountCurve):
         self.basis_spreads = []
         self.swap_times = []
 
-        dcc = DayCount(self._dc_type)
-        days_in_year = dcc.days_in_year()
-
         for swap in self._used_swaps:
             # Basis spread is on foreign leg
             basis_spread = swap._foreign_spread
             maturity_dt = swap._maturity_dt
-            tswap = (maturity_dt - self._value_dt) / days_in_year
+            # Use gDaysInYear (365) for consistency with DiscountCurve
+            tswap = (maturity_dt - self._value_dt) / gDaysInYear
 
             self.swap_times.append(tswap)
             self.basis_spreads.append(basis_spread)
@@ -209,12 +208,15 @@ class XccyCurve(DiscountCurve):
         algebraic solution.
         """
         # Build a temporary XCCY curve for intermediate calculations
-        # Initialize with just the anchor point
-        xccy_nodes_times = [0.0]
-        xccy_nodes_dfs = [1.0]
+        # Store times and DFs directly to avoid DiscountCurve round-trip conversion errors
+        from cavour.market.curves.interpolator import Interpolator
+
+        xccy_nodes_times = []
+        xccy_nodes_dfs = []
 
         for i, swap in enumerate(self._used_swaps):
             t_mat = self.swap_times[i]
+            maturity_dt = swap._maturity_dt
 
             # Value domestic leg using domestic curve
             pv_domestic = swap._domestic_leg.value(
@@ -224,19 +226,119 @@ class XccyCurve(DiscountCurve):
                 first_fixing_rate=None
             )
 
+            # Before building temp curve, identify any intermediate payment dates
+            # that fall between the last node and current maturity
+            intermediate_dates = []
+            if i > 0:
+                last_node_time = xccy_nodes_times[-1]
+                for pmnt_dt in swap._foreign_leg._payment_dts:
+                    pmnt_time = (pmnt_dt - self._value_dt) / 365.0  # ACT_365F
+                    if last_node_time < pmnt_time < t_mat:
+                        intermediate_dates.append((pmnt_dt, pmnt_time))
+
             # Build temporary XCCY curve from current nodes
-            # For the first pillar, use the foreign OIS curve for initial approximation
+            # For ALL pillars (including first), create consistent temp curve
             if i == 0:
-                # For first pillar, use foreign curve as initial XCCY approximation
-                temp_xccy_curve = self._foreign_curve
+                # For first pillar, create a single-node curve at t=0, DF=1.0
+                # We'll use foreign_curve for all other discount queries, but this
+                # ensures consistent ACT_365F day count handling
+                temp_times = np.array([0.0])
+                temp_dfs = np.array([1.0])
+
+                # Manually construct DiscountCurve
+                temp_xccy_curve = DiscountCurve.__new__(DiscountCurve)
+                temp_xccy_curve._value_dt = self._value_dt
+                temp_xccy_curve._times = temp_times
+                temp_xccy_curve._dfs = temp_dfs
+                temp_xccy_curve._interp_type = self._interp_type
+                temp_xccy_curve._dc_type = DayCountTypes.ACT_365F
+
+                # Manually create and fit interpolator
+                temp_interpolator = Interpolator(self._interp_type)
+                temp_interpolator.fit(temp_times, temp_dfs)
+                temp_xccy_curve._interpolator = temp_interpolator
+
+                # For first pillar, also add foreign curve's DFs to approximate
+                # We'll query foreign_curve and copy its structure with ACT_365F override
+                # Actually, for the first pillar we need to query foreign curve for DFs at payment dates
+                # Let's use a simpler approach: just use flat DF=1.0 since we're solving for the first DF anyway
+
+                # Override df() to query foreign_curve with dates (not times)
+                # This allows foreign_curve to use its own day count for time calculations
+                def temp_df_override_first(self, dt, day_count=None):
+                    # Query foreign curve with dates, letting it use its own day count
+                    return xccy_curve_self._foreign_curve.df(dt, xccy_curve_self._foreign_curve._dc_type)
+
+                # Store reference to self for closure
+                xccy_curve_self = self
+
+                # Bind the override method to the instance
+                import types
+                temp_xccy_curve.df = types.MethodType(temp_df_override_first, temp_xccy_curve)
             else:
-                # For subsequent pillars, use bootstrapped XCCY nodes
-                temp_xccy_curve = DiscountCurve(
-                    value_dt=self._value_dt,
-                    df_dts=xccy_nodes_times,
-                    df_values=np.array(xccy_nodes_dfs),
-                    interp_type=self._interp_type
-                )
+                # For subsequent pillars, manually construct temp curve to avoid
+                # DiscountCurve round-trip conversion error (year_frac -> date -> year_frac)
+                # which corrupts the times and introduces accumulating errors
+
+                # Create times and DFs arrays, including intermediate nodes
+                temp_times_list = [0.0] + xccy_nodes_times.copy()
+                temp_dfs_list = [1.0] + xccy_nodes_dfs.copy()
+
+                # Add intermediate nodes using extrapolation if any exist
+                if intermediate_dates:
+                    # Use the interpolate function to extrapolate DFs
+                    from cavour.market.curves.interpolator import interpolate
+
+                    existing_times = np.array([0.0] + xccy_nodes_times)
+                    existing_dfs = np.array([1.0] + xccy_nodes_dfs)
+
+                    # Extrapolate DFs for intermediate dates
+                    for interm_dt, interm_time in intermediate_dates:
+                        interm_df = interpolate(
+                            interm_time,
+                            existing_times,
+                            existing_dfs,
+                            self._interp_type.value
+                        )
+                        temp_times_list.append(interm_time)
+                        temp_dfs_list.append(float(interm_df))
+
+                    # Sort by time to maintain monotonicity
+                    sorted_indices = np.argsort(temp_times_list)
+                    temp_times_list = [temp_times_list[i] for i in sorted_indices]
+                    temp_dfs_list = [temp_dfs_list[i] for i in sorted_indices]
+
+                # Convert to numpy arrays
+                temp_times = np.array(temp_times_list)
+                temp_dfs = np.array(temp_dfs_list)
+
+                # Manually construct DiscountCurve to preserve exact times
+                temp_xccy_curve = DiscountCurve.__new__(DiscountCurve)
+                temp_xccy_curve._value_dt = self._value_dt
+                temp_xccy_curve._times = temp_times  # Keep as numpy array for interpolator
+                temp_xccy_curve._dfs = temp_dfs      # Keep as numpy array for interpolator
+                temp_xccy_curve._interp_type = self._interp_type
+                temp_xccy_curve._dc_type = DayCountTypes.ACT_365F
+
+                # Manually create and fit interpolator
+                temp_interpolator = Interpolator(self._interp_type)
+                temp_interpolator.fit(temp_times, temp_dfs)
+                temp_xccy_curve._interpolator = temp_interpolator
+
+                # Override df() method to always use ACT_365F (same as XccyCurve.df())
+                # This prevents day count mismatch when foreign leg queries with ACT_360
+                def temp_df_override(self, dt, day_count=None):
+                    from cavour.utils.helpers import times_from_dates
+                    times = times_from_dates(dt, self._value_dt, DayCountTypes.ACT_365F)
+                    dfs = self._df(times)
+                    if isinstance(dfs, float):
+                        return dfs
+                    else:
+                        return np.array(dfs)
+
+                # Bind the override method to the instance
+                import types
+                temp_xccy_curve.df = types.MethodType(temp_df_override, temp_xccy_curve)
 
             # For foreign leg, we need to split PV into known and unknown parts
             # The foreign leg is PAY type, so value() will negate the final PV
@@ -263,7 +365,7 @@ class XccyCurve(DiscountCurve):
 
             # Loop through the stored PV values
             for j, pmnt_dt in enumerate(foreign_leg._payment_dts):
-                if pmnt_dt >= self._value_dt:
+                if pmnt_dt > self._value_dt:  # Exclude payments AT value_dt (already have DF=1.0)
                     pmnt_amount = foreign_leg._payments[j]
 
                     if pmnt_dt == maturity_dt:
@@ -275,6 +377,9 @@ class XccyCurve(DiscountCurve):
                         # The _payment_pvs already have the cashflow sign (positive or negative)
                         # but NOT the final PAY/RECEIVE leg type sign flip
                         pv_foreign_known += foreign_leg._payment_pvs[j]
+                elif pmnt_dt == self._value_dt:
+                    # Initial notional exchange at value_dt - include in known PV with DF=1.0
+                    pv_foreign_known += foreign_leg._payments[j]
 
             # The PAY/RECEIVE sign flip is applied at the END by the leg.value() method
             # So we need to apply it here too
@@ -294,7 +399,27 @@ class XccyCurve(DiscountCurve):
 
             df_mat = -(pv_domestic + self._spot_fx * pv_foreign_known) / (self._spot_fx * cf_last_foreign)
 
-            # Store the new node
+            # Store intermediate nodes first (if any) to maintain chronological order
+            for interm_dt, interm_time in intermediate_dates:
+                # Extrapolate DF for intermediate node using existing nodes
+                from cavour.market.curves.interpolator import interpolate
+                interm_df = interpolate(
+                    interm_time,
+                    np.array([0.0] + xccy_nodes_times),
+                    np.array([1.0] + xccy_nodes_dfs),
+                    self._interp_type.value
+                )
+
+                # Store intermediate node
+                xccy_nodes_times.append(interm_time)
+                xccy_nodes_dfs.append(float(interm_df))
+
+                # Update curve arrays
+                self._times = jnp.append(self._times, interm_time)
+                self._dfs = jnp.append(self._dfs, float(interm_df))
+                self._repr_dfs = jnp.append(self._repr_dfs, float(interm_df))
+
+            # Now store the new pillar node using exact times
             xccy_nodes_times.append(t_mat)
             xccy_nodes_dfs.append(df_mat)
 
@@ -303,9 +428,42 @@ class XccyCurve(DiscountCurve):
             self._dfs = jnp.append(self._dfs, df_mat)
             self._repr_dfs = jnp.append(self._repr_dfs, df_mat)
 
+        # Initialize the interpolator with the final times and DFs
+        from cavour.market.curves.interpolator import Interpolator
+        self._interpolator = Interpolator(self._interp_type)
+        self._interpolator.fit(self._times, self._dfs)
+
         # Validate calibration if requested
         if self._check_refit:
             self._check_refits(SWAP_TOL)
+
+###############################################################################
+
+    def df(self, dt, day_count=None):
+        """
+        Override parent df() method to ensure consistent day count usage.
+
+        XccyCurve uses ACT/365F (gDaysInYear) for all time calculations,
+        so we must use the same when querying discount factors.
+
+        Args:
+            dt: Date or list of dates to get discount factors for
+            day_count: Day count convention (ignored - always uses ACT/365F)
+
+        Returns:
+            Discount factor(s) at the given date(s)
+        """
+        from cavour.utils.helpers import times_from_dates
+
+        # Always use ACT/365F to match how we calculate _times internally
+        # Ignore the day_count parameter to ensure consistency
+        times = times_from_dates(dt, self._value_dt, DayCountTypes.ACT_365F)
+        dfs = self._df(times)
+
+        if isinstance(dfs, float):
+            return dfs
+        else:
+            return np.array(dfs)
 
 ###############################################################################
 
