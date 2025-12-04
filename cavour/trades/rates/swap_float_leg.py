@@ -285,32 +285,53 @@ class SwapFloatLeg:
             # Notional exchange logic:
             # At effective date: always negative (outflow)
             # At maturity: always positive (inflow)
-            
+
             start_notional_pv = 0.0
             end_notional_pv = 0.0
-            
+
+            # Check if notional exchange has already been added to _payment_dts
+            # (to prevent adding it on every call to value())
+            # Note: _payment_dts persists across value() calls, unlike _payments which is reset
+            notional_exchange_already_added = (
+                len(self._payment_dts) > 0 and
+                self._payment_dts[0] == self._effective_dt
+            )
+
             # Start notional exchange (at effective date) - always negative
             if self._effective_dt >= value_dt:
                 df_start = discount_curve.df(self._effective_dt, self._dc_type) / df_value
                 start_notional_amount = float(-self._notional)  # Always negative at start
                 start_notional_pv = float(-self._notional * df_start)
-                
-                # Add payment date at beginning for effective date
-                # Need to insert into ALL arrays to maintain consistent lengths
-                self._payment_dts.insert(0, self._effective_dt)
-                self._payments.insert(0, start_notional_amount)
-                self._payment_pvs.insert(0, start_notional_pv)
-                self._payment_dfs.insert(0, df_start)
-                self._rates.insert(0, 0.0)
-                self._cumulative_pvs.insert(0, start_notional_pv)
-                self._start_accrued_dts.insert(0, self._effective_dt)
-                self._end_accrued_dts.insert(0, self._effective_dt)
-                self._year_fracs.insert(0, 0.0)
-                self._accrued_days.insert(0, 0)
-                
-                # Update cumulative PVs for all subsequent payments
-                for i in range(1, len(self._cumulative_pvs)):
-                    self._cumulative_pvs[i] += start_notional_pv
+
+                if not notional_exchange_already_added:
+                    # First time adding notional exchange: INSERT into all arrays
+                    self._payments.insert(0, start_notional_amount)
+                    self._payment_pvs.insert(0, start_notional_pv)
+                    self._payment_dfs.insert(0, df_start)
+                    self._rates.insert(0, 0.0)
+                    self._cumulative_pvs.insert(0, start_notional_pv)
+                    self._payment_dts.insert(0, self._effective_dt)
+                    self._start_accrued_dts.insert(0, self._effective_dt)
+                    self._end_accrued_dts.insert(0, self._effective_dt)
+                    self._year_fracs.insert(0, 0.0)
+                    self._accrued_days.insert(0, 0)
+                    self._notional_array.insert(0, self._notional)
+
+                    # Update cumulative PVs for all subsequent payments
+                    for i in range(1, len(self._cumulative_pvs)):
+                        self._cumulative_pvs[i] += start_notional_pv
+                else:
+                    # Notional exchange already in _payment_dts, UPDATE the reset arrays at index 0
+                    # The loop above already populated index 0 with 0.0, replace it
+                    self._payments[0] = start_notional_amount
+                    self._payment_pvs[0] = start_notional_pv
+                    self._payment_dfs[0] = df_start
+                    # Recalculate cumulative PVs from scratch
+                    running_pv = start_notional_pv
+                    self._cumulative_pvs[0] = running_pv
+                    for i in range(1, len(self._cumulative_pvs)):
+                        running_pv += self._payment_pvs[i]
+                        self._cumulative_pvs[i] = running_pv
             
             # End notional exchange (at maturity date) - always positive
             if self._maturity_dt >= value_dt and len(self._payments) > 0:
