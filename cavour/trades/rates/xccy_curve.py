@@ -228,7 +228,10 @@ class XccyCurve(DiscountCurve):
 
             # Before building temp curve, identify any intermediate payment dates
             # that fall between the last node and current maturity
+            # Store as (date, time) tuples - DFs will be computed with flat forward basis
             intermediate_dates = []
+            intermediate_dates_with_dfs = []  # Will store (date, time, df) after computation
+
             if i > 0:
                 last_node_time = xccy_nodes_times[-1]
                 for pmnt_dt in swap._foreign_leg._payment_dts:
@@ -237,11 +240,11 @@ class XccyCurve(DiscountCurve):
                         intermediate_dates.append((pmnt_dt, pmnt_time))
 
             # Build temporary XCCY curve from current nodes
-            # For ALL pillars (including first), create consistent temp curve
+            # Apply FLAT FORWARD BASIS ASSUMPTION for intermediate dates
+            basis_spread = self.basis_spreads[i]  # Current pillar's basis spread
+
             if i == 0:
                 # For first pillar, create a single-node curve at t=0, DF=1.0
-                # We'll use foreign_curve for all other discount queries, but this
-                # ensures consistent ACT_365F day count handling
                 temp_times = np.array([0.0])
                 temp_dfs = np.array([1.0])
 
@@ -258,50 +261,70 @@ class XccyCurve(DiscountCurve):
                 temp_interpolator.fit(temp_times, temp_dfs)
                 temp_xccy_curve._interpolator = temp_interpolator
 
-                # For first pillar, also add foreign curve's DFs to approximate
-                # We'll query foreign_curve and copy its structure with ACT_365F override
-                # Actually, for the first pillar we need to query foreign curve for DFs at payment dates
-                # Let's use a simpler approach: just use flat DF=1.0 since we're solving for the first DF anyway
-
-                # Override df() to query foreign_curve with dates (not times)
-                # This allows foreign_curve to use its own day count for time calculations
+                # FLAT FORWARD BASIS ASSUMPTION:
+                # Apply the current pillar's basis spread to all intermediate dates
+                # Formula: DF_xccy(t) = DF_ois(t) * exp(-basis * t)
+                # This assumes constant forward basis spread from 0 to maturity
                 def temp_df_override_first(self, dt, day_count=None):
-                    # Query foreign curve with dates, letting it use its own day count
-                    return xccy_curve_self._foreign_curve.df(dt, xccy_curve_self._foreign_curve._dc_type)
+                    from cavour.utils.helpers import times_from_dates
 
-                # Store reference to self for closure
+                    # Get time from value date using ACT_365F (consistent with curve)
+                    t = times_from_dates(dt, xccy_curve_self._value_dt, DayCountTypes.ACT_365F)
+
+                    # Get foreign OIS DF (uses its own day count internally)
+                    df_ois = xccy_curve_self._foreign_curve.df(dt, xccy_curve_self._foreign_curve._dc_type)
+
+                    # Apply flat forward basis adjustment
+                    # Scalar or array handling
+                    if isinstance(t, (list, np.ndarray)):
+                        t_arr = np.array(t)
+                        df_ois_arr = np.array(df_ois) if not isinstance(df_ois, np.ndarray) else df_ois
+                        df_xccy = df_ois_arr * np.exp(-basis_spread_closure * t_arr)
+                    else:
+                        df_xccy = df_ois * np.exp(-basis_spread_closure * float(t))
+
+                    return df_xccy
+
+                # Store references for closure
                 xccy_curve_self = self
+                basis_spread_closure = basis_spread
 
                 # Bind the override method to the instance
                 import types
                 temp_xccy_curve.df = types.MethodType(temp_df_override_first, temp_xccy_curve)
             else:
-                # For subsequent pillars, manually construct temp curve to avoid
-                # DiscountCurve round-trip conversion error (year_frac -> date -> year_frac)
-                # which corrupts the times and introduces accumulating errors
-
-                # Create times and DFs arrays, including intermediate nodes
+                # For subsequent pillars, apply flat forward basis for intermediate dates
+                # Create times and DFs arrays with existing nodes
                 temp_times_list = [0.0] + xccy_nodes_times.copy()
                 temp_dfs_list = [1.0] + xccy_nodes_dfs.copy()
 
-                # Add intermediate nodes using extrapolation if any exist
+                # FLAT FORWARD BASIS for intermediate nodes
+                # For dates between last pillar and current maturity:
+                # DF_xccy(t) = DF_xccy(t_prev) * [DF_ois(t) / DF_ois(t_prev)] * exp(-basis * (t - t_prev))
                 if intermediate_dates:
-                    # Use the interpolate function to extrapolate DFs
-                    from cavour.market.curves.interpolator import interpolate
+                    last_node_time = xccy_nodes_times[-1]
+                    last_node_df = xccy_nodes_dfs[-1]
 
-                    existing_times = np.array([0.0] + xccy_nodes_times)
-                    existing_dfs = np.array([1.0] + xccy_nodes_dfs)
+                    # Get the actual last pillar date from the previous swap's maturity
+                    last_pillar_dt = self._used_swaps[i-1]._maturity_dt
 
-                    # Extrapolate DFs for intermediate dates
+                    # Compute DF_ois at last pillar
+                    df_ois_prev = self._foreign_curve.df(last_pillar_dt, self._foreign_curve._dc_type)
+
                     for interm_dt, interm_time in intermediate_dates:
-                        interm_df = interpolate(
-                            interm_time,
-                            existing_times,
-                            existing_dfs,
-                            self._interp_type.value
-                        )
+                        # Get DF_ois at intermediate date
+                        df_ois_t = self._foreign_curve.df(interm_dt, self._foreign_curve._dc_type)
+
+                        # Apply flat forward basis formula
+                        # DF_xccy(t) = DF_xccy(t_prev) * [DF_ois(t) / DF_ois(t_prev)] * exp(-basis * (t - t_prev))
+                        dt_delta = interm_time - last_node_time
+                        interm_df = last_node_df * (df_ois_t / df_ois_prev) * np.exp(-basis_spread * dt_delta)
+
                         temp_times_list.append(interm_time)
                         temp_dfs_list.append(float(interm_df))
+
+                        # Store the DF for later (to be added as a node in the final curve)
+                        intermediate_dates_with_dfs.append((interm_dt, interm_time, float(interm_df)))
 
                     # Sort by time to maintain monotonicity
                     sorted_indices = np.argsort(temp_times_list)
@@ -400,24 +423,37 @@ class XccyCurve(DiscountCurve):
             df_mat = -(pv_domestic + self._spot_fx * pv_foreign_known) / (self._spot_fx * cf_last_foreign)
 
             # Store intermediate nodes first (if any) to maintain chronological order
-            for interm_dt, interm_time in intermediate_dates:
-                # Extrapolate DF for intermediate node using existing nodes
-                from cavour.market.curves.interpolator import interpolate
-                interm_df = interpolate(
-                    interm_time,
-                    np.array([0.0] + xccy_nodes_times),
-                    np.array([1.0] + xccy_nodes_dfs),
-                    self._interp_type.value
-                )
+            # For i=0, compute intermediate DFs using flat forward basis
+            # For i>0, use the DFs already computed and stored in intermediate_dfs_dict
+            if i == 0:
+                # For first pillar, identify and store DFs for all payment dates before maturity
+                for j, pmnt_dt in enumerate(foreign_leg._payment_dts):
+                    if self._value_dt < pmnt_dt < maturity_dt:
+                        # Compute DF using flat forward basis
+                        from cavour.utils.helpers import times_from_dates
+                        pmnt_time = float(times_from_dates(pmnt_dt, self._value_dt, DayCountTypes.ACT_365F))
+                        df_ois = self._foreign_curve.df(pmnt_dt, self._foreign_curve._dc_type)
+                        interm_df = df_ois * np.exp(-basis_spread * pmnt_time)
 
-                # Store intermediate node
-                xccy_nodes_times.append(interm_time)
-                xccy_nodes_dfs.append(float(interm_df))
+                        # Store intermediate node
+                        xccy_nodes_times.append(pmnt_time)
+                        xccy_nodes_dfs.append(float(interm_df))
 
-                # Update curve arrays
-                self._times = jnp.append(self._times, interm_time)
-                self._dfs = jnp.append(self._dfs, float(interm_df))
-                self._repr_dfs = jnp.append(self._repr_dfs, float(interm_df))
+                        # Update curve arrays
+                        self._times = jnp.append(self._times, pmnt_time)
+                        self._dfs = jnp.append(self._dfs, float(interm_df))
+                        self._repr_dfs = jnp.append(self._repr_dfs, float(interm_df))
+            else:
+                # For subsequent pillars, use the pre-computed DFs
+                for interm_dt, interm_time, interm_df in intermediate_dates_with_dfs:
+                    # Store intermediate node
+                    xccy_nodes_times.append(interm_time)
+                    xccy_nodes_dfs.append(float(interm_df))
+
+                    # Update curve arrays
+                    self._times = jnp.append(self._times, interm_time)
+                    self._dfs = jnp.append(self._dfs, float(interm_df))
+                    self._repr_dfs = jnp.append(self._repr_dfs, float(interm_df))
 
             # Now store the new pillar node using exact times
             xccy_nodes_times.append(t_mat)

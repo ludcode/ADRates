@@ -153,8 +153,6 @@ def test_xccy_curve_quarterly_frequency():
     print(f"\nAll swaps repriced successfully!")
     print(f"Maximum repricing error: {max_error:.2e}")
 
-    return xccy_curve
-
 
 def test_xccy_curve_mixed_frequency():
     """Test XCCY curve with mixed frequencies (domestic quarterly, foreign semi-annual)."""
@@ -249,8 +247,6 @@ def test_xccy_curve_mixed_frequency():
         assert abs(normalized_pv) < 1e-8
 
     print(f"\nMixed frequency test passed!")
-
-    return xccy_curve
 
 
 if __name__ == "__main__":
