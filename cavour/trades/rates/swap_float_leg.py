@@ -338,12 +338,12 @@ class SwapFloatLeg:
                 df_end = discount_curve.df(self._maturity_dt, self._dc_type) / df_value
                 end_notional_amount = float(self._notional)  # Always positive at end
                 end_notional_pv = float(self._notional * df_end)
-                
+
                 # Add to last payment
                 self._payments[-1] += end_notional_amount
                 self._payment_pvs[-1] += end_notional_pv
                 self._cumulative_pvs[-1] += end_notional_pv
-            
+
             leg_pv += start_notional_pv + end_notional_pv
 
         if self._leg_type == SwapTypes.PAY:

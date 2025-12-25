@@ -10,12 +10,14 @@ from cavour.market.curves.interpolator import *
 from cavour.utils.helpers import to_tenor, times_from_dates
 from cavour.utils.date import Date
 from cavour.market.curves.interpolator_ad import InterpolatorAd
-from cavour.requests.results import Valuation, Gamma, Delta, AnalyticsResult
-from cavour.utils.global_types import (SwapTypes, 
-                                   InstrumentTypes, 
+from cavour.requests.results import Valuation, Gamma, Delta, AnalyticsResult, Risk
+from cavour.utils.global_types import (SwapTypes,
+                                   InstrumentTypes,
                                    RequestTypes,
                                    CurveTypes)
 from cavour.utils.currency import CurrencyTypes
+from cavour.trades.rates.swap_fixed_leg import SwapFixedLeg
+from cavour.trades.rates.swap_float_leg import SwapFloatLeg
 
 
 
@@ -31,6 +33,11 @@ class Engine:
         """Return analytics for the given derivative and requested measures."""
         reqs = set(request_list)
 
+        # Route XCCY swaps to separate handler
+        if derivative.derivative_type == InstrumentTypes.XCCY_SWAP:
+            return self._compute_xccy(derivative, reqs)
+
+        # Route OIS swaps to existing logic
         if derivative.derivative_type != InstrumentTypes.OIS_SWAP:
             raise LibError(f"{derivative.derivative_type} not yet implemented")
 
@@ -71,6 +78,197 @@ class Engine:
             gamma = fixed.get("gamma") + floating.get("gamma")
 
         #risk = Risk([delta]) if delta is not None else None
+
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma)
+
+    def _compute_xccy(self, derivative, reqs):
+        """Compute analytics for cross-currency swaps (VALUE, DELTA, GAMMA).
+
+        Handles XccyFixFloat, XccyBasisSwap, and XccyFixFix swaps.
+        Currently supports VALUE only.
+
+        Args:
+            derivative: XCCY swap instance (XccyFixFloat, XccyBasisSwap, or XccyFixFix)
+            reqs: Set of RequestTypes (VALUE, DELTA, GAMMA)
+
+        Returns:
+            AnalyticsResult with value, risk (multi-curve Delta), and gamma
+        """
+        # Get spot FX rate from model
+        try:
+            foreign_code = derivative._foreign_currency.name
+            domestic_code = derivative._domestic_currency.name
+            fx_pair = f"{foreign_code}{domestic_code}"  # e.g., "USDGBP"
+
+            if fx_pair not in self.model._fx_params_dict:
+                raise LibError(f"FX rate {fx_pair} not found in model. Available: {list(self.model._fx_params_dict.keys())}")
+
+            spot_fx = self.model._fx_params_dict[fx_pair]["price"]
+        except LibError:
+            raise
+
+        # Get curves from model
+        domestic_model = getattr(self.model.curves, derivative._domestic_floating_index.name)
+        foreign_model = getattr(self.model.curves, derivative._foreign_floating_index.name)
+
+        # Detect leg types to route appropriately
+        is_domestic_fixed = isinstance(derivative._domestic_leg, SwapFixedLeg)
+        is_foreign_fixed = isinstance(derivative._foreign_leg, SwapFixedLeg)
+
+        # Compute domestic leg analytics
+        if is_domestic_fixed:
+            # For XCCY swaps, use direct leg valuation to match test behavior
+            domestic_leg_value = derivative._domestic_leg.value(
+                value_dt=domestic_model._value_dt,
+                discount_curve=domestic_model
+            )
+            domestic_analytics = {
+                "value": Valuation(amount=domestic_leg_value, currency=derivative._domestic_currency)
+            }
+        else:
+            # For XCCY floating legs with notional_exchange=True, use direct valuation
+            if derivative._domestic_leg._notional_exchange:
+                domestic_leg_value = derivative._domestic_leg.value(
+                    value_dt=domestic_model._value_dt,
+                    discount_curve=domestic_model,
+                    index_curve=domestic_model,
+                    first_fixing_rate=None
+                )
+                domestic_analytics = {
+                    "value": Valuation(amount=domestic_leg_value, currency=derivative._domestic_currency)
+                }
+            else:
+                domestic_analytics = self._float_leg_analytics(
+                    domestic_model.swap_rates,
+                    domestic_model.swap_times,
+                    domestic_model.year_fracs,
+                    derivative._domestic_leg,
+                    domestic_model._value_dt,
+                    domestic_model._interp_type,  # discount curve
+                    domestic_model._interp_type,  # index curve
+                    None,  # first_fixing_rate
+                    reqs,
+                )
+
+        # Compute foreign leg analytics
+        if is_foreign_fixed:
+            # For XCCY swaps, use direct leg valuation to match test behavior
+            foreign_leg_value = derivative._foreign_leg.value(
+                value_dt=foreign_model._value_dt,
+                discount_curve=foreign_model
+            )
+            foreign_analytics = {
+                "value": Valuation(amount=foreign_leg_value, currency=derivative._foreign_currency)
+            }
+        else:
+            # For XCCY floating legs with notional_exchange=True, use direct valuation
+            # because _float_leg_analytics doesn't handle notional exchanges correctly
+            # (end notional is added to _payments[-1], but _float_leg_jax recalculates from scratch)
+            if derivative._foreign_leg._notional_exchange:
+                # Call leg.value() directly
+                foreign_leg_value = derivative._foreign_leg.value(
+                    value_dt=foreign_model._value_dt,
+                    discount_curve=foreign_model,  # Use foreign curve for both discount and index
+                    index_curve=foreign_model,
+                    first_fixing_rate=None
+                )
+                foreign_analytics = {
+                    "value": Valuation(amount=foreign_leg_value, currency=derivative._foreign_currency)
+                }
+            else:
+                foreign_analytics = self._float_leg_analytics(
+                    foreign_model.swap_rates,
+                    foreign_model.swap_times,
+                    foreign_model.year_fracs,
+                    derivative._foreign_leg,
+                    foreign_model._value_dt,
+                    foreign_model._interp_type,  # discount curve
+                    foreign_model._interp_type,  # index curve
+                    None,  # first_fixing_rate
+                    reqs,
+                )
+
+        # Add notional exchanges for fixed legs (they don't include them by default)
+        if RequestTypes.VALUE in reqs:
+            # Domestic leg notional exchanges (if fixed)
+            if is_domestic_fixed:
+                domestic_value = domestic_analytics["value"].amount
+                effective_dt = derivative._effective_dt
+                maturity_dt = derivative._maturity_dt
+                domestic_leg_type = derivative._domestic_leg_type
+
+                # Start exchange: -notional at effective date (outflow)
+                if effective_dt >= domestic_model._value_dt:
+                    df_start = domestic_model.df(effective_dt)
+                    start_exchange_pv = -derivative._domestic_notional * df_start
+                    # Apply leg type sign
+                    if domestic_leg_type == SwapTypes.RECEIVE:
+                        domestic_value += start_exchange_pv
+                    else:
+                        domestic_value -= start_exchange_pv
+
+                # End exchange: +notional at maturity date (inflow)
+                if maturity_dt >= domestic_model._value_dt:
+                    df_end = domestic_model.df(maturity_dt)
+                    end_exchange_pv = derivative._domestic_notional * df_end
+                    # Apply leg type sign
+                    if domestic_leg_type == SwapTypes.RECEIVE:
+                        domestic_value += end_exchange_pv
+                    else:
+                        domestic_value -= end_exchange_pv
+
+                # Update domestic analytics with notional exchanges
+                domestic_analytics["value"] = Valuation(
+                    amount=domestic_value,
+                    currency=derivative._domestic_currency
+                )
+
+            # Foreign leg notional exchanges (if fixed)
+            # Note: Floating legs already include notional exchanges via notional_exchange=True
+            if is_foreign_fixed:
+                foreign_value = foreign_analytics["value"].amount
+                effective_dt = derivative._effective_dt
+                maturity_dt = derivative._maturity_dt
+                foreign_leg_type = derivative._foreign_leg._leg_type
+
+                # Start exchange: -notional at effective date (outflow)
+                if effective_dt >= foreign_model._value_dt:
+                    df_start = foreign_model.df(effective_dt)
+                    start_exchange_pv = -derivative._foreign_notional * df_start
+                    # Apply leg type sign
+                    if foreign_leg_type == SwapTypes.RECEIVE:
+                        foreign_value += start_exchange_pv
+                    else:
+                        foreign_value -= start_exchange_pv
+
+                # End exchange: +notional at maturity date (inflow)
+                if maturity_dt >= foreign_model._value_dt:
+                    df_end = foreign_model.df(maturity_dt)
+                    end_exchange_pv = derivative._foreign_notional * df_end
+                    # Apply leg type sign
+                    if foreign_leg_type == SwapTypes.RECEIVE:
+                        foreign_value += end_exchange_pv
+                    else:
+                        foreign_value -= end_exchange_pv
+
+                # Update foreign analytics with notional exchanges
+                foreign_analytics["value"] = Valuation(
+                    amount=foreign_value,
+                    currency=derivative._foreign_currency
+                )
+
+        # Combine results
+        value = None
+        if RequestTypes.VALUE in reqs:
+            domestic_value = domestic_analytics["value"].amount
+            foreign_value = foreign_analytics["value"].amount
+            # Total PV = domestic PV + spot_FX * foreign PV (converted to domestic currency)
+            total_value = domestic_value + spot_fx * foreign_value
+            value = Valuation(amount=total_value, currency=derivative._domestic_currency)
+
+        # DELTA and GAMMA not yet implemented for XCCY
+        delta = None
+        gamma = None
 
         return AnalyticsResult(value=value, risk=delta, gamma=gamma)
 
@@ -552,7 +750,8 @@ class Engine:
         df_end   = jnp.atleast_1d(idx_interp.simple_interpolate(end_times, times, dfs, idx_interp_type.value))
 
         # d) Vectorised forward rates
-        fwd = (df_start / df_end - 1.0) / pay_alphas                 # [..., M]
+        # Avoid 0/0 when pay_alphas is zero (notional exchanges with no accrual period)
+        fwd = jnp.where(pay_alphas > 0, (df_start / df_end - 1.0) / pay_alphas, 0.0)  # [..., M]
 
         # only override if the I actually passed a first_fixing_rate
         first_mask     = jnp.arange(fwd.shape[-1]) == 0             # [M]
