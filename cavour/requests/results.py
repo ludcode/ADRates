@@ -431,6 +431,174 @@ class Gamma:
     __radd__ = __add__
 
     
+@dataclass(frozen=True)
+class CrossGamma:
+    """
+    Cross-curve second-order sensitivity (cross-gamma).
+
+    Represents how delta to one curve changes when a DIFFERENT curve moves.
+    This captures second-order dependencies between curves (e.g., how XCCY 
+    basis delta changes when foreign OIS rates move).
+
+    Attributes:
+        risk_matrix (jnp.ndarray): Cross-gamma matrix (shape: [N1, N2])
+        tenors_curve1 (List[str]): Tenor labels for curve 1 (rows)
+        tenors_curve2 (List[str]): Tenor labels for curve 2 (columns)
+        curve_type_1 (CurveTypes): First curve identifier
+        curve_type_2 (CurveTypes): Second curve identifier
+        currency (CurrencyTypes): Currency of sensitivities
+
+    Properties:
+        value: Sum of cross-gamma matrix as Value object
+        matrix: Display cross-gamma as formatted table (prints to console)
+        to_dict: Export cross-gamma as nested dictionary
+
+    Methods:
+        plot(): Display interactive Plotly heatmap
+
+    Note:
+        Units are value per bp^2, typically scaled by 1e8.
+        Matrix element [i,j] represents: d²PV / d(curve1_rate_i) d(curve2_rate_j)
+
+    Example:
+        >>> cross_gamma = CrossGamma(
+        ...     risk_matrix=jnp.array([[0.5, 0.1], [0.1, 0.8]]),
+        ...     tenors_curve1=[1Y, 5Y],
+        ...     tenors_curve2=[1Y, 3Y],
+        ...     curve_type_1=CurveTypes.USD_OIS_SOFR,
+        ...     curve_type_2=CurveTypes.USD_GBP_BASIS,
+        ...     currency=CurrencyTypes.GBP
+        ... )
+        >>> cross_gamma.plot()  # Interactive heatmap
+    """
+    risk_matrix:     jnp.ndarray       # shape [N1, N2]
+    tenors_curve1:   List[str]         # length N1 (rows)
+    tenors_curve2:   List[str]         # length N2 (columns)
+    curve_type_1:    CurveTypes
+    curve_type_2:    CurveTypes
+    currency:        CurrencyTypes
+
+    def __post_init__(self):
+        arr = self.risk_matrix
+        if isinstance(arr, list):
+            arr = jnp.array(arr)
+            object.__setattr__(self, 'risk_matrix', arr)
+        
+        if arr.ndim != 2:
+            raise ValueError(f"CrossGamma risk_matrix must be 2D, got {arr.ndim}D")
+        
+        n1, n2 = arr.shape
+        if n1 != len(self.tenors_curve1):
+            raise ValueError(f"Expected {n1} tenors for curve 1, got {len(self.tenors_curve1)}")
+        if n2 != len(self.tenors_curve2):
+            raise ValueError(f"Expected {n2} tenors for curve 2, got {len(self.tenors_curve2)}")
+        
+        if not isinstance(self.currency, CurrencyTypes):
+            raise TypeError(f"currency must be CurrencyTypes, got {type(self.currency)}")
+        if not isinstance(self.curve_type_1, CurveTypes):
+            raise TypeError(f"curve_type_1 must be CurveTypes, got {type(self.curve_type_1)}")
+        if not isinstance(self.curve_type_2, CurveTypes):
+            raise TypeError(f"curve_type_2 must be CurveTypes, got {type(self.curve_type_2)}")
+
+    @property
+    def value(self) -> Value:
+        """Sum of the cross-gamma matrix as a Value object."""
+        total = float(jnp.sum(self.risk_matrix))
+        return Value(amount=total, currency=self.currency)
+
+    @property
+    def matrix(self) -> dict:
+        """
+        Return the cross-gamma matrix as a nested dict: {curve1_tenor: {curve2_tenor: value}}.
+        """
+        matrix_dict = self.to_dict
+
+        df = pd.DataFrame(matrix_dict)
+        # Don't drop zero rows/columns for cross-gamma (they may all be informative)
+
+        df.index.name = f"{self.curve_type_1.name} Tenors"
+        df.columns.name = f"{self.curve_type_2.name} Tenors"
+        
+        # Pretty print
+        print(tabulate(df, headers='keys', tablefmt='grid', floatfmt=".4f"))
+    
+    @property
+    def to_dict(self) -> dict:
+        """
+        Return the cross-gamma matrix as a nested dict: {curve1_tenor: {curve2_tenor: value}}.
+        """
+        gamma_np = np.array(self.risk_matrix)
+        
+        matrix = {
+            row_tenor: {
+                col_tenor: float(gamma_np[i, j])
+                for j, col_tenor in enumerate(self.tenors_curve2)
+            }
+            for i, row_tenor in enumerate(self.tenors_curve1)
+        }
+        return matrix
+
+    def plot(self):
+        """
+        Plot the cross-gamma heatmap using Plotly.
+        Shows curve1 tenors on Y-axis and curve2 tenors on X-axis.
+        """
+        gamma_np = np.array(self.risk_matrix, dtype=np.float64)
+
+        fig = go.Figure(data=go.Heatmap(
+            z=gamma_np,
+            x=self.tenors_curve2,
+            y=self.tenors_curve1,
+            colorscale="RdYlGn_r",
+            colorbar=dict(title="Cross-Gamma"),
+            zmin=np.min(gamma_np) if gamma_np.size > 0 else 0,
+            zmax=np.max(gamma_np) if gamma_np.size > 0 else 1,
+        ))
+
+        fig.update_layout(
+            title=f"Cross-Gamma: {self.curve_type_1.name} vs {self.curve_type_2.name}",
+            xaxis_title=f"{self.curve_type_2.name} Tenors",
+            yaxis_title=f"{self.curve_type_1.name} Tenors",
+            width=900,
+            height=700,
+        )
+
+        fig.show()
+
+    def __repr__(self):
+        total = self.value.amount
+        cur = self.currency.name
+        n1, n2 = len(self.tenors_curve1), len(self.tenors_curve2)
+        return (
+            f"{self.__class__.__name__}("
+            f"{self.curve_type_1.name} x {self.curve_type_2.name}: "
+            f"{total:.6g} {cur}, shape=[{n1}, {n2}])"
+        )
+
+    def __add__(self, other: Any) -> 'CrossGamma':
+        if not isinstance(other, CrossGamma):
+            return NotImplemented
+        if (self.curve_type_1 != other.curve_type_1 or
+            self.curve_type_2 != other.curve_type_2 or
+            self.currency != other.currency or
+            self.tenors_curve1 != other.tenors_curve1 or
+            self.tenors_curve2 != other.tenors_curve2):
+            raise ValueError(
+                "Cannot add CrossGamma with mismatched curves, currency, or tenors"
+            )
+        summed = self.risk_matrix + other.risk_matrix
+        return CrossGamma(
+            risk_matrix=summed,
+            tenors_curve1=self.tenors_curve1,
+            tenors_curve2=self.tenors_curve2,
+            curve_type_1=self.curve_type_1,
+            curve_type_2=self.curve_type_2,
+            currency=self.currency
+        )
+
+    __radd__ = __add__
+
+
 class Risk:
     """
     Container for multiple per-curve Delta and Gamma ladders.
@@ -440,12 +608,14 @@ class Risk:
 
     Args:
         ladders (Iterable[Union[Delta, Gamma]]): List of Delta or Gamma objects
+        cross_gammas (Optional[Iterable[CrossGamma]]): List of CrossGamma objects
 
     Access patterns:
         1. Attribute: risk.GBP_OIS_SONIA.value
         2. Attribute: risk.GBP_OIS_SONIA.ladder (for Delta)
         3. Attribute: risk.GBP_OIS_SONIA.matrix (for Gamma)
         4. Callable: risk(CurveTypes.GBP_OIS_SONIA)
+        5. Cross-gamma: risk.cross_gamma(CurveTypes.USD_OIS_SOFR, CurveTypes.USD_GBP_BASIS)
 
     Example:
         >>> delta1 = Delta([10, -5], ["1Y", "5Y"], CurrencyTypes.GBP, CurveTypes.GBP_OIS_SONIA)
@@ -457,8 +627,13 @@ class Risk:
     Raises:
         ValueError: If duplicate curve names provided
     """
-    def __init__(self, ladders: Iterable[Union[Delta, Gamma]]):
+    def __init__(
+        self,
+        ladders: Iterable[Union[Delta, Gamma]],
+        cross_gammas: Optional[Iterable[CrossGamma]] = None
+    ):
         self._by_curve = {}  # type: Dict[str, Union[Delta, Gamma]]
+        self._cross_gammas = {}  # type: Dict[Tuple[str, str], CrossGamma]
 
         for ladder in ladders:
             name = ladder.curve_type.name
@@ -466,6 +641,14 @@ class Risk:
                 raise ValueError(f"Duplicate curve {name}")
             self._by_curve[name] = ladder
             setattr(self, name, ladder)
+
+        # Store cross-gammas keyed by (curve1_name, curve2_name)
+        if cross_gammas is not None:
+            for cg in cross_gammas:
+                key = (cg.curve_type_1.name, cg.curve_type_2.name)
+                if key in self._cross_gammas:
+                    raise ValueError(f"Duplicate cross-gamma for {key}")
+                self._cross_gammas[key] = cg
 
     def __call__(self, curve_type: CurveTypes) -> Union[Delta, Gamma]:
         """
@@ -475,6 +658,44 @@ class Risk:
             return self._by_curve[curve_type.name]
         except KeyError:
             raise ValueError(f"No risk data for curve: {curve_type.name}")
+
+    def cross_gamma(
+        self,
+        curve_type_1: CurveTypes,
+        curve_type_2: CurveTypes
+    ) -> Optional[CrossGamma]:
+        """
+        Access cross-gamma between two curves.
+
+        Args:
+            curve_type_1: First curve (e.g., USD_OIS_SOFR)
+            curve_type_2: Second curve (e.g., USD_GBP_BASIS)
+
+        Returns:
+            CrossGamma object if exists, None otherwise
+
+        Example:
+            >>> cg = risk.cross_gamma(CurveTypes.USD_OIS_SOFR, CurveTypes.USD_GBP_BASIS)
+            >>> if cg:
+            >>>     print(cg.value)  # Total cross-gamma
+            >>>     cg.plot()  # Heatmap
+        """
+        key = (curve_type_1.name, curve_type_2.name)
+        return self._cross_gammas.get(key, None)
+
+    def has_cross_gamma(
+        self,
+        curve_type_1: CurveTypes,
+        curve_type_2: CurveTypes
+    ) -> bool:
+        """Check if cross-gamma exists for the given curve pair."""
+        key = (curve_type_1.name, curve_type_2.name)
+        return key in self._cross_gammas
+
+    @property
+    def all_cross_gammas(self) -> Dict[Tuple[str, str], CrossGamma]:
+        """Return all cross-gammas as a dictionary."""
+        return self._cross_gammas.copy()
 
     def __repr__(self):
         parts = []

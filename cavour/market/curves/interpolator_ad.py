@@ -210,14 +210,20 @@ class InterpolatorAd:
         def _eval_scalar(tt):
             # if tt < 0:
             #     raise LibError("Interpolate times must all be >= 0")
+
+            # Add small epsilon to avoid interpolating at exact grid points
+            # This prevents numerical issues with jnp.interp gradients
+            eps = 1e-12
+            tt_adjusted = tt + eps
+
             if method == InterpTypes.LINEAR_ZERO_RATES.value:
                 r = -jnp.log(d) / x
-                return jnp.exp(-jnp.interp(tt, x, r) * tt)
+                return jnp.exp(-jnp.interp(tt_adjusted, x, r) * tt)
             if method == InterpTypes.FLAT_FWD_RATES.value:
                 rt = -jnp.log(d)
-                return jnp.exp(-jnp.interp(tt, x, rt))
+                return jnp.exp(-jnp.interp(tt_adjusted, x, rt))
             if method == InterpTypes.LINEAR_FWD_RATES.value:
-                return jnp.interp(tt, x, d)
+                return jnp.interp(tt_adjusted, x, d)
             else:
                 raise LibError("Invalid interpolation scheme.")
         #return jnp.where(isinstance(t, jnp.ndarray), jax.vmap(_eval_scalar)(t) , _eval_scalar(t))

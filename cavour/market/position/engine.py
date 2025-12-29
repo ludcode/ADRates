@@ -9,8 +9,9 @@ from typing import Sequence, Any, Dict
 from cavour.market.curves.interpolator import *
 from cavour.utils.helpers import to_tenor, times_from_dates
 from cavour.utils.date import Date
+from cavour.utils.day_count import DayCountTypes
 from cavour.market.curves.interpolator_ad import InterpolatorAd
-from cavour.requests.results import Valuation, Gamma, Delta, AnalyticsResult, Risk
+from cavour.requests.results import Valuation, Gamma, Delta, AnalyticsResult, Risk, CrossGamma
 from cavour.utils.global_types import (SwapTypes,
                                    InstrumentTypes,
                                    RequestTypes,
@@ -85,7 +86,7 @@ class Engine:
         """Compute analytics for cross-currency swaps (VALUE, DELTA, GAMMA).
 
         Handles XccyFixFloat, XccyBasisSwap, and XccyFixFix swaps.
-        Currently supports VALUE only.
+        Uses JAX automatic differentiation for multi-curve sensitivities.
 
         Args:
             derivative: XCCY swap instance (XccyFixFloat, XccyBasisSwap, or XccyFixFix)
@@ -94,22 +95,528 @@ class Engine:
         Returns:
             AnalyticsResult with value, risk (multi-curve Delta), and gamma
         """
-        # Get spot FX rate from model
-        try:
-            foreign_code = derivative._foreign_currency.name
-            domestic_code = derivative._domestic_currency.name
-            fx_pair = f"{foreign_code}{domestic_code}"  # e.g., "USDGBP"
-
-            if fx_pair not in self.model._fx_params_dict:
-                raise LibError(f"FX rate {fx_pair} not found in model. Available: {list(self.model._fx_params_dict.keys())}")
-
-            spot_fx = self.model._fx_params_dict[fx_pair]["price"]
-        except LibError:
-            raise
+        from jax import grad
+        import jax.numpy as jnp
+        from cavour.utils.helpers import times_from_dates
 
         # Get curves from model
         domestic_model = getattr(self.model.curves, derivative._domestic_floating_index.name)
         foreign_model = getattr(self.model.curves, derivative._foreign_floating_index.name)
+
+        # Get XCCY curve and spot FX
+        foreign_code = derivative._foreign_currency.name
+        domestic_code = derivative._domestic_currency.name
+        xccy_curve_name = f"{foreign_code}_{domestic_code}_BASIS"
+
+        try:
+            xccy_curve = getattr(self.model.curves, xccy_curve_name)
+            spot_fx = xccy_curve._spot_fx
+        except AttributeError:
+            raise LibError(f"XCCY curve {xccy_curve_name} not found in model. "
+                         f"Available curves: {[attr for attr in dir(self.model.curves) if not attr.startswith('_')]}")
+
+        # Build domestic OIS curve arrays
+        dom_curve_key = tuple(domestic_model.swap_times)
+        dom_cache = self._cached_curve(
+            dom_curve_key,
+            domestic_model.swap_rates,
+            domestic_model.swap_times,
+            domestic_model.year_fracs,
+            domestic_model._interp_type
+        )
+        dom_times = dom_cache["times"]
+        dom_dfs = dom_cache["dfs"]
+
+        # Build foreign OIS curve arrays
+        for_curve_key = tuple(foreign_model.swap_times)
+        for_cache = self._cached_curve(
+            for_curve_key,
+            foreign_model.swap_rates,
+            foreign_model.swap_times,
+            foreign_model.year_fracs,
+            foreign_model._interp_type
+        )
+        for_times = for_cache["times"]
+        for_dfs = for_cache["dfs"]
+
+        # Get XCCY curve arrays
+        # Note: XCCY curve times are in ACT_365F, but we'll use them to interpolate
+        # foreign leg payment times in ACT_360. This creates a small time mismatch
+        # (similar to how .value() method handles it)
+        xccy_times = jnp.array(xccy_curve._times)
+        xccy_dfs = jnp.array(xccy_curve._dfs)
+
+        # Prepare leg parameters for JAX computation
+        dc_type = derivative._domestic_leg._dc_type
+        value_time = times_from_dates(self.model.value_dt, self.model.value_dt, dc_type)
+
+        # Domestic leg parameters
+        dom_payment_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                       for dt in derivative._domestic_leg._payment_dts])
+        dom_start_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                     for dt in derivative._domestic_leg._start_accrued_dts])
+        dom_end_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                   for dt in derivative._domestic_leg._end_accrued_dts])
+        dom_alphas = jnp.array(derivative._domestic_leg._year_fracs)
+        dom_spreads = jnp.full_like(dom_alphas, derivative._domestic_leg._spread)
+        dom_notionals = jnp.array(derivative._domestic_leg._notional_array or
+                                  [derivative._domestic_leg._notional] * len(dom_alphas))
+        dom_principal = derivative._domestic_leg._principal
+        dom_leg_sign = +1.0 if derivative._domestic_leg._leg_type == SwapTypes.RECEIVE else -1.0
+
+        # Foreign leg parameters
+        # For forward rates: use foreign leg's day count (ACT_360) to match foreign OIS curve
+        # For discounting: use XCCY curve's day count (ACT_365F) for proper interpolation
+        for_dc_type = derivative._foreign_leg._dc_type  # ACT_360 for forward rates
+        xccy_dc_type = xccy_curve._dc_type  # ACT_365F for discounting
+
+        # Payment times for discounting (must match XCCY curve times)
+        for_payment_times = jnp.array([times_from_dates(dt, self.model.value_dt, xccy_dc_type)
+                                       for dt in derivative._foreign_leg._payment_dts])
+        # Start/end times for forward rates (must match foreign OIS curve times)
+        for_start_times = jnp.array([times_from_dates(dt, self.model.value_dt, for_dc_type)
+                                     for dt in derivative._foreign_leg._start_accrued_dts])
+        for_end_times = jnp.array([times_from_dates(dt, self.model.value_dt, for_dc_type)
+                                   for dt in derivative._foreign_leg._end_accrued_dts])
+        for_alphas = jnp.array(derivative._foreign_leg._year_fracs)
+        for_spreads = jnp.full_like(for_alphas, derivative._foreign_leg._spread)
+        for_notionals = jnp.array(derivative._foreign_leg._notional_array or
+                                  [derivative._foreign_leg._notional] * len(for_alphas))
+        for_principal = derivative._foreign_leg._principal
+        for_leg_sign = +1.0 if derivative._foreign_leg._leg_type == SwapTypes.RECEIVE else -1.0
+
+        # Compute effective and maturity times for notional exchanges
+        # Use discount curve's day count for discounting times
+        dom_effective_time = times_from_dates(derivative._effective_dt, self.model.value_dt, dc_type)
+        dom_maturity_time = times_from_dates(derivative._maturity_dt, self.model.value_dt, dc_type)
+        # Foreign leg: use XCCY curve's day count (ACT_365F) for discounting
+        for_effective_time = times_from_dates(derivative._effective_dt, self.model.value_dt, xccy_dc_type)
+        for_maturity_time = times_from_dates(derivative._maturity_dt, self.model.value_dt, xccy_dc_type)
+
+        # Compute VALUE using JAX
+        value = None
+        if RequestTypes.VALUE in reqs:
+            # Domestic leg PV (single curve)
+            dom_pv = self._float_leg_jax(
+                dfs=dom_dfs,
+                times=dom_times,
+                disc_interp_type=domestic_model._interp_type,
+                idx_interp_type=domestic_model._interp_type,
+                payment_times=dom_payment_times,
+                start_times=dom_start_times,
+                end_times=dom_end_times,
+                pay_alphas=dom_alphas,
+                spreads=dom_spreads,
+                notionals=dom_notionals,
+                principal=dom_principal,
+                leg_sign=dom_leg_sign,
+                value_time=value_time,
+                first_fixing_rate=0.0,
+                override_first=False,
+                idx_times=None,
+                idx_dfs=None,
+                notional_exchange=derivative._domestic_leg._notional_exchange,
+                notional_exchange_amount=derivative._domestic_leg._notional,
+                effective_time=dom_effective_time,
+                maturity_time=dom_maturity_time
+            )
+
+            # Foreign leg PV (dual curve: XCCY for discount, foreign OIS for index)
+            for_pv = self._float_leg_jax(
+                dfs=xccy_dfs,  # XCCY curve for discounting
+                times=xccy_times,
+                disc_interp_type=xccy_curve._interp_type,
+                idx_interp_type=foreign_model._interp_type,
+                payment_times=for_payment_times,
+                start_times=for_start_times,
+                end_times=for_end_times,
+                pay_alphas=for_alphas,
+                spreads=for_spreads,
+                notionals=for_notionals,
+                principal=for_principal,
+                leg_sign=for_leg_sign,
+                value_time=value_time,
+                first_fixing_rate=0.0,
+                override_first=False,
+                idx_times=for_times,  # Foreign OIS for forward rates
+                idx_dfs=for_dfs,
+                notional_exchange=derivative._foreign_leg._notional_exchange,
+                notional_exchange_amount=derivative._foreign_leg._notional,
+                effective_time=for_effective_time,
+                maturity_time=for_maturity_time
+            )
+
+            # Convert to scalars and compute total PV
+            dom_pv_scalar = float(jnp.squeeze(dom_pv))
+            for_pv_scalar = float(jnp.squeeze(for_pv))
+            total_pv = dom_pv_scalar + spot_fx * for_pv_scalar
+            value = Valuation(amount=total_pv, currency=derivative._domestic_currency)
+
+        # Compute DELTA using automatic differentiation
+        delta = None
+        if RequestTypes.DELTA in reqs:
+            from cavour.utils.helpers import to_tenor
+
+            # Define PV functions for each curve's DFs
+            # Domestic leg PV as function of domestic DFs
+            def pv_dom_fn(dom_dfs_var):
+                return self._float_leg_jax(
+                    dfs=dom_dfs_var, times=dom_times,
+                    disc_interp_type=domestic_model._interp_type,
+                    idx_interp_type=domestic_model._interp_type,
+                    payment_times=dom_payment_times,
+                    start_times=dom_start_times, end_times=dom_end_times,
+                    pay_alphas=dom_alphas, spreads=dom_spreads,
+                    notionals=dom_notionals, principal=dom_principal,
+                    leg_sign=dom_leg_sign, value_time=value_time,
+                    first_fixing_rate=0.0, override_first=False,
+                    notional_exchange=derivative._domestic_leg._notional_exchange,
+                    notional_exchange_amount=derivative._domestic_leg._notional,
+                    effective_time=dom_effective_time,
+                    maturity_time=dom_maturity_time
+                )
+
+            # IMPORTANT: DF(t≈0) = 1.0 is a boundary condition, NOT a curve parameter.
+            # We prepended it to the curve grid for interpolation purposes, but we should
+            # NOT compute gradients w.r.t. it. Only the original DFs are parameters.
+
+            # Define PV function that takes ONLY the original DFs (excluding prepended t≈0)
+            def pv_dom_original_dfs(original_dfs):
+                # Prepend DF(0)=1.0 as a constant
+                full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs])
+                return pv_dom_fn(full_dfs)
+
+            # Extract original DFs (excluding prepended point)
+            dom_dfs_original = dom_dfs[1:] if dom_times[0] < 1e-6 else dom_dfs
+
+            # Compute gradients w.r.t. ORIGINAL DFs only (excluding DF(0)=1.0)
+            grad_dom_dfs_original = grad(lambda d: jnp.squeeze(pv_dom_original_dfs(d)))(dom_dfs_original)
+
+            # Chain rule: sensitivities to rates
+            # Domestic OIS: simple chain rule
+            dom_cache = self._cached_curve(
+                tuple(domestic_model.swap_times),
+                domestic_model.swap_rates,
+                domestic_model.swap_times,
+                domestic_model.year_fracs,
+                domestic_model._interp_type
+            )
+
+            # The Jacobian has shape (n_dfs, n_rates) where n_dfs includes prepended point
+            # Skip the first row (which is zeros for the prepended DF(0)=1.0)
+            jac_dom_original = dom_cache["jac"][1:, :] if dom_times[0] < 1e-6 else dom_cache["jac"]
+            delta_dom_rates = jnp.dot(grad_dom_dfs_original, jac_dom_original)
+            delta_dom_rates = [float(x) * 1e-4 for x in delta_dom_rates]
+
+            # Foreign OIS: DELTA computation for XCCY swaps
+            # Use two-step gradient approach (same as domestic):
+            # 1. Compute grad(PV, foreign_OIS_DFs) using JAX
+            # 2. Apply chain rule with Jacobian jac(DFs, rates) from cached curve
+            #
+            # IMPORTANT: Keep XCCY curve FIXED when computing foreign OIS delta.
+            # The XCCY curve represents basis spreads which are independent market data.
+            # Only the foreign OIS curve (used for forward rates) varies.
+
+            # Define PV function that takes foreign OIS DFs as variable
+            def pv_for_fn(for_ois_dfs_var):
+                """Foreign leg PV as function of foreign OIS DFs (XCCY curve fixed)."""
+                return self._float_leg_jax(
+                    dfs=xccy_dfs, times=xccy_times,  # XCCY curve for discounting (FIXED)
+                    disc_interp_type=xccy_curve._interp_type,
+                    idx_interp_type=foreign_model._interp_type,
+                    payment_times=for_payment_times,
+                    start_times=for_start_times, end_times=for_end_times,
+                    pay_alphas=for_alphas, spreads=for_spreads,
+                    notionals=for_notionals, principal=for_principal,
+                    leg_sign=for_leg_sign, value_time=value_time,
+                    first_fixing_rate=0.0, override_first=False,
+                    idx_times=for_times, idx_dfs=for_ois_dfs_var,  # Foreign OIS DFs (VARIABLE)
+                    notional_exchange=derivative._foreign_leg._notional_exchange,
+                    notional_exchange_amount=derivative._foreign_leg._notional,
+                    effective_time=for_effective_time,
+                    maturity_time=for_maturity_time
+                )
+
+            # Extract original foreign OIS DFs (excluding prepended t≈0 if present)
+            for_ois_dfs_original = for_dfs[1:] if for_times[0] < 1e-6 else for_dfs
+
+            # Define PV function that takes ONLY the original DFs (excluding prepended t≈0)
+            def pv_for_original_dfs(original_dfs):
+                # Prepend DF(0)=1.0 as a constant
+                full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs])
+                return pv_for_fn(full_dfs)
+
+            # Compute gradients w.r.t. foreign OIS DFs
+            grad_for_dfs_original = grad(lambda d: jnp.squeeze(pv_for_original_dfs(d)))(for_ois_dfs_original)
+
+            # Chain rule: sensitivities to foreign OIS rates
+            # The Jacobian has shape (n_dfs, n_rates)
+            # Skip the first row if it corresponds to prepended DF(0)=1.0
+            jac_for_original = for_cache["jac"][1:, :] if for_times[0] < 1e-6 else for_cache["jac"]
+            delta_for_rates_raw = jnp.dot(grad_for_dfs_original, jac_for_original)
+
+            # Convert to GBP per bp
+            # Foreign leg PV is in USD, multiply by spot_fx to convert to GBP
+            # Rates are stored in DECIMAL (0.052 for 5.2%), Jacobian is d(DFs)/d(rate_decimal)
+            # 1bp = 0.0001 in decimal units → multiply by 1e-4
+            delta_for_rates = [float(x) * 1e-4 * spot_fx for x in delta_for_rates_raw]
+
+            # XCCY Basis: DELTA computation for basis spread curve
+            # Compute sensitivity to basis spread changes (keeping both OIS curves fixed)
+            # Only the foreign leg has sensitivity to XCCY curve (used for discounting)
+
+            # Define PV function that takes XCCY DFs as variable (both OIS curves FIXED)
+            def pv_xccy_fn(xccy_dfs_var):
+                """Foreign leg PV as function of XCCY DFs (both OIS curves fixed)."""
+                return self._float_leg_jax(
+                    dfs=xccy_dfs_var, times=xccy_times,  # XCCY curve for discounting (VARIABLE)
+                    disc_interp_type=xccy_curve._interp_type,
+                    idx_interp_type=foreign_model._interp_type,
+                    payment_times=for_payment_times,
+                    start_times=for_start_times, end_times=for_end_times,
+                    pay_alphas=for_alphas, spreads=for_spreads,
+                    notionals=for_notionals, principal=for_principal,
+                    leg_sign=for_leg_sign, value_time=value_time,
+                    first_fixing_rate=0.0, override_first=False,
+                    idx_times=for_times, idx_dfs=for_dfs,  # Foreign OIS DFs (FIXED)
+                    notional_exchange=derivative._foreign_leg._notional_exchange,
+                    notional_exchange_amount=derivative._foreign_leg._notional,
+                    effective_time=for_effective_time,
+                    maturity_time=for_maturity_time
+                )
+
+            # Extract original XCCY DFs (excluding prepended t≈0 if present)
+            xccy_dfs_original = xccy_dfs[1:] if xccy_times[0] < 1e-6 else xccy_dfs
+
+            # Define PV function that takes ONLY the original DFs (excluding prepended t≈0)
+            def pv_xccy_original_dfs(original_dfs):
+                # Prepend DF(0)=1.0 as a constant
+                full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs])
+                return pv_xccy_fn(full_dfs)
+
+            # Compute gradients w.r.t. XCCY DFs
+            grad_xccy_dfs_original = grad(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
+
+            # Chain rule: sensitivities to basis spreads
+            # The XCCY curve has a Jacobian d(DFs)/d(basis_spreads) stored as _jac_basis
+            # Check if JAX-based bootstrap was used (has _jac_basis attribute)
+            if hasattr(xccy_curve, '_jac_basis') and xccy_curve._jac_basis is not None:
+                # Get basis spread tenors from XCCY curve (needed for both DELTA and GAMMA)
+                # Convert swap times to tenor strings
+                basis_swap_tenors = to_tenor(xccy_curve.swap_times)
+
+                # The Jacobian is already at pillar-level (one column per swap/pillar)
+                jac_xccy_pillar = xccy_curve._jac_basis[1:, :] if xccy_times[0] < 1e-6 else xccy_curve._jac_basis
+
+                # Compute delta: grad(PV, DFs) · Jacobian(DFs, pillar_spreads)
+                delta_basis_rates_raw = jnp.dot(grad_xccy_dfs_original, jac_xccy_pillar)
+
+                # Convert to GBP per bp
+                # Foreign leg PV is in USD, multiply by spot_fx to convert to GBP
+                # Basis spreads are stored in DECIMAL (0.0030 for 30bp), Jacobian is d(DFs)/d(spread_decimal)
+                # 1bp = 0.0001 in decimal units → multiply by 1e-4
+                delta_basis_rates = [float(x) * 1e-4 * spot_fx for x in delta_basis_rates_raw]
+
+                delta_basis = Delta(
+                    risk_ladder=delta_basis_rates,
+                    tenors=basis_swap_tenors,
+                    currency=derivative._domestic_currency,
+                    curve_type=CurveTypes.USD_GBP_BASIS,
+                )
+            else:
+                # Fallback: no XCCY basis delta if Jacobian not available
+                delta_basis = None
+
+            # Create Delta objects for each curve
+            delta_domestic = Delta(
+                risk_ladder=delta_dom_rates,
+                tenors=to_tenor(domestic_model.swap_times),
+                currency=derivative._domestic_currency,
+                curve_type=derivative._domestic_floating_index,
+            )
+
+            delta_foreign = Delta(
+                risk_ladder=delta_for_rates,
+                tenors=to_tenor(foreign_model.swap_times),
+                currency=derivative._domestic_currency,
+                curve_type=derivative._foreign_floating_index,
+            )
+
+            # Package deltas into Risk object
+            # Include XCCY basis delta if available
+            if delta_basis is not None:
+                delta = Risk([delta_domestic, delta_foreign, delta_basis])
+            else:
+                delta = Risk([delta_domestic, delta_foreign])
+
+        # Compute GAMMA using automatic differentiation
+        gamma = None
+        if RequestTypes.GAMMA in reqs:
+            from cavour.utils.helpers import to_tenor
+
+            # Domestic OIS GAMMA
+            # Compute Hessian w.r.t. domestic DFs
+            hess_dom_dfs_original = hessian(lambda d: jnp.squeeze(pv_dom_original_dfs(d)))(dom_dfs_original)
+
+            # Retrieve Hessian of curve bootstrapping (d²DFs/d(rates)²)
+            hess_dom_curve = dom_cache["hess"][1:, :, :] if dom_times[0] < 1e-6 else dom_cache["hess"]
+
+            # Chain rule for gamma: d²PV/d(rates)² = jac^T @ hess_dfs @ jac + sum(grad_dfs * hess_curve)
+            # term1: main chain rule (treating curve as fixed mapping)
+            # term2: correction for curve Hessian (derivative of Jacobian itself)
+            term1_dom = jac_dom_original.T @ hess_dom_dfs_original @ jac_dom_original
+            term2_dom = jnp.sum(grad_dom_dfs_original[:, None, None] * hess_dom_curve, axis=0)
+            gammas_dom_matrix = term1_dom + term2_dom
+
+            # Extract diagonal elements (d²PV/dr_i²) for each tenor
+            # The diagonal represents sensitivity of each rate to itself
+            gammas_dom = jnp.diag(gammas_dom_matrix)
+
+            # Convert to GBP per bp²
+            # 1bp = 0.0001 in decimal → (1bp)² = 1e-8
+            gammas_dom = np.array(gammas_dom, dtype=np.float64) * 1e-8
+
+            # Foreign OIS GAMMA
+            # Compute Hessian w.r.t. foreign DFs
+            hess_for_dfs_original = hessian(lambda d: jnp.squeeze(pv_for_original_dfs(d)))(for_ois_dfs_original)
+
+            # Retrieve Hessian of curve bootstrapping
+            hess_for_curve = for_cache["hess"][1:, :, :] if for_times[0] < 1e-6 else for_cache["hess"]
+
+            # Chain rule for gamma
+            term1_for = jac_for_original.T @ hess_for_dfs_original @ jac_for_original
+            term2_for = jnp.sum(grad_for_dfs_original[:, None, None] * hess_for_curve, axis=0)
+            gammas_for_matrix = term1_for + term2_for
+
+            # Extract diagonal elements (d²PV/dr_i²) for each tenor
+            gammas_for = jnp.diag(gammas_for_matrix)
+
+            # Convert to GBP per bp²
+            # Foreign leg PV is in USD, multiply by spot_fx to convert to GBP
+            gammas_for = np.array(gammas_for, dtype=np.float64) * 1e-8 * spot_fx
+
+            # Create Gamma objects for each curve
+            gamma_domestic = Gamma(
+                risk_ladder=gammas_dom,
+                tenors=to_tenor(domestic_model.swap_times),
+                currency=derivative._domestic_currency,
+                curve_type=derivative._domestic_floating_index,
+            )
+
+            gamma_foreign = Gamma(
+                risk_ladder=gammas_for,
+                tenors=to_tenor(foreign_model.swap_times),
+                currency=derivative._domestic_currency,
+                curve_type=derivative._foreign_floating_index,
+            )
+
+            # XCCY Basis GAMMA
+            # Compute Hessian w.r.t. XCCY DFs (if Jacobian available)
+            if hasattr(xccy_curve, '_jac_basis') and xccy_curve._jac_basis is not None:
+                # Compute Hessian w.r.t. XCCY DFs
+                hess_xccy_dfs_original = hessian(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
+
+                # The Jacobian is already at pillar-level (one column per swap/pillar)
+                jac_xccy_pillar = xccy_curve._jac_basis[1:, :] if xccy_times[0] < 1e-6 else xccy_curve._jac_basis
+
+                # Chain rule for gamma (COMPLETE version with both terms)
+                # term1: main chain rule (treating curve as fixed mapping)
+                # term2: correction for curve Hessian (derivative of Jacobian itself)
+                term1_xccy = jac_xccy_pillar.T @ hess_xccy_dfs_original @ jac_xccy_pillar
+
+                # Check if curve Hessian is available (added in xccy_curve.py)
+                if hasattr(xccy_curve, "_hess_basis") and xccy_curve._hess_basis is not None:
+                    hess_xccy_curve = xccy_curve._hess_basis[1:, :, :] if xccy_times[0] < 1e-6 else xccy_curve._hess_basis
+                    term2_xccy = jnp.sum(grad_xccy_dfs_original[:, None, None] * hess_xccy_curve, axis=0)
+                    gammas_xccy_matrix = term1_xccy + term2_xccy
+                else:
+                    # Fallback to term1 only (will likely give zero or near-zero)
+                    gammas_xccy_matrix = term1_xccy
+
+                # Extract diagonal elements (d²PV/d(spread_i)²) for each pillar
+                gammas_xccy = jnp.diag(gammas_xccy_matrix)
+
+                # Convert to GBP per bp²
+                # Foreign leg PV is in USD, multiply by spot_fx to convert to GBP
+                gammas_xccy = np.array(gammas_xccy, dtype=np.float64) * 1e-8 * spot_fx
+
+                gamma_basis = Gamma(
+                    risk_ladder=gammas_xccy,
+                    tenors=basis_swap_tenors,
+                    currency=derivative._domestic_currency,
+                    curve_type=CurveTypes.USD_GBP_BASIS,
+                )
+            else:
+                gamma_basis = None
+
+            # Cross-Gamma: Foreign OIS <-> XCCY Basis
+            # This captures how XCCY basis delta changes when foreign OIS rates move
+            cross_gamma_for_basis = None
+            if hasattr(xccy_curve, '_mixed_hess_foreign_basis') and xccy_curve._mixed_hess_foreign_basis is not None:
+                # Get required Jacobians
+                jac_xccy_for_ois = xccy_curve._jac_foreign_ois[1:, :] if xccy_times[0] < 1e-6 else xccy_curve._jac_foreign_ois
+                mixed_hess_xccy = xccy_curve._mixed_hess_foreign_basis[1:, :, :] if xccy_times[0] < 1e-6 else xccy_curve._mixed_hess_foreign_basis
+
+                # Compute Hessian of PV w.r.t. XCCY DFs
+                # This is analogous to hess_dom_dfs_original and hess_for_dfs_original
+                hess_pv_xccy_dfs = hessian(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
+
+                # Chain rule for cross-gamma: d2PV / d(for_rates) d(basis)
+                # term1: Propagate mixed Hessian of XCCY curve through PV gradient
+                # Use einsum: sum over xccy_dfs (i) and for_ois (j)
+                # Result[basis_k, for_rate_l] = sum_i sum_j grad[i] * mixed_hess[i,j,k] * jac_for[j,l]
+                term1_cross = jnp.einsum('i,ijk,jl->kl',
+                                         grad_xccy_dfs_original,  # [n_xccy_dfs]
+                                         mixed_hess_xccy,          # [n_xccy_dfs, n_for_ois, n_basis]
+                                         jac_for_original)         # [n_for_ois, n_for_rates]
+
+                # term2: Off-diagonal block of full Hessian
+                term2_cross = jac_for_original.T @ jac_xccy_for_ois.T @ hess_pv_xccy_dfs @ jac_xccy_pillar
+
+                # Total cross-gamma matrix [n_for_rates, n_basis]
+                gamma_cross_matrix = term1_cross.T + term2_cross  # Transpose term1
+
+                # Convert to GBP per bp2
+                gamma_cross_matrix = gamma_cross_matrix * 1e-8 * spot_fx
+
+                # Create CrossGamma object
+                cross_gamma_for_basis = CrossGamma(
+                    risk_matrix=gamma_cross_matrix,
+                    tenors_curve1=to_tenor(foreign_model.swap_times),
+                    tenors_curve2=basis_swap_tenors,
+                    curve_type_1=foreign_model.curve_type,
+                    curve_type_2=xccy_curve.curve_type,
+                    currency=CurrencyTypes.GBP
+                )
+
+            # Package gammas into Risk object with cross-gammas
+            # Include XCCY basis gamma if available
+            cross_gammas_list = [cross_gamma_for_basis] if cross_gamma_for_basis is not None else None
+
+            if gamma_basis is not None:
+                gamma = Risk([gamma_domestic, gamma_foreign, gamma_basis], cross_gammas=cross_gammas_list)
+            else:
+                gamma = Risk([gamma_domestic, gamma_foreign], cross_gammas=cross_gammas_list)
+
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma)
+
+    def _compute_xccy_old(self, derivative, reqs):
+        """Old array-based implementation - kept for DELTA/GAMMA future work."""
+        # Get curves from model
+        domestic_model = getattr(self.model.curves, derivative._domestic_floating_index.name)
+        foreign_model = getattr(self.model.curves, derivative._foreign_floating_index.name)
+
+        # Get XCCY curve and spot FX
+        foreign_code = derivative._foreign_currency.name
+        domestic_code = derivative._domestic_currency.name
+        xccy_curve_name = f"{foreign_code}_{domestic_code}_BASIS"
+
+        try:
+            xccy_curve = getattr(self.model.curves, xccy_curve_name)
+            spot_fx = xccy_curve._spot_fx
+        except AttributeError:
+            raise LibError(f"XCCY curve {xccy_curve_name} not found in model. "
+                         f"Available curves: {[attr for attr in dir(self.model.curves) if not attr.startswith('_')]}")
 
         # Detect leg types to route appropriately
         is_domestic_fixed = isinstance(derivative._domestic_leg, SwapFixedLeg)
@@ -117,26 +624,49 @@ class Engine:
 
         # Compute domestic leg analytics
         if is_domestic_fixed:
-            # For XCCY swaps, use direct leg valuation to match test behavior
-            domestic_leg_value = derivative._domestic_leg.value(
-                value_dt=domestic_model._value_dt,
-                discount_curve=domestic_model
+            # Fixed leg: use fixed leg analytics
+            domestic_analytics = self._fixed_leg_analytics(
+                domestic_model.swap_rates,
+                domestic_model.swap_times,
+                domestic_model.year_fracs,
+                derivative._domestic_leg,
+                domestic_model._value_dt,
+                domestic_model._interp_type,
+                reqs
             )
-            domestic_analytics = {
-                "value": Valuation(amount=domestic_leg_value, currency=derivative._domestic_currency)
-            }
-        else:
-            # For XCCY floating legs with notional_exchange=True, use direct valuation
-            if derivative._domestic_leg._notional_exchange:
-                domestic_leg_value = derivative._domestic_leg.value(
-                    value_dt=domestic_model._value_dt,
-                    discount_curve=domestic_model,
-                    index_curve=domestic_model,
-                    first_fixing_rate=None
+            # Add notional exchanges for fixed legs
+            if RequestTypes.VALUE in reqs:
+                notional_analytics = self._notional_exchange_value(
+                    domestic_model.swap_rates,
+                    domestic_model.swap_times,
+                    domestic_model.year_fracs,
+                    derivative._effective_dt,
+                    derivative._maturity_dt,
+                    derivative._domestic_notional,
+                    domestic_model._value_dt,
+                    domestic_model._interp_type,
+                    derivative._domestic_currency,
+                    derivative._domestic_floating_index,
+                    derivative._domestic_leg_type
                 )
-                domestic_analytics = {
-                    "value": Valuation(amount=domestic_leg_value, currency=derivative._domestic_currency)
-                }
+                domestic_value = domestic_analytics["value"].amount + notional_analytics["value"].amount
+                domestic_analytics["value"] = Valuation(amount=domestic_value, currency=derivative._domestic_currency)
+        else:
+            # Floating leg: use XCCY floating leg analytics (handles notional exchanges)
+            if derivative._domestic_leg._notional_exchange:
+                domestic_analytics = self._xccy_float_leg_analytics(
+                    domestic_model.swap_rates,
+                    domestic_model.swap_times,
+                    domestic_model.year_fracs,
+                    derivative._domestic_leg,
+                    domestic_model._value_dt,
+                    domestic_model._interp_type,  # discount curve
+                    domestic_model._interp_type,  # index curve
+                    None,  # first_fixing_rate
+                    reqs,
+                    derivative._effective_dt,
+                    derivative._maturity_dt
+                )
             else:
                 domestic_analytics = self._float_leg_analytics(
                     domestic_model.swap_rates,
@@ -152,29 +682,50 @@ class Engine:
 
         # Compute foreign leg analytics
         if is_foreign_fixed:
-            # For XCCY swaps, use direct leg valuation to match test behavior
-            foreign_leg_value = derivative._foreign_leg.value(
-                value_dt=foreign_model._value_dt,
-                discount_curve=foreign_model
+            # Fixed leg: use fixed leg analytics
+            foreign_analytics = self._fixed_leg_analytics(
+                foreign_model.swap_rates,
+                foreign_model.swap_times,
+                foreign_model.year_fracs,
+                derivative._foreign_leg,
+                foreign_model._value_dt,
+                foreign_model._interp_type,
+                reqs
             )
-            foreign_analytics = {
-                "value": Valuation(amount=foreign_leg_value, currency=derivative._foreign_currency)
-            }
-        else:
-            # For XCCY floating legs with notional_exchange=True, use direct valuation
-            # because _float_leg_analytics doesn't handle notional exchanges correctly
-            # (end notional is added to _payments[-1], but _float_leg_jax recalculates from scratch)
-            if derivative._foreign_leg._notional_exchange:
-                # Call leg.value() directly
-                foreign_leg_value = derivative._foreign_leg.value(
-                    value_dt=foreign_model._value_dt,
-                    discount_curve=foreign_model,  # Use foreign curve for both discount and index
-                    index_curve=foreign_model,
-                    first_fixing_rate=None
+            # Add notional exchanges for fixed legs
+            if RequestTypes.VALUE in reqs:
+                notional_analytics = self._notional_exchange_value(
+                    foreign_model.swap_rates,
+                    foreign_model.swap_times,
+                    foreign_model.year_fracs,
+                    derivative._effective_dt,
+                    derivative._maturity_dt,
+                    derivative._foreign_notional,
+                    foreign_model._value_dt,
+                    foreign_model._interp_type,
+                    derivative._foreign_currency,
+                    derivative._foreign_floating_index,
+                    derivative._foreign_leg._leg_type
                 )
-                foreign_analytics = {
-                    "value": Valuation(amount=foreign_leg_value, currency=derivative._foreign_currency)
-                }
+                foreign_value = foreign_analytics["value"].amount + notional_analytics["value"].amount
+                foreign_analytics["value"] = Valuation(amount=foreign_value, currency=derivative._foreign_currency)
+        else:
+            # Floating leg: use XCCY curve for discounting, foreign curve for forward rates
+            # The foreign leg coupons are projected using foreign OIS curve, but discounted using XCCY curve
+            if derivative._foreign_leg._notional_exchange:
+                foreign_analytics = self._xccy_float_leg_analytics(
+                    foreign_model.swap_rates,
+                    foreign_model.swap_times,
+                    foreign_model.year_fracs,
+                    derivative._foreign_leg,
+                    foreign_model._value_dt,
+                    xccy_curve,  # Pass XCCY curve object for discounting
+                    foreign_model._interp_type,  # index curve type (for forward rates)
+                    None,  # first_fixing_rate
+                    reqs,
+                    derivative._effective_dt,
+                    derivative._maturity_dt
+                )
             else:
                 foreign_analytics = self._float_leg_analytics(
                     foreign_model.swap_rates,
@@ -182,79 +733,10 @@ class Engine:
                     foreign_model.year_fracs,
                     derivative._foreign_leg,
                     foreign_model._value_dt,
-                    foreign_model._interp_type,  # discount curve
-                    foreign_model._interp_type,  # index curve
+                    xccy_curve,  # Pass XCCY curve object for discounting
+                    foreign_model._interp_type,  # index curve type (for forward rates)
                     None,  # first_fixing_rate
                     reqs,
-                )
-
-        # Add notional exchanges for fixed legs (they don't include them by default)
-        if RequestTypes.VALUE in reqs:
-            # Domestic leg notional exchanges (if fixed)
-            if is_domestic_fixed:
-                domestic_value = domestic_analytics["value"].amount
-                effective_dt = derivative._effective_dt
-                maturity_dt = derivative._maturity_dt
-                domestic_leg_type = derivative._domestic_leg_type
-
-                # Start exchange: -notional at effective date (outflow)
-                if effective_dt >= domestic_model._value_dt:
-                    df_start = domestic_model.df(effective_dt)
-                    start_exchange_pv = -derivative._domestic_notional * df_start
-                    # Apply leg type sign
-                    if domestic_leg_type == SwapTypes.RECEIVE:
-                        domestic_value += start_exchange_pv
-                    else:
-                        domestic_value -= start_exchange_pv
-
-                # End exchange: +notional at maturity date (inflow)
-                if maturity_dt >= domestic_model._value_dt:
-                    df_end = domestic_model.df(maturity_dt)
-                    end_exchange_pv = derivative._domestic_notional * df_end
-                    # Apply leg type sign
-                    if domestic_leg_type == SwapTypes.RECEIVE:
-                        domestic_value += end_exchange_pv
-                    else:
-                        domestic_value -= end_exchange_pv
-
-                # Update domestic analytics with notional exchanges
-                domestic_analytics["value"] = Valuation(
-                    amount=domestic_value,
-                    currency=derivative._domestic_currency
-                )
-
-            # Foreign leg notional exchanges (if fixed)
-            # Note: Floating legs already include notional exchanges via notional_exchange=True
-            if is_foreign_fixed:
-                foreign_value = foreign_analytics["value"].amount
-                effective_dt = derivative._effective_dt
-                maturity_dt = derivative._maturity_dt
-                foreign_leg_type = derivative._foreign_leg._leg_type
-
-                # Start exchange: -notional at effective date (outflow)
-                if effective_dt >= foreign_model._value_dt:
-                    df_start = foreign_model.df(effective_dt)
-                    start_exchange_pv = -derivative._foreign_notional * df_start
-                    # Apply leg type sign
-                    if foreign_leg_type == SwapTypes.RECEIVE:
-                        foreign_value += start_exchange_pv
-                    else:
-                        foreign_value -= start_exchange_pv
-
-                # End exchange: +notional at maturity date (inflow)
-                if maturity_dt >= foreign_model._value_dt:
-                    df_end = foreign_model.df(maturity_dt)
-                    end_exchange_pv = derivative._foreign_notional * df_end
-                    # Apply leg type sign
-                    if foreign_leg_type == SwapTypes.RECEIVE:
-                        foreign_value += end_exchange_pv
-                    else:
-                        foreign_value -= end_exchange_pv
-
-                # Update foreign analytics with notional exchanges
-                foreign_analytics["value"] = Valuation(
-                    amount=foreign_value,
-                    currency=derivative._foreign_currency
                 )
 
         # Combine results
@@ -486,10 +968,38 @@ class Engine:
         rates = jnp.array(swap_rates)
         times, dfs = self.build_curve_ad(rates, swap_times, year_fracs)
 
+        # IMPORTANT: Prepend time≈0 with DF≈1.0 to enable forward rate calculations
+        # from value date. Without this, interpolating start_times=0 fails.
+        # Use time=1e-8 instead of exactly 0 to avoid numerical issues in FLAT_FWD_RATES
+        # gradients (where rt = -log(DF) causes issues when DF=1.0 exactly).
+        prepended_t0 = False
+        if times[0] > 1e-7:
+            times = jnp.concatenate([jnp.array([1e-8]), times])
+            dfs = jnp.concatenate([jnp.array([1.0]), dfs])
+            prepended_t0 = True
+
         # For AD, we need DFs as a function of rates only (times are constant)
-        build_dfs = lambda r: self.build_curve_ad(r, swap_times, year_fracs)[1]
-        jac = jacrev(build_dfs)(rates)
-        hess = hessian(build_dfs)(rates)
+        # Compute Jacobian for the original DFs (without time=0)
+        def build_dfs_original(r):
+            _, dfs_out = self.build_curve_ad(r, swap_times, year_fracs)
+            return dfs_out
+
+        jac_original = jacrev(build_dfs_original)(rates)
+        hess_original = hessian(build_dfs_original)(rates)
+
+        # If we prepended time=0, add a row of zeros to Jacobian and Hessian
+        # because DF(t=0) = 1.0 is constant (zero gradient w.r.t. all rates)
+        if prepended_t0:
+            n_rates = len(rates)
+            zero_row = jnp.zeros((1, n_rates))
+            jac = jnp.concatenate([zero_row, jac_original], axis=0)
+
+            # For Hessian: prepend zeros for the time=0 point
+            zero_matrix = jnp.zeros((1, n_rates, n_rates))
+            hess = jnp.concatenate([zero_matrix, hess_original], axis=0)
+        else:
+            jac = jac_original
+            hess = hess_original
 
         cache = {
             "times": times,
@@ -740,14 +1250,24 @@ class Engine:
                     leg_sign: float,              # +1 or –1
                     value_time: float,            # scalar
                     first_fixing_rate: float,
-                    override_first               # scalar
+                    override_first,               # scalar
+                    idx_times=None,               # Optional separate index curve times
+                    idx_dfs=None,                 # Optional separate index curve dfs
+                    notional_exchange=False,      # Optional: enable notional exchanges (for XCCY)
+                    notional_exchange_amount=0.0, # Optional: notional amount to exchange
+                    effective_time=0.0,           # Optional: time to effective date
+                    maturity_time=0.0             # Optional: time to maturity date
                     ):
         disc_interp = InterpolatorAd(disc_interp_type)
         idx_interp  = InterpolatorAd(idx_interp_type)
 
+        # Use separate index curve times/dfs if provided (for XCCY swaps)
+        idx_times_actual = idx_times if idx_times is not None else times
+        idx_dfs_actual = idx_dfs if idx_dfs is not None else dfs
+
         df_val   = jnp.atleast_1d(disc_interp.simple_interpolate(value_time, times, dfs, disc_interp_type.value))
-        df_start = jnp.atleast_1d(idx_interp.simple_interpolate(start_times, times, dfs, idx_interp_type.value))
-        df_end   = jnp.atleast_1d(idx_interp.simple_interpolate(end_times, times, dfs, idx_interp_type.value))
+        df_start = jnp.atleast_1d(idx_interp.simple_interpolate(start_times, idx_times_actual, idx_dfs_actual, idx_interp_type.value))
+        df_end   = jnp.atleast_1d(idx_interp.simple_interpolate(end_times, idx_times_actual, idx_dfs_actual, idx_interp_type.value))
 
         # d) Vectorised forward rates
         # Avoid 0/0 when pay_alphas is zero (notional exchanges with no accrual period)
@@ -780,8 +1300,30 @@ class Engine:
                             principal * df_rel[..., -1],
                             0.0)                                            # [...]
 
-        # i) aggregate and apply sign
-        leg_pv     = jnp.sum(pv_coupons, axis=-1) + pv_prin                      # [...]
+        # i) Notional exchanges (for XCCY swaps)
+        # At effective_dt: -notional (outflow), at maturity_dt: +notional (inflow)
+        pv_notional_exchange = 0.0
+        if notional_exchange:
+            # Start exchange: -notional at effective_dt (if in future or today)
+            df_effective = jnp.atleast_1d(disc_interp.simple_interpolate(effective_time, times, dfs, disc_interp_type.value))
+            df_effective_rel = df_effective / df_val
+            pv_start_exchange = jnp.where(effective_time >= value_time,
+                                         -notional_exchange_amount * df_effective_rel,
+                                         0.0)
+
+            # End exchange: +notional at maturity_dt (if in future)
+            df_maturity = jnp.atleast_1d(disc_interp.simple_interpolate(maturity_time, times, dfs, disc_interp_type.value))
+            df_maturity_rel = df_maturity / df_val
+            pv_end_exchange = jnp.where(maturity_time >= value_time,
+                                       notional_exchange_amount * df_maturity_rel,
+                                       0.0)
+
+            pv_notional_exchange = jnp.squeeze(pv_start_exchange + pv_end_exchange)
+
+        # j) aggregate and apply sign
+        pv_coupons_sum = jnp.sum(pv_coupons, axis=-1)
+        leg_pv     = pv_coupons_sum + pv_prin + pv_notional_exchange  # [...]
+
         return leg_sign * leg_pv
             
     def value_float_leg(self,
@@ -879,14 +1421,38 @@ class Engine:
         if requests is None:
             requests = {RequestTypes.VALUE}
 
-        curve_key = tuple(swap_times)
-        cache = self._cached_curve(
-            curve_key, swap_rates, swap_times, year_fracs, discount_curve_type
-        )
-        times = cache["times"]
-        dfs = cache["dfs"]
-        jac = cache["jac"]
-        hess_curve = cache["hess"]
+        # Check if discount_curve_type is an actual curve object (XccyCurve)
+        from cavour.trades.rates.xccy_curve import XccyCurve
+        idx_times = None
+        idx_dfs = None
+
+        if isinstance(discount_curve_type, XccyCurve):
+            # Use pre-computed times and dfs from XCCY curve for discounting
+            times = jnp.array(discount_curve_type._times)
+            dfs = jnp.array(discount_curve_type._dfs)
+            jac = None  # Not available for pre-computed curves
+            hess_curve = None
+            actual_interp_type = discount_curve_type._interp_type
+
+            # For index curve (forward rates), use the provided swap_rates/swap_times
+            # These come from the foreign OIS curve for XCCY swaps
+            idx_curve_key = tuple(swap_times)
+            idx_cache = self._cached_curve(
+                idx_curve_key, swap_rates, swap_times, year_fracs, index_curve_type or actual_interp_type
+            )
+            idx_times = idx_cache["times"]
+            idx_dfs = idx_cache["dfs"]
+        else:
+            # Normal case: bootstrap curve from rates
+            curve_key = tuple(swap_times)
+            cache = self._cached_curve(
+                curve_key, swap_rates, swap_times, year_fracs, discount_curve_type
+            )
+            times = cache["times"]
+            dfs = cache["dfs"]
+            jac = cache["jac"]
+            hess_curve = cache["hess"]
+            actual_interp_type = discount_curve_type
 
         dc_type = floating_leg_details._dc_type
         payment_times = jnp.array(
@@ -912,8 +1478,8 @@ class Engine:
         pv_fn = partial(
             self._float_leg_jax,
             times=times,
-            disc_interp_type=discount_curve_type,
-            idx_interp_type=index_curve_type or discount_curve_type,
+            disc_interp_type=actual_interp_type,
+            idx_interp_type=index_curve_type or actual_interp_type,
             payment_times=payment_times,
             start_times=start_times,
             end_times=end_times,
@@ -925,6 +1491,8 @@ class Engine:
             value_time=value_time,
             first_fixing_rate=fix0,
             override_first=override_first,
+            idx_times=idx_times,  # For XCCY: separate index curve
+            idx_dfs=idx_dfs,
         )
 
         out = {}
@@ -963,6 +1531,180 @@ class Engine:
             )
 
         return out
+
+    def _xccy_float_leg_analytics(
+        self,
+        swap_rates,
+        swap_times,
+        year_fracs,
+        floating_leg_details,
+        value_dt,
+        discount_curve_type,
+        index_curve_type,
+        first_fixing_rate,
+        requests,
+        effective_dt,
+        maturity_dt
+    ):
+        """
+        Compute analytics for XCCY floating leg with notional exchanges.
+
+        This extends _float_leg_analytics to handle notional exchanges which
+        are critical for XCCY swaps but not standard OIS swaps.
+
+        Args:
+            swap_rates: Par rates for curve building
+            swap_times: Swap maturities
+            year_fracs: Year fractions for each swap
+            floating_leg_details: SwapFloatLeg instance
+            value_dt: Valuation date
+            discount_curve_type: Interpolation type for discounting
+            index_curve_type: Interpolation type for forward rates
+            first_fixing_rate: Optional first fixing rate
+            requests: Set of RequestTypes (VALUE, DELTA, GAMMA)
+            effective_dt: Swap effective date
+            maturity_dt: Swap maturity date
+
+        Returns:
+            dict with value, delta, gamma (VALUE only for now)
+        """
+        # Get coupon cashflows analytics using standard method
+        coupon_analytics = self._float_leg_analytics(
+            swap_rates,
+            swap_times,
+            year_fracs,
+            floating_leg_details,
+            value_dt,
+            discount_curve_type,
+            index_curve_type,
+            first_fixing_rate,
+            requests
+        )
+
+        # Get notional exchange analytics
+        # For XCCY curves, pass empty arrays since we use pre-computed times/dfs
+        from cavour.trades.rates.xccy_curve import XccyCurve
+        if isinstance(discount_curve_type, XccyCurve):
+            # Use empty arrays - _notional_exchange_value will detect XCCY curve
+            notional_swap_rates = jnp.array([])
+            notional_swap_times = jnp.array([])
+            notional_year_fracs = jnp.array([])
+        else:
+            # Normal case: use provided data
+            notional_swap_rates = swap_rates
+            notional_swap_times = swap_times
+            notional_year_fracs = year_fracs
+
+        notional_analytics = self._notional_exchange_value(
+            notional_swap_rates,
+            notional_swap_times,
+            notional_year_fracs,
+            effective_dt,
+            maturity_dt,
+            floating_leg_details._notional,
+            value_dt,
+            discount_curve_type,
+            floating_leg_details._currency,
+            floating_leg_details._floating_index,
+            floating_leg_details._leg_type
+        )
+
+        # Combine results
+        out = {}
+        if RequestTypes.VALUE in requests:
+            coupon_value = coupon_analytics.get("value").amount
+            notional_value = notional_analytics.get("value").amount
+            total_value = coupon_value + notional_value
+            out["value"] = Valuation(amount=total_value, currency=floating_leg_details._currency)
+
+        # TODO: DELTA and GAMMA will be added in Phase 2
+
+        return out
+
+    def _notional_exchange_value(
+        self,
+        swap_rates,
+        swap_times,
+        year_fracs,
+        effective_dt,
+        maturity_dt,
+        notional,
+        value_dt,
+        interp_type,
+        currency,
+        curve_type,
+        leg_type
+    ):
+        """
+        Compute VALUE for notional exchanges at start and maturity.
+
+        For XCCY swaps, notional is exchanged at:
+        - Start (effective_dt): -notional (outflow)
+        - Maturity: +notional (inflow)
+
+        Args:
+            swap_rates: Par rates for curve bootstrapping
+            swap_times: Swap maturities
+            year_fracs: Year fractions for curve building
+            effective_dt: Swap effective date
+            maturity_dt: Swap maturity date
+            notional: Notional amount
+            value_dt: Valuation date
+            interp_type: Interpolation type
+            currency: Currency for valuation
+            curve_type: Curve type identifier
+            leg_type: SwapTypes.RECEIVE or SwapTypes.PAY
+
+        Returns:
+            dict with 'value': Valuation object
+        """
+        # Check if interp_type is an actual curve object (XccyCurve)
+        from cavour.trades.rates.xccy_curve import XccyCurve
+        if isinstance(interp_type, XccyCurve):
+            # Use pre-computed times and dfs from the curve
+            times = jnp.array(interp_type._times)
+            dfs = jnp.array(interp_type._dfs)
+            actual_interp_type = interp_type._interp_type
+        else:
+            # Normal case: bootstrap curve from rates
+            curve_key = tuple(swap_times)
+            cache = self._cached_curve(curve_key, swap_rates, swap_times, year_fracs, interp_type)
+            times = cache["times"]
+            dfs = cache["dfs"]
+            actual_interp_type = interp_type
+
+        # Build interpolator
+        from cavour.market.curves.interpolator_ad import InterpolatorAd
+        interp = InterpolatorAd(actual_interp_type)
+
+        dc_type = DayCountTypes.ACT_365F  # Standard for time calculations
+        value_time = times_from_dates(value_dt, value_dt, dc_type)
+        df_value = float(interp.simple_interpolate(value_time, times, dfs, actual_interp_type.value))
+        total_value = 0.0
+
+        # Start exchange: -notional at effective_dt (outflow)
+        if effective_dt >= value_dt:
+            effective_time = times_from_dates(effective_dt, value_dt, dc_type)
+            df_start_abs = float(interp.simple_interpolate(effective_time, times, dfs, actual_interp_type.value))
+            df_start = df_start_abs / df_value  # Normalize by DF at valuation date
+            start_exchange_pv = -notional * df_start
+            total_value += start_exchange_pv
+
+        # End exchange: +notional at maturity_dt (inflow)
+        if maturity_dt >= value_dt:
+            maturity_time = times_from_dates(maturity_dt, value_dt, dc_type)
+            df_end_abs = float(interp.simple_interpolate(maturity_time, times, dfs, actual_interp_type.value))
+            df_end = df_end_abs / df_value  # Normalize by DF at valuation date
+            end_exchange_pv = notional * df_end
+            total_value += end_exchange_pv
+
+        # Apply leg type sign
+        if leg_type == SwapTypes.PAY:
+            total_value = -total_value
+
+        return {
+            "value": Valuation(amount=total_value, currency=currency)
+        }
 
     def valuation_float_leg(
         self,

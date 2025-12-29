@@ -80,3 +80,4 @@ class CurveTypes(Enum):
     GBP_OIS_SONIA = 1
     USD_OIS_SOFR = 2
     EUR_OIS_ESTR = 3
+    USD_GBP_BASIS = 4

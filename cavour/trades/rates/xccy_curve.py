@@ -113,7 +113,8 @@ class XccyCurve(DiscountCurve):
                  foreign_curve: DiscountCurve,
                  spot_fx: float,
                  interp_type: InterpTypes = InterpTypes.FLAT_FWD_RATES,
-                 check_refit: bool = False):
+                 check_refit: bool = False,
+                 use_ad: bool = False):
         """
         Create a cross-currency discount curve from basis swaps.
 
@@ -125,6 +126,7 @@ class XccyCurve(DiscountCurve):
             spot_fx: Spot FX rate (domestic currency per unit of foreign)
             interp_type: Interpolation method for discount factors
             check_refit: If True, verify calibration swaps reprice to zero
+            use_ad: If True, use JAX-compatible _build_curve_ad() for automatic differentiation
 
         Notes:
             - All basis swaps must have same effective date (XCCY spot date)
@@ -140,6 +142,7 @@ class XccyCurve(DiscountCurve):
         self._spot_fx = spot_fx
         self._interp_type = interp_type
         self._check_refit = check_refit
+        self._use_ad = use_ad
         self._interpolator = None
 
         # Sort swaps by maturity
@@ -148,7 +151,12 @@ class XccyCurve(DiscountCurve):
 
         # Prepare inputs and build curve
         self._prepare_curve_builder_inputs()
-        self._build_curve()
+
+        # Use AD or regular build method
+        if use_ad:
+            self._build_curve_ad()
+        else:
+            self._build_curve()
 
 ###############################################################################
 
@@ -472,6 +480,785 @@ class XccyCurve(DiscountCurve):
         # Validate calibration if requested
         if self._check_refit:
             self._check_refits(SWAP_TOL)
+
+###############################################################################
+
+    def _build_curve_ad(self):
+        """
+        Bootstrap the XCCY discount curve using JAX-compatible operations.
+
+        This method provides the same functionality as _build_curve() but uses
+        pure JAX operations for automatic differentiation. The algorithm is
+        identical, but implemented using jax.lax.scan instead of Python loops.
+
+        Returns exact same times and DFs as _build_curve() to machine precision.
+
+        Also computes and stores Jacobians for sensitivity analysis:
+        - _jac_basis: d(xccy_dfs) / d(basis_spreads)
+        - _jac_foreign_ois: d(xccy_dfs) / d(foreign_ois_dfs)
+        """
+        from cavour.utils.helpers import times_from_dates
+        from jax import lax, jacrev
+
+        # Step 1: Pre-extract ALL payment data from ALL swaps
+        # This is done outside JAX since it involves object manipulation
+        payment_data = self._prepare_ad_inputs()
+
+        # Cache payment_data for later use (e.g., aggregating Jacobian sensitivities)
+        self._payment_data_cache = payment_data
+
+        # Step 2: Run JAX bootstrap using lax.scan
+        times, dfs = self._run_jax_bootstrap(payment_data)
+
+        # Step 3: Update curve arrays
+        self._times = times
+        self._dfs = dfs
+        self._repr_dfs = dfs
+
+        # Step 4: Compute Jacobians for automatic differentiation
+        # Extract current parameter values
+        df_foreign_ois = payment_data['df_foreign_ois']
+
+        # Import JAX for Jacobian computation
+        import jax.numpy as jnp
+
+        # 4a: Jacobian w.r.t. basis spreads: d(xccy_dfs) / d(basis_spreads)
+        # We want sensitivity to PILLAR-level spreads, not payment-level
+        # Extract pillar-level spreads (one per swap)
+        swap_idx_array = payment_data['swap_idx']
+        n_swaps = payment_data['n_swaps']
+
+        # Create pillar-level basis spread array (one per swap)
+        basis_spreads_pillar = jnp.array([self._used_swaps[i]._foreign_spread for i in range(n_swaps)])
+
+        def dfs_from_basis_pillar(pillar_spreads):
+            """Rebuild curve with different pillar-level basis spreads.
+
+            Args:
+                pillar_spreads: Array of shape (n_swaps,) with one spread per swap/pillar
+
+            Returns:
+                DFs after bootstrapping with the new spreads
+            """
+            # Expand pillar-level spreads to payment-level
+            # payment_spreads[i] = pillar_spreads[swap_idx[i]]
+            payment_spreads = pillar_spreads[swap_idx_array]
+
+            modified_data = dict(payment_data)
+            modified_data['basis_spreads'] = payment_spreads
+            _, dfs_out = self._run_jax_bootstrap(modified_data)
+            return dfs_out
+
+        self._jac_basis = jacrev(dfs_from_basis_pillar)(basis_spreads_pillar)
+        # 4a-ii: Hessian w.r.t. basis spreads: d²(xccy_dfs) / d(basis_spreads)²
+        # This is needed for computing gamma (second-order sensitivities)
+        # Cannot use JAX hessian() due to custom_vjp - must use finite differences
+        n_spreads = len(basis_spreads_pillar)
+        n_xccy_dfs = len(dfs)
+        hess_basis = jnp.zeros((n_xccy_dfs, n_spreads, n_spreads))
+        eps = 1e-6
+        
+        # Compute Hessian using central differences
+        # For efficiency, only compute upper triangle and diagonal
+        for i in range(n_spreads):
+            for j in range(i, n_spreads):
+                if i == j:
+                    # Diagonal: d²f/dx_i² = (f(x+2h) - 2f(x) + f(x-2h)) / (4h²)
+                    spreads_plus = basis_spreads_pillar.at[i].add(eps)
+                    spreads_minus = basis_spreads_pillar.at[i].add(-eps)
+                    
+                    dfs_plus = dfs_from_basis_pillar(spreads_plus)
+                    dfs_minus = dfs_from_basis_pillar(spreads_minus)
+                    dfs_base = dfs_from_basis_pillar(basis_spreads_pillar)
+                    
+                    hess_diag = (dfs_plus - 2*dfs_base + dfs_minus) / (eps**2)
+                    hess_basis = hess_basis.at[:, i, i].set(hess_diag)
+                else:
+                    # Off-diagonal: d²f/dx_idx_j = (f(x+hi+hj) - f(x+hi-hj) - f(x-hi+hj) + f(x-hi-hj)) / (4h²)
+                    spreads_pp = basis_spreads_pillar.at[i].add(eps).at[j].add(eps)
+                    spreads_pm = basis_spreads_pillar.at[i].add(eps).at[j].add(-eps)
+                    spreads_mp = basis_spreads_pillar.at[i].add(-eps).at[j].add(eps)
+                    spreads_mm = basis_spreads_pillar.at[i].add(-eps).at[j].add(-eps)
+                    
+                    dfs_pp = dfs_from_basis_pillar(spreads_pp)
+                    dfs_pm = dfs_from_basis_pillar(spreads_pm)
+                    dfs_mp = dfs_from_basis_pillar(spreads_mp)
+                    dfs_mm = dfs_from_basis_pillar(spreads_mm)
+                    
+                    hess_off_diag = (dfs_pp - dfs_pm - dfs_mp + dfs_mm) / (4 * eps**2)
+                    hess_basis = hess_basis.at[:, i, j].set(hess_off_diag)
+                    hess_basis = hess_basis.at[:, j, i].set(hess_off_diag)  # Symmetric
+        
+        self._hess_basis = hess_basis
+
+        # 4b: Jacobian w.r.t. foreign OIS DFs: d(xccy_dfs) / d(df_foreign_ois)
+        # This captures how XCCY curve changes when foreign OIS curve changes
+        # Use finite differences since automatic differentiation has circular dependencies
+        import jax.numpy as jnp
+
+        def dfs_from_foreign_ois(foreign_ois_array):
+            """Rebuild curve with different foreign OIS discount factors."""
+            modified_data = dict(payment_data)
+            modified_data['df_foreign_ois'] = foreign_ois_array
+            _, dfs_out = self._run_jax_bootstrap_impl(modified_data)
+            return dfs_out
+
+        # Compute Jacobian using finite differences
+        n_foreign_ois = len(df_foreign_ois)
+        n_xccy_dfs = len(dfs)
+        jac_foreign_ois = jnp.zeros((n_xccy_dfs, n_foreign_ois))
+        eps = 1e-7
+
+        for i in range(n_foreign_ois):
+            # Perturb i-th foreign OIS DF
+            df_foreign_ois_plus = df_foreign_ois.at[i].add(eps)
+            df_foreign_ois_minus = df_foreign_ois.at[i].add(-eps)
+
+            # Recompute DFs
+            dfs_plus = dfs_from_foreign_ois(df_foreign_ois_plus)
+            dfs_minus = dfs_from_foreign_ois(df_foreign_ois_minus)
+
+            # Finite difference gradient
+            jac_foreign_ois = jac_foreign_ois.at[:, i].set((dfs_plus - dfs_minus) / (2 * eps))
+
+        self._jac_foreign_ois = jac_foreign_ois
+
+        # 4c: Mixed Hessian w.r.t. foreign OIS CURVE DFs and basis spreads
+        # d2(xccy_dfs) / d(foreign_curve_dfs) d(basis_spreads)
+        # This is needed for computing cross-gamma between foreign OIS and XCCY basis
+        #
+        # IMPORTANT: Use foreign CURVE DFs (at swap maturity points), not payment DFs
+        # This ensures dimensional compatibility with jac_for_original in engine.py
+
+        foreign_curve_dfs = jnp.array(self._foreign_curve._dfs)
+        n_foreign_curve_dfs = len(foreign_curve_dfs)
+
+        def dfs_from_foreign_curve_and_basis(foreign_curve_dfs_array, basis_pillar_array):
+            """Rebuild curve with different foreign CURVE DFs and basis spreads."""
+            # We need to interpolate payment DFs from modified foreign curve DFs
+            # Use linear interpolation in log(DF) space (equivalent to flat forward rates)
+            foreign_times_array = jnp.array(self._foreign_curve._times)
+            payment_times_array = payment_data['foreign_ois_times']  # Times at which we need foreign OIS DFs
+
+            # Linear interpolation in log(DF) space
+            log_dfs_curve = jnp.log(foreign_curve_dfs_array)
+            log_dfs_payments = jnp.interp(payment_times_array, foreign_times_array, log_dfs_curve)
+            payment_dfs_modified = jnp.exp(log_dfs_payments)
+
+            # Expand pillar-level basis spreads to payment-level
+            payment_spreads = basis_pillar_array[swap_idx_array]
+
+            modified_data = dict(payment_data)
+            modified_data['df_foreign_ois'] = payment_dfs_modified
+            modified_data['basis_spreads'] = payment_spreads
+            _, dfs_out = self._run_jax_bootstrap_impl(modified_data)
+            return dfs_out
+
+        # Compute mixed Hessian using central differences
+        # For mixed partials: d2f/dxdy = [f(x+h,y+h) - f(x+h,y-h) - f(x-h,y+h) + f(x-h,y-h)] / (4h2)
+        mixed_hess = jnp.zeros((n_xccy_dfs, n_foreign_curve_dfs, n_spreads))
+        eps_mixed = 1e-7
+
+        for i in range(n_foreign_curve_dfs):
+            for j in range(n_spreads):
+                # Four corner points for central difference
+                for_curve_dfs_plus = foreign_curve_dfs.at[i].add(eps_mixed)
+                for_curve_dfs_minus = foreign_curve_dfs.at[i].add(-eps_mixed)
+                basis_plus = basis_spreads_pillar.at[j].add(eps_mixed)
+                basis_minus = basis_spreads_pillar.at[j].add(-eps_mixed)
+
+                # f(x+h, y+h)
+                dfs_pp = dfs_from_foreign_curve_and_basis(for_curve_dfs_plus, basis_plus)
+
+                # f(x+h, y-h)
+                dfs_pm = dfs_from_foreign_curve_and_basis(for_curve_dfs_plus, basis_minus)
+
+                # f(x-h, y+h)
+                dfs_mp = dfs_from_foreign_curve_and_basis(for_curve_dfs_minus, basis_plus)
+
+                # f(x-h, y-h)
+                dfs_mm = dfs_from_foreign_curve_and_basis(for_curve_dfs_minus, basis_minus)
+
+                # Central difference for mixed partial
+                mixed_partial = (dfs_pp - dfs_pm - dfs_mp + dfs_mm) / (4 * eps_mixed**2)
+                mixed_hess = mixed_hess.at[:, i, j].set(mixed_partial)
+
+        self._mixed_hess_foreign_basis = mixed_hess
+
+
+        # Step 5: Initialize the interpolator with the final times and DFs
+        from cavour.market.curves.interpolator import Interpolator
+        self._interpolator = Interpolator(self._interp_type)
+        self._interpolator.fit(np.array(self._times), np.array(self._dfs))
+
+        # Step 6: Validate calibration if requested
+        if self._check_refit:
+            self._check_refits(SWAP_TOL)
+
+###############################################################################
+
+    def _prepare_ad_inputs(self):
+        """
+        Pre-extract all payment data and build static structures for JAX bootstrap.
+
+        Returns a dictionary containing all data needed for the JAX scan operation:
+        - All payment times from all swaps (both domestic and foreign legs)
+        - Pre-computed OIS discount factors at all payment dates
+        - Cashflow amounts (forward rates pre-computed)
+        - Dependency indices (which prior XCCY DF to use)
+        - Masks for conditional logic
+        """
+        all_points = []
+
+        # For each basis swap, extract ALL payment data from BOTH legs
+        for swap_idx, swap in enumerate(self._used_swaps):
+            basis_spread = swap._foreign_spread
+            maturity_dt = swap._maturity_dt
+            maturity_time = (maturity_dt - self._value_dt) / 365.0  # ACT_365F
+
+            # First, trigger leg valuation to populate internal cashflow data
+            # We need to value domestic leg normally
+            pv_domestic = swap._domestic_leg.value(
+                value_dt=self._value_dt,
+                discount_curve=self._domestic_curve,
+                index_curve=self._domestic_curve,
+                first_fixing_rate=None
+            )
+
+            # Value foreign leg to populate cashflows
+            # Use foreign OIS curve for projection, XCCY curve will be bootstrapped
+            _ = swap._foreign_leg.value(
+                value_dt=self._value_dt,
+                discount_curve=self._foreign_curve,
+                index_curve=self._foreign_curve,
+                first_fixing_rate=None
+            )
+
+            # Extract ONLY foreign leg payments (domestic PV is already pre-computed)
+            for pmt_idx, pmnt_dt in enumerate(swap._foreign_leg._payment_dts):
+                if pmnt_dt >= self._value_dt:  # Include payments at or after value date
+                    pmnt_time = (pmnt_dt - self._value_dt) / 365.0  # ACT_365F
+                    df_foreign_ois = self._foreign_curve.df(pmnt_dt, self._foreign_curve._dc_type)
+
+                    # Extract data needed to recompute cashflows from DFs
+                    # Cashflows will be computed inside bootstrap from forward rates
+                    if pmt_idx < len(swap._foreign_leg._year_fracs):
+                        year_frac = swap._foreign_leg._year_fracs[pmt_idx]
+                        notional = swap._foreign_leg._notional_array[pmt_idx] if len(swap._foreign_leg._notional_array) > 0 else swap._foreign_notional
+
+                        # Get accrual dates and convert to times using foreign curve's day count
+                        start_accrual_dt = swap._foreign_leg._start_accrued_dts[pmt_idx]
+                        end_accrual_dt = swap._foreign_leg._end_accrued_dts[pmt_idx]
+                        # Use foreign curve's day count to match foreign_ois_times grid
+                        from cavour.utils.helpers import times_from_dates
+                        start_accrual_time = times_from_dates(start_accrual_dt, self._value_dt, self._foreign_curve._dc_type)
+                        end_accrual_time = times_from_dates(end_accrual_dt, self._value_dt, self._foreign_curve._dc_type)
+
+                        # Check if this is a notional exchange (year_frac=0)
+                        is_notional_exchange = (abs(year_frac) < 1e-10)
+
+                        # Check if final payment with notional return
+                        is_last_payment = (pmnt_dt == maturity_dt) and swap._foreign_leg._notional_exchange
+
+                        # For spread sensitivity: always year_frac * notional (zero for notional exchanges)
+                        spread_sensitivity = year_frac * notional if not is_notional_exchange else 0.0
+                    else:
+                        # Fallback
+                        year_frac = 0.0
+                        notional = 0.0
+                        start_accrual_time = pmnt_time
+                        end_accrual_time = pmnt_time
+                        is_notional_exchange = True
+                        is_last_payment = False
+                        spread_sensitivity = 0.0
+
+                    all_points.append({
+                        'time': pmnt_time,
+                        'time_key': round(pmnt_time, 4),  # For deduplication
+                        'swap_idx': swap_idx,
+                        'is_domestic': False,
+                        'is_foreign': True,
+                        'is_maturity': (pmnt_dt == maturity_dt),
+                        'is_at_value_dt': (pmnt_dt == self._value_dt),
+                        'basis_spread': basis_spread,
+                        # Store data to recompute cashflows from DFs
+                        'year_frac': year_frac,
+                        'notional': notional,
+                        'start_accrual_time': start_accrual_time,
+                        'end_accrual_time': end_accrual_time,
+                        'is_notional_exchange': is_notional_exchange,
+                        'is_last_payment': is_last_payment,
+                        'spread_sensitivity': spread_sensitivity,  # For basis spread AD
+                        'df_domestic_ois': 1.0,  # Not used for foreign payments
+                        'df_foreign_ois': df_foreign_ois,
+                        'pv_domestic': pv_domestic,  # Store total domestic PV for this swap
+                        'maturity_time': maturity_time
+                    })
+
+        # Sort all points by time, then by swap_idx for deterministic ordering
+        all_points_sorted = sorted(all_points, key=lambda x: (x['time'], x['swap_idx']))
+
+        # NO deduplication at payment level - each swap needs its payments tracked separately
+        unique_points = all_points_sorted
+
+        # Build XCCY node mask (foreign payments after value_dt)
+        xccy_node_mask = []
+        for point in unique_points:
+            is_xccy_node = not point['is_at_value_dt']  # All non-value_dt points are nodes
+            xccy_node_mask.append(is_xccy_node)
+
+        # Pre-compute which XCCY nodes are unique by time (for final curve output)
+        # This avoids using jnp.unique in the differentiable computation
+        # Track first occurrence of each unique time among XCCY nodes
+        seen_times = {}
+        unique_node_indices = []  # Indices in the FILTERED (xccy_node_mask=True) array
+        filtered_idx = 0
+        for idx, point in enumerate(unique_points):
+            if xccy_node_mask[idx]:  # Only consider XCCY nodes
+                time_key = point['time_key']
+                if time_key not in seen_times:
+                    seen_times[time_key] = filtered_idx
+                    unique_node_indices.append(filtered_idx)
+                filtered_idx += 1
+
+        # Build dependency graph (prev_idx)
+        # For each point, find the previous XCCY node (any swap, in time order)
+        n_points = len(unique_points)
+        prev_idx_array = np.full(n_points, -1, dtype=np.int32)
+
+        # Track indices of XCCY nodes (excluding value_dt)
+        xccy_node_indices = []
+        for idx, point in enumerate(unique_points):
+            if not point['is_at_value_dt']:
+                xccy_node_indices.append(idx)
+
+        # For each XCCY node, previous node is the one before it in the list
+        for i, idx in enumerate(xccy_node_indices):
+            if i > 0:
+                prev_idx_array[idx] = xccy_node_indices[i-1]
+
+        # Convert to JAX arrays
+        n_swaps = len(self._used_swaps)
+        times_array = jnp.array([p['time'] for p in unique_points])
+        basis_spreads_array = jnp.array([p['basis_spread'] for p in unique_points])
+        swap_idx_array = jnp.array([p['swap_idx'] for p in unique_points], dtype=jnp.int32)
+        is_domestic_array = jnp.array([p['is_domestic'] for p in unique_points])
+        is_foreign_array = jnp.array([p['is_foreign'] for p in unique_points])
+        is_maturity_array = jnp.array([p['is_maturity'] for p in unique_points])
+        is_at_value_dt_array = jnp.array([p['is_at_value_dt'] for p in unique_points])
+        # New arrays for recomputing cashflows from DFs
+        year_frac_array = jnp.array([p['year_frac'] for p in unique_points])
+        notional_array = jnp.array([p['notional'] for p in unique_points])
+        start_accrual_time_array = jnp.array([p['start_accrual_time'] for p in unique_points])
+        end_accrual_time_array = jnp.array([p['end_accrual_time'] for p in unique_points])
+        is_notional_exchange_array = jnp.array([p['is_notional_exchange'] for p in unique_points])
+        is_last_payment_array = jnp.array([p['is_last_payment'] for p in unique_points])
+        spread_sensitivity_array = jnp.array([p['spread_sensitivity'] for p in unique_points])
+        df_domestic_ois_array = jnp.array([p['df_domestic_ois'] for p in unique_points])
+        df_foreign_ois_array = jnp.array([p['df_foreign_ois'] for p in unique_points])
+        prev_idx_array = jnp.array(prev_idx_array)
+        xccy_node_mask_array = jnp.array(xccy_node_mask)
+
+        # Pre-computed domestic PV for each swap (constant throughout)
+        # Map each point's swap_idx to the correct domestic PV
+        pv_domestic_by_swap_dict = {}
+        for i in range(n_swaps):
+            pv_dom = self._used_swaps[i]._domestic_leg.value(
+                value_dt=self._value_dt,
+                discount_curve=self._domestic_curve,
+                index_curve=self._domestic_curve,
+                first_fixing_rate=None
+            )
+            pv_domestic_by_swap_dict[i] = pv_dom
+
+        # Create array indexed by swap number
+        pv_domestic_by_swap = jnp.array([pv_domestic_by_swap_dict[i] for i in range(n_swaps)])
+
+        # Pre-compute mask matrix for sequential accumulation (avoids swap-indexed state)
+        # same_swap_mask[i, j] = 1 if point j belongs to same swap as point i AND j < i
+        # This enables sequential writes: state[i] = value, then sum using mask
+        same_swap_mask = np.zeros((n_points, n_points))
+        for i in range(n_points):
+            swap_i = unique_points[i]['swap_idx']
+            for j in range(i):  # Only previous points
+                swap_j = unique_points[j]['swap_idx']
+                if swap_i == swap_j:
+                    same_swap_mask[i, j] = 1.0
+        same_swap_mask_array = jnp.array(same_swap_mask)
+
+        # Get foreign OIS curve grid for interpolation (used to compute forward rates)
+        # _foreign_curve._times already starts with 0, so prepend only if needed
+        if self._foreign_curve._times[0] > 1e-10:
+            foreign_ois_times = jnp.concatenate([jnp.array([0.0]), jnp.array(self._foreign_curve._times)])
+            foreign_ois_dfs = jnp.concatenate([jnp.array([1.0]), jnp.array(self._foreign_curve._dfs)])
+        else:
+            foreign_ois_times = jnp.array(self._foreign_curve._times)
+            foreign_ois_dfs = jnp.array(self._foreign_curve._dfs)
+
+        return {
+            'n_points': n_points,
+            'n_swaps': n_swaps,
+            'times': times_array,
+            'basis_spreads': basis_spreads_array,
+            'swap_idx': swap_idx_array,
+            'is_domestic': is_domestic_array,
+            'is_foreign': is_foreign_array,
+            'is_maturity': is_maturity_array,
+            'is_at_value_dt': is_at_value_dt_array,
+            # New: data to compute cashflows from DFs (instead of pre-computed cashflows)
+            'year_fracs': year_frac_array,
+            'notionals': notional_array,
+            'start_accrual_times': start_accrual_time_array,
+            'end_accrual_times': end_accrual_time_array,
+            'is_notional_exchange': is_notional_exchange_array,
+            'is_last_payment': is_last_payment_array,
+            'spread_sensitivities': spread_sensitivity_array,
+            'df_domestic_ois': df_domestic_ois_array,
+            'df_foreign_ois': df_foreign_ois_array,  # DFs at payment times (legacy, may be unused)
+            'foreign_ois_times': foreign_ois_times,  # Full curve grid for interpolation
+            'foreign_ois_dfs': foreign_ois_dfs,  # Full curve DFs for interpolation
+            'prev_idx': prev_idx_array,
+            'xccy_node_mask': xccy_node_mask_array,
+            'unique_node_indices': jnp.array(unique_node_indices, dtype=jnp.int32),
+            'pv_domestic_by_swap': pv_domestic_by_swap,
+            'same_swap_mask': same_swap_mask_array,  # For sequential accumulation
+            'spot_fx': self._spot_fx
+        }
+
+###############################################################################
+
+    def _run_jax_bootstrap(self, payment_data):
+        """
+        Run JAX-based bootstrap with custom gradient rules.
+
+        Uses custom VJP to avoid circular dependency issues in JAX's automatic
+        differentiation through the scan-based accumulation.
+        """
+        from jax import custom_vjp
+        import jax.numpy as jnp
+
+        # Extract basis spreads (the differentiation variable)
+        basis_spreads = payment_data['basis_spreads']
+
+        # Define custom VJP wrapper
+        @custom_vjp
+        def bootstrap_curve(basis_array):
+            """Bootstrap curve - forward pass."""
+            modified_data = dict(payment_data)
+            modified_data['basis_spreads'] = basis_array
+            return self._run_jax_bootstrap_impl(modified_data)
+
+        def bootstrap_fwd(basis_array):
+            """Forward: compute curve and save data for backward."""
+            times, dfs = bootstrap_curve(basis_array)
+            # Save residuals needed for backward pass
+            residuals = (basis_array, times, dfs)
+            return (times, dfs), residuals
+
+        def bootstrap_bwd(residuals, g):
+            """
+            Backward: compute gradients w.r.t. basis spreads using analytical rules.
+
+            g = (g_times, g_dfs) where g_dfs contains gradient from downstream.
+
+            Strategy: Compute d(final_dfs)/d(basis_spreads) using chain rule:
+            - d(DF)/d(basis) via sensitivity to cashflow changes
+            - d(cashflow)/d(basis) = spread_sensitivity (pre-computed)
+            """
+            basis_array, times, dfs = residuals
+            g_times, g_dfs = g
+
+            # Extract payment data
+            n_points = payment_data['n_points']
+            spread_sens = payment_data['spread_sensitivities']
+            same_swap_mask = payment_data['same_swap_mask']
+            is_maturity = payment_data['is_maturity']
+            spot_fx = payment_data['spot_fx']
+
+            # Compute gradient using vectorized finite differences
+            # This computes the Jacobian matrix d(dfs)/d(basis) then contracts with g_dfs
+
+            # Use central differences for better accuracy
+            eps = 1e-7
+
+            def compute_perturbed_dfs_plus(i):
+                """Compute DFs with basis[i] perturbed by +eps."""
+                basis_perturbed = basis_array.at[i].add(eps)
+                modified_data_pert = dict(payment_data)
+                modified_data_pert['basis_spreads'] = basis_perturbed
+                _, dfs_pert = self._run_jax_bootstrap_impl(modified_data_pert)
+                return dfs_pert
+
+            def compute_perturbed_dfs_minus(i):
+                """Compute DFs with basis[i] perturbed by -eps."""
+                basis_perturbed = basis_array.at[i].add(-eps)
+                modified_data_pert = dict(payment_data)
+                modified_data_pert['basis_spreads'] = basis_perturbed
+                _, dfs_pert = self._run_jax_bootstrap_impl(modified_data_pert)
+                return dfs_pert
+
+            # Vectorize over all basis spread indices
+            from jax import vmap
+            n_basis = len(basis_array)
+            indices = jnp.arange(n_basis)
+
+            # Compute all perturbed DFs (this is vectorized)
+            dfs_plus_all = vmap(compute_perturbed_dfs_plus)(indices)   # Shape: [n_basis, n_dfs]
+            dfs_minus_all = vmap(compute_perturbed_dfs_minus)(indices) # Shape: [n_basis, n_dfs]
+
+            # Central difference Jacobian: d(dfs)/d(basis)
+            # Shape: [n_basis, n_dfs]
+            jacobian = (dfs_plus_all - dfs_minus_all) / (2 * eps)
+
+            # Contract with incoming gradient: g_dfs @ jacobian.T
+            # Result: gradient w.r.t. each basis spread
+            grad_basis = jnp.dot(jacobian, g_dfs)  # Shape: [n_basis]
+
+            return (grad_basis,)
+
+        # Define the custom VJP
+        bootstrap_curve.defvjp(bootstrap_fwd, bootstrap_bwd)
+
+        # Call with custom gradients
+        return bootstrap_curve(basis_spreads)
+
+###############################################################################
+
+    def _run_jax_bootstrap_impl(self, payment_data):
+        """
+        Implementation of JAX-based bootstrap (forward pass).
+
+        This contains the actual bootstrap logic using lax.scan.
+        Separated from _run_jax_bootstrap to enable custom VJP.
+        """
+        from jax import lax
+
+        n_points = payment_data['n_points']
+        n_swaps = payment_data['n_swaps']
+        times = payment_data['times']
+        basis_spreads = payment_data['basis_spreads']
+        swap_idx = payment_data['swap_idx']
+        is_maturity = payment_data['is_maturity']
+        is_at_value_dt = payment_data['is_at_value_dt']
+        spread_sensitivities = payment_data['spread_sensitivities']
+        df_foreign_ois = payment_data['df_foreign_ois']
+        prev_idx = payment_data['prev_idx']
+        xccy_node_mask = payment_data['xccy_node_mask']
+        unique_node_indices = payment_data['unique_node_indices']
+        pv_domestic_by_swap = payment_data['pv_domestic_by_swap']
+        same_swap_mask = payment_data['same_swap_mask']  # For sequential accumulation
+        spot_fx = payment_data['spot_fx']
+
+        # New fields for computing cashflows from DFs
+        year_fracs = payment_data['year_fracs']
+        notionals = payment_data['notionals']
+        start_accrual_times = payment_data['start_accrual_times']
+        end_accrual_times = payment_data['end_accrual_times']
+        is_notional_exchange = payment_data['is_notional_exchange']
+        is_last_payment = payment_data['is_last_payment']
+        foreign_ois_times = payment_data['foreign_ois_times']
+        foreign_ois_dfs_grid = payment_data['foreign_ois_dfs']
+
+        # PRE-COMPUTE interpolated DFs for all accrual times
+        # This avoids closure issues in JAX scan (closures don't backprop gradients)
+        # Interpolate all start/end accrual DFs before the scan
+        df_start_accrual_array = jnp.interp(start_accrual_times, foreign_ois_times, foreign_ois_dfs_grid)
+        df_end_accrual_array = jnp.interp(end_accrual_times, foreign_ois_times, foreign_ois_dfs_grid)
+
+        def step(state, inputs):
+            """
+            Bootstrap one point in the XCCY curve using SEQUENTIAL INDEXING ONLY.
+
+            State tracks (all point-indexed, written sequentially):
+            - xccy_dfs: Discount factors at each point [n_points]
+            - pv_contributions: PV contribution at each point [n_points]
+            - cf_contributions: Cashflow contribution at each point [n_points]
+
+            At each point idx:
+            1. Compute intermediate XCCY DF using flat forward basis
+            2. Store PV contribution at this point: state[idx] = value (sequential write)
+            3. If maturity: sum all previous contributions using pre-computed mask
+            4. Solve par condition if at maturity point
+
+            This avoids swap-indexed arrays (which cause circular dependencies in gradients).
+            """
+            (idx, time, basis, prev_idx_i, is_mat, is_val_dt, spread_sens, df_ois, swap_i, mask_row,
+             year_frac, notional, is_notl_exch, is_last_pmt, df_start_accrual, df_end_accrual) = inputs
+
+            # Compute cashflow dynamically from foreign OIS DFs
+            # This enables gradients to flow through foreign_ois_dfs_grid -> forward rates -> cashflows
+
+            # For notional exchanges: cashflow = notional (no dependency on rates)
+            # For interest payments: compute forward rate from DFs
+            def compute_interest_cashflow():
+                # Use pre-computed interpolated DFs (passed as scan inputs for gradient flow)
+                df_start = df_start_accrual
+                df_end = df_end_accrual
+
+                # Compute forward rate: fwd = (DF_start / DF_end - 1) / year_frac
+                # Use jnp.maximum to avoid division by zero (jnp.where evaluates both branches)
+                # For year_frac=0 (notional exchanges), this branch won't be selected anyway
+                year_frac_safe = jnp.maximum(year_frac, 1e-10)
+                fwd_rate = (df_start / df_end - 1.0) / year_frac_safe
+
+                # Zero out forward rate for notional exchanges (year_frac ~ 0)
+                fwd_rate = jnp.where(year_frac > 1e-10, fwd_rate, 0.0)
+
+                # Base interest payment (forward_rate only, NO spread yet)
+                # The spread will be added separately via spread_sens
+                base_interest = fwd_rate * year_frac * notional
+
+                # If last payment, add notional return
+                return jnp.where(is_last_pmt, base_interest + notional, base_interest)
+
+            # Select between notional exchange and interest payment
+            # For notional exchanges: at effective_dt (t=0), we RECEIVE notional (negative for PAY leg)
+            # at maturity, we RETURN notional (handled by is_last_payment flag above)
+            # Since effective_dt notional exchange has year_frac=0 and is_last_payment=False,
+            # we need to use -notional for initial exchange
+            notional_exchange_cf = jnp.where(is_last_pmt, notional, -notional)
+            base_cashflow = jnp.where(is_notl_exch, notional_exchange_cf, compute_interest_cashflow())
+
+            # Add basis spread component (for basis spread AD)
+            # spread_sens = year_frac * notional for interest payments, 0 for notional exchanges
+            cashflow = base_cashflow + basis * spread_sens
+
+            # Get previous XCCY DF and time for flat forward basis formula
+            prev_df = jnp.where(prev_idx_i < 0, 1.0, state['xccy_dfs'][prev_idx_i])
+            prev_time = jnp.where(prev_idx_i < 0, 0.0, times[prev_idx_i])
+            prev_df_ois = jnp.where(prev_idx_i < 0, 1.0, df_foreign_ois[prev_idx_i])
+
+            # Compute intermediate XCCY DF using flat forward basis
+            is_first = (prev_idx_i < 0)
+
+            # First pillar: DF_xccy(t) = DF_ois(t) * exp(-basis * t)
+            df_first = df_ois * jnp.exp(-basis * time)
+
+            # Subsequent: DF_xccy(t) = DF_xccy(t_prev) * [DF_ois(t)/DF_ois(t_prev)] * exp(-basis * dt)
+            dt_delta = time - prev_time
+            df_subsequent = prev_df * (df_ois / prev_df_ois) * jnp.exp(-basis * dt_delta)
+
+            df_intermediate = jnp.where(is_first, df_first, df_subsequent)
+
+            # Compute PV contribution at THIS point (sequential write to idx)
+            # PV contribution for non-maturity, non-value_dt points
+            is_known = (~is_mat) & (~is_val_dt)
+            pv_contrib = jnp.where(is_known, cashflow * df_intermediate, 0.0)
+
+            # PV contribution at value_dt (DF = 1.0)
+            pv_at_val_dt_contrib = jnp.where(is_val_dt, cashflow * 1.0, 0.0)
+
+            # Total PV contribution at this point
+            total_pv_contribution = pv_contrib + pv_at_val_dt_contrib
+
+            # Store PV contribution at THIS index (sequential write)
+            new_pv_contributions = state['pv_contributions'].at[idx].set(total_pv_contribution)
+
+            # Compute cashflow contribution at THIS point
+            cf_contribution = jnp.where(is_mat, cashflow, 0.0)
+
+            # Store cashflow contribution at THIS index (sequential write)
+            new_cf_contributions = state['cf_contributions'].at[idx].set(cf_contribution)
+
+            # If maturity point: sum all previous contributions for this swap
+            # mask_row is pre-computed and passed as input (avoids dynamic indexing)
+            # Shape: [n_points], with 1.0 for points in same swap (j < idx), 0.0 otherwise
+
+            # Sum contributions for this swap (mask zeros out other swaps)
+            pv_sum_prev = jnp.dot(mask_row, state['pv_contributions'])
+            cf_sum_prev = jnp.dot(mask_row, state['cf_contributions'])
+
+            # Total includes current contribution
+            pv_foreign_known = pv_sum_prev + total_pv_contribution
+            cf_at_maturity = cf_sum_prev + cf_contribution
+
+            # Apply PAY/RECEIVE sign for foreign leg (all foreign legs are PAY type)
+            foreign_sign = -1.0
+            pv_foreign_known_signed = pv_foreign_known * foreign_sign
+            cf_at_maturity_signed = cf_at_maturity * foreign_sign
+
+            # Solve par condition if this is a maturity point
+            # Par: PV_domestic + spot_fx * (PV_foreign_known + cf_last * DF_xccy) = 0
+            # Solve: DF_xccy = -(PV_domestic + spot_fx * PV_foreign_known) / (spot_fx * cf_last)
+            pv_dom = pv_domestic_by_swap[swap_i]
+            numerator = -(pv_dom + spot_fx * pv_foreign_known_signed)
+            denominator = spot_fx * cf_at_maturity_signed
+
+            # Compute DF from par condition (with safety check)
+            # Use jnp.maximum to avoid division by zero (jnp.where evaluates both branches)
+            denominator_safe = jnp.where(
+                jnp.abs(denominator) > 1e-12,
+                denominator,
+                jnp.where(denominator >= 0, 1e-12, -1e-12)  # Keep sign
+            )
+            df_from_par = numerator / denominator_safe
+
+            # Only use par solution if denominator is large enough
+            df_from_par = jnp.where(
+                jnp.abs(denominator) > 1e-12,
+                df_from_par,
+                df_intermediate
+            )
+
+            # Use par solution if at maturity, otherwise use intermediate DF
+            df_final = jnp.where(is_mat, df_from_par, df_intermediate)
+
+            # Update state (all sequential writes to index idx)
+            new_xccy_dfs = state['xccy_dfs'].at[idx].set(df_final)
+            new_state = {
+                'xccy_dfs': new_xccy_dfs,
+                'pv_contributions': new_pv_contributions,
+                'cf_contributions': new_cf_contributions
+            }
+
+            return new_state, df_final
+
+        # Initialize state (all point-indexed for sequential writes)
+        init_state = {
+            'xccy_dfs': jnp.zeros(n_points),
+            'pv_contributions': jnp.zeros(n_points),  # PV contribution at each point
+            'cf_contributions': jnp.zeros(n_points)   # CF contribution at each point
+        }
+
+        # Prepare scan inputs
+        idxs = jnp.arange(n_points)
+        scan_inputs = (
+            idxs,
+            times,
+            basis_spreads,
+            prev_idx,
+            is_maturity,
+            is_at_value_dt,
+            spread_sensitivities,
+            df_foreign_ois,
+            swap_idx,
+            same_swap_mask,  # Pass mask as input to avoid dynamic indexing
+            year_fracs,
+            notionals,
+            is_notional_exchange,
+            is_last_payment,
+            df_start_accrual_array,  # Pre-computed interpolated DFs for gradient flow
+            df_end_accrual_array     # Pre-computed interpolated DFs for gradient flow
+        )
+
+        # Run scan - this is the pure JAX operation
+        final_state, all_dfs = lax.scan(step, init_state, scan_inputs)
+
+        # Filter to only XCCY curve nodes (exclude value_dt point)
+        filtered_times = times[xccy_node_mask]
+        filtered_dfs = all_dfs[xccy_node_mask]
+
+        # Deduplicate by time (keep first occurrence of each unique time)
+        # Use pre-computed indices from _prepare_ad_inputs to avoid jnp.unique
+        # which is non-differentiable and causes gradient NaN
+        unique_times = filtered_times[unique_node_indices]
+        unique_dfs = filtered_dfs[unique_node_indices]
+
+        # Prepend t=0, DF=1.0
+        final_times = jnp.concatenate([jnp.array([0.0]), unique_times])
+        final_dfs = jnp.concatenate([jnp.array([1.0]), unique_dfs])
+
+        return final_times, final_dfs
 
 ###############################################################################
 
