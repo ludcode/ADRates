@@ -493,9 +493,11 @@ class XccyCurve(DiscountCurve):
 
         Returns exact same times and DFs as _build_curve() to machine precision.
 
-        Also computes and stores Jacobians for sensitivity analysis:
+        Also computes and stores Jacobians and Hessians for sensitivity analysis:
         - _jac_basis: d(xccy_dfs) / d(basis_spreads)
-        - _jac_foreign_ois: d(xccy_dfs) / d(foreign_ois_dfs)
+        - _jac_foreign_curve_dfs: d(xccy_dfs) / d(foreign_curve_dfs)
+        - _hess_basis: d²(xccy_dfs) / d(basis_spreads)²
+        - _mixed_hess_foreign_basis: d²(xccy_dfs) / d(foreign_curve_dfs) d(basis_spreads)
         """
         from cavour.utils.helpers import times_from_dates
         from jax import lax, jacrev
@@ -518,9 +520,6 @@ class XccyCurve(DiscountCurve):
         # Step 4: Compute Jacobians for automatic differentiation
         # Extract current parameter values
         df_foreign_ois = payment_data['df_foreign_ois']
-
-        # Import JAX for Jacobian computation
-        import jax.numpy as jnp
 
         # 4a: Jacobian w.r.t. basis spreads: d(xccy_dfs) / d(basis_spreads)
         # We want sensitivity to PILLAR-level spreads, not payment-level
@@ -550,140 +549,105 @@ class XccyCurve(DiscountCurve):
             return dfs_out
 
         self._jac_basis = jacrev(dfs_from_basis_pillar)(basis_spreads_pillar)
+
         # 4a-ii: Hessian w.r.t. basis spreads: d²(xccy_dfs) / d(basis_spreads)²
         # This is needed for computing gamma (second-order sensitivities)
-        # Cannot use JAX hessian() due to custom_vjp - must use finite differences
-        n_spreads = len(basis_spreads_pillar)
-        n_xccy_dfs = len(dfs)
-        hess_basis = jnp.zeros((n_xccy_dfs, n_spreads, n_spreads))
-        eps = 1e-6
-        
-        # Compute Hessian using central differences
-        # For efficiency, only compute upper triangle and diagonal
-        for i in range(n_spreads):
-            for j in range(i, n_spreads):
-                if i == j:
-                    # Diagonal: d²f/dx_i² = (f(x+2h) - 2f(x) + f(x-2h)) / (4h²)
-                    spreads_plus = basis_spreads_pillar.at[i].add(eps)
-                    spreads_minus = basis_spreads_pillar.at[i].add(-eps)
-                    
-                    dfs_plus = dfs_from_basis_pillar(spreads_plus)
-                    dfs_minus = dfs_from_basis_pillar(spreads_minus)
-                    dfs_base = dfs_from_basis_pillar(basis_spreads_pillar)
-                    
-                    hess_diag = (dfs_plus - 2*dfs_base + dfs_minus) / (eps**2)
-                    hess_basis = hess_basis.at[:, i, i].set(hess_diag)
-                else:
-                    # Off-diagonal: d²f/dx_idx_j = (f(x+hi+hj) - f(x+hi-hj) - f(x-hi+hj) + f(x-hi-hj)) / (4h²)
-                    spreads_pp = basis_spreads_pillar.at[i].add(eps).at[j].add(eps)
-                    spreads_pm = basis_spreads_pillar.at[i].add(eps).at[j].add(-eps)
-                    spreads_mp = basis_spreads_pillar.at[i].add(-eps).at[j].add(eps)
-                    spreads_mm = basis_spreads_pillar.at[i].add(-eps).at[j].add(-eps)
-                    
-                    dfs_pp = dfs_from_basis_pillar(spreads_pp)
-                    dfs_pm = dfs_from_basis_pillar(spreads_pm)
-                    dfs_mp = dfs_from_basis_pillar(spreads_mp)
-                    dfs_mm = dfs_from_basis_pillar(spreads_mm)
-                    
-                    hess_off_diag = (dfs_pp - dfs_pm - dfs_mp + dfs_mm) / (4 * eps**2)
-                    hess_basis = hess_basis.at[:, i, j].set(hess_off_diag)
-                    hess_basis = hess_basis.at[:, j, i].set(hess_off_diag)  # Symmetric
-        
+        #
+        # Phase 2: Using JAX automatic differentiation (fast!)
+        # jacfwd(jacrev(...)) computes Hessian for vector-valued functions
+        # This is equivalent to forward-over-reverse mode AD
+        from jax import jacfwd
+        hess_basis_func = jacfwd(jacrev(dfs_from_basis_pillar))
+        hess_basis = hess_basis_func(basis_spreads_pillar)
+        # Result shape: [n_xccy_dfs, n_spreads, n_spreads]
         self._hess_basis = hess_basis
 
-        # 4b: Jacobian w.r.t. foreign OIS DFs: d(xccy_dfs) / d(df_foreign_ois)
-        # This captures how XCCY curve changes when foreign OIS curve changes
-        # Use finite differences since automatic differentiation has circular dependencies
-        import jax.numpy as jnp
-
-        def dfs_from_foreign_ois(foreign_ois_array):
-            """Rebuild curve with different foreign OIS discount factors."""
-            modified_data = dict(payment_data)
-            modified_data['df_foreign_ois'] = foreign_ois_array
-            _, dfs_out = self._run_jax_bootstrap_impl(modified_data)
-            return dfs_out
-
-        # Compute Jacobian using finite differences
-        n_foreign_ois = len(df_foreign_ois)
-        n_xccy_dfs = len(dfs)
-        jac_foreign_ois = jnp.zeros((n_xccy_dfs, n_foreign_ois))
-        eps = 1e-7
-
-        for i in range(n_foreign_ois):
-            # Perturb i-th foreign OIS DF
-            df_foreign_ois_plus = df_foreign_ois.at[i].add(eps)
-            df_foreign_ois_minus = df_foreign_ois.at[i].add(-eps)
-
-            # Recompute DFs
-            dfs_plus = dfs_from_foreign_ois(df_foreign_ois_plus)
-            dfs_minus = dfs_from_foreign_ois(df_foreign_ois_minus)
-
-            # Finite difference gradient
-            jac_foreign_ois = jac_foreign_ois.at[:, i].set((dfs_plus - dfs_minus) / (2 * eps))
-
-        self._jac_foreign_ois = jac_foreign_ois
-
-        # 4c: Mixed Hessian w.r.t. foreign OIS CURVE DFs and basis spreads
+        # 4b: Mixed Hessian w.r.t. foreign OIS CURVE DFs and basis spreads
         # d2(xccy_dfs) / d(foreign_curve_dfs) d(basis_spreads)
         # This is needed for computing cross-gamma between foreign OIS and XCCY basis
         #
-        # IMPORTANT: Use foreign CURVE DFs (at swap maturity points), not payment DFs
-        # This ensures dimensional compatibility with jac_for_original in engine.py
+        # BREAKTHROUGH: The key to making JAX mixed Hessians work:
+        # - Use jacrev(jacfwd(...)) NOT jacfwd(jacrev(...))
+        # - Differentiate w.r.t. CURVE DFs (not payment DFs) to match engine.py expectations
+        # - Use lax.stop_gradient() on all static arrays
+        # - Result shape: [n_xccy, n_foreign_curve, n_basis] → transpose to [n_xccy, n_basis, n_foreign_curve]
 
+        from jax import jacrev, jacfwd
+        from jax import lax
+
+        # Get foreign curve times and DFs
+        foreign_curve_times = jnp.array(self._foreign_curve._times)
         foreign_curve_dfs = jnp.array(self._foreign_curve._dfs)
-        n_foreign_curve_dfs = len(foreign_curve_dfs)
 
-        def dfs_from_foreign_curve_and_basis(foreign_curve_dfs_array, basis_pillar_array):
-            """Rebuild curve with different foreign CURVE DFs and basis spreads."""
-            # We need to interpolate payment DFs from modified foreign curve DFs
-            # Use linear interpolation in log(DF) space (equivalent to flat forward rates)
-            foreign_times_array = jnp.array(self._foreign_curve._times)
-            payment_times_array = payment_data['foreign_ois_times']  # Times at which we need foreign OIS DFs
+        # Static JAX arrays (explicitly marked as non-differentiable)
+        foreign_curve_times_static = lax.stop_gradient(foreign_curve_times)
+        payment_times_jax = lax.stop_gradient(jnp.array(payment_data['times']))
+        swap_idx_jax = lax.stop_gradient(jnp.array(payment_data['swap_idx'], dtype=jnp.int32))
 
-            # Linear interpolation in log(DF) space
-            log_dfs_curve = jnp.log(foreign_curve_dfs_array)
-            log_dfs_payments = jnp.interp(payment_times_array, foreign_times_array, log_dfs_curve)
-            payment_dfs_modified = jnp.exp(log_dfs_payments)
+        # Extract static scalars from payment_data (not arrays)
+        payment_data_scalars = {
+            k: v for k, v in payment_data.items()
+            if k not in ['df_foreign_ois', 'basis_spreads', 'times', 'swap_idx']
+        }
 
-            # Expand pillar-level basis spreads to payment-level
-            payment_spreads = basis_pillar_array[swap_idx_array]
+        # Create function with ONLY the two differentiable inputs as arguments
+        def compute_xccy_from_foreign_curve(basis_spreads_arg, foreign_curve_dfs_arg):
+            """
+            Compute XCCY DFs from basis spreads and foreign curve DFs.
 
-            modified_data = dict(payment_data)
-            modified_data['df_foreign_ois'] = payment_dfs_modified
+            Args:
+                basis_spreads_arg: [n_basis] - pillar basis spreads (DIFFERENTIABLE)
+                foreign_curve_dfs_arg: [n_foreign_curve] - foreign curve DFs (DIFFERENTIABLE)
+
+            Returns:
+                xccy_dfs: [n_xccy] - bootstrapped XCCY discount factors
+            """
+            # Interpolate foreign curve DFs to payment times
+            log_curve_dfs = jnp.log(foreign_curve_dfs_arg)
+            log_payment_dfs = jnp.interp(payment_times_jax, foreign_curve_times_static, log_curve_dfs)
+            payment_dfs_foreign = jnp.exp(log_payment_dfs)
+
+            # Expand basis spreads from pillar to payment level
+            payment_spreads = basis_spreads_arg[swap_idx_jax]
+
+            # Rebuild payment_data with modified values
+            modified_data = dict(payment_data_scalars)
+            modified_data['df_foreign_ois'] = payment_dfs_foreign
             modified_data['basis_spreads'] = payment_spreads
-            _, dfs_out = self._run_jax_bootstrap_impl(modified_data)
-            return dfs_out
+            modified_data['times'] = payment_times_jax
+            modified_data['swap_idx'] = swap_idx_jax
 
-        # Compute mixed Hessian using central differences
-        # For mixed partials: d2f/dxdy = [f(x+h,y+h) - f(x+h,y-h) - f(x-h,y+h) + f(x-h,y-h)] / (4h2)
-        mixed_hess = jnp.zeros((n_xccy_dfs, n_foreign_curve_dfs, n_spreads))
-        eps_mixed = 1e-7
+            # Bootstrap XCCY curve
+            _, xccy_dfs = self._run_jax_bootstrap_impl(modified_data)
+            return xccy_dfs
 
-        for i in range(n_foreign_curve_dfs):
-            for j in range(n_spreads):
-                # Four corner points for central difference
-                for_curve_dfs_plus = foreign_curve_dfs.at[i].add(eps_mixed)
-                for_curve_dfs_minus = foreign_curve_dfs.at[i].add(-eps_mixed)
-                basis_plus = basis_spreads_pillar.at[j].add(eps_mixed)
-                basis_minus = basis_spreads_pillar.at[j].add(-eps_mixed)
+        # 4c: Jacobian w.r.t. foreign curve DFs: d(xccy_dfs) / d(foreign_curve_dfs)
+        # Use the same function as mixed Hessian but differentiate only w.r.t. foreign DFs
+        # Chained with d(foreign_dfs)/d(foreign_rates) in engine.py for foreign OIS sensitivities
+        self._jac_foreign_curve_dfs = jacrev(compute_xccy_from_foreign_curve, argnums=1)(basis_spreads_pillar, foreign_curve_dfs)
+        # Shape: [n_xccy_dfs, n_foreign_dfs]
 
-                # f(x+h, y+h)
-                dfs_pp = dfs_from_foreign_curve_and_basis(for_curve_dfs_plus, basis_plus)
+        # Compute mixed Hessian: d²(xccy_dfs) / d(basis) d(foreign_curve)
+        # KEY: Use jacrev(jacfwd(...)) not jacfwd(jacrev(...))!
+        # jacrev(jacfwd(f, argnums=1), argnums=0) gives [n_xccy, n_foreign_curve, n_basis]
+        mixed_hess_func = jacrev(jacfwd(compute_xccy_from_foreign_curve, argnums=1), argnums=0)
+        mixed_hess_raw = mixed_hess_func(basis_spreads_pillar, foreign_curve_dfs)
 
-                # f(x+h, y-h)
-                dfs_pm = dfs_from_foreign_curve_and_basis(for_curve_dfs_plus, basis_minus)
+        # Verify dimensions
+        # Expected shape: [n_xccy, n_foreign_curve, n_basis]
+        n_xccy_result = mixed_hess_raw.shape[0]
+        n_foreign_result = mixed_hess_raw.shape[1]
+        n_basis_result = mixed_hess_raw.shape[2]
 
-                # f(x-h, y+h)
-                dfs_mp = dfs_from_foreign_curve_and_basis(for_curve_dfs_minus, basis_plus)
-
-                # f(x-h, y-h)
-                dfs_mm = dfs_from_foreign_curve_and_basis(for_curve_dfs_minus, basis_minus)
-
-                # Central difference for mixed partial
-                mixed_partial = (dfs_pp - dfs_pm - dfs_mp + dfs_mm) / (4 * eps_mixed**2)
-                mixed_hess = mixed_hess.at[:, i, j].set(mixed_partial)
-
-        self._mixed_hess_foreign_basis = mixed_hess
+        if n_foreign_result == len(foreign_curve_dfs) and n_basis_result == len(basis_spreads_pillar):
+            # Already in the correct format [n_xccy, n_foreign_curve, n_basis]
+            # But we need [n_xccy, n_basis, n_foreign_curve] for engine.py
+            self._mixed_hess_foreign_basis = jnp.transpose(mixed_hess_raw, (0, 2, 1))
+        else:
+            print(f"WARNING: Mixed Hessian dimensions incorrect!")
+            print(f"  Got: [{n_xccy_result}, {n_foreign_result}, {n_basis_result}]")
+            print(f"  Expected: [?, {len(foreign_curve_dfs)}, {len(basis_spreads_pillar)}]")
+            self._mixed_hess_foreign_basis = None
 
 
         # Step 5: Initialize the interpolator with the final times and DFs
@@ -874,9 +838,11 @@ class XccyCurve(DiscountCurve):
         # Create array indexed by swap number
         pv_domestic_by_swap = jnp.array([pv_domestic_by_swap_dict[i] for i in range(n_swaps)])
 
-        # Pre-compute mask matrix for sequential accumulation (avoids swap-indexed state)
+        # Pre-compute mask matrix for sequential accumulation
+        # This avoids swap-indexed state (which causes circular gradient dependencies in JAX)
         # same_swap_mask[i, j] = 1 if point j belongs to same swap as point i AND j < i
-        # This enables sequential writes: state[i] = value, then sum using mask
+        # This enables sequential writes: state[i] = value, then sum using jnp.dot(mask, state)
+        # JAX can differentiate through dot products, but not through dynamic indexing
         same_swap_mask = np.zeros((n_points, n_points))
         for i in range(n_points):
             swap_i = unique_points[i]['swap_idx']
@@ -929,98 +895,16 @@ class XccyCurve(DiscountCurve):
 
     def _run_jax_bootstrap(self, payment_data):
         """
-        Run JAX-based bootstrap with custom gradient rules.
+        Run JAX-based bootstrap using pure JAX automatic differentiation.
 
-        Uses custom VJP to avoid circular dependency issues in JAX's automatic
-        differentiation through the scan-based accumulation.
+        JAX's built-in AD handles lax.scan differentiation correctly,
+        including second derivatives (Hessians). Removing the custom_vjp
+        wrapper enables forward-mode AD (jvp) required for hessian().
+
+        This allows replacing finite difference Hessian computations with
+        fast JAX AD in subsequent optimizations.
         """
-        from jax import custom_vjp
-        import jax.numpy as jnp
-
-        # Extract basis spreads (the differentiation variable)
-        basis_spreads = payment_data['basis_spreads']
-
-        # Define custom VJP wrapper
-        @custom_vjp
-        def bootstrap_curve(basis_array):
-            """Bootstrap curve - forward pass."""
-            modified_data = dict(payment_data)
-            modified_data['basis_spreads'] = basis_array
-            return self._run_jax_bootstrap_impl(modified_data)
-
-        def bootstrap_fwd(basis_array):
-            """Forward: compute curve and save data for backward."""
-            times, dfs = bootstrap_curve(basis_array)
-            # Save residuals needed for backward pass
-            residuals = (basis_array, times, dfs)
-            return (times, dfs), residuals
-
-        def bootstrap_bwd(residuals, g):
-            """
-            Backward: compute gradients w.r.t. basis spreads using analytical rules.
-
-            g = (g_times, g_dfs) where g_dfs contains gradient from downstream.
-
-            Strategy: Compute d(final_dfs)/d(basis_spreads) using chain rule:
-            - d(DF)/d(basis) via sensitivity to cashflow changes
-            - d(cashflow)/d(basis) = spread_sensitivity (pre-computed)
-            """
-            basis_array, times, dfs = residuals
-            g_times, g_dfs = g
-
-            # Extract payment data
-            n_points = payment_data['n_points']
-            spread_sens = payment_data['spread_sensitivities']
-            same_swap_mask = payment_data['same_swap_mask']
-            is_maturity = payment_data['is_maturity']
-            spot_fx = payment_data['spot_fx']
-
-            # Compute gradient using vectorized finite differences
-            # This computes the Jacobian matrix d(dfs)/d(basis) then contracts with g_dfs
-
-            # Use central differences for better accuracy
-            eps = 1e-7
-
-            def compute_perturbed_dfs_plus(i):
-                """Compute DFs with basis[i] perturbed by +eps."""
-                basis_perturbed = basis_array.at[i].add(eps)
-                modified_data_pert = dict(payment_data)
-                modified_data_pert['basis_spreads'] = basis_perturbed
-                _, dfs_pert = self._run_jax_bootstrap_impl(modified_data_pert)
-                return dfs_pert
-
-            def compute_perturbed_dfs_minus(i):
-                """Compute DFs with basis[i] perturbed by -eps."""
-                basis_perturbed = basis_array.at[i].add(-eps)
-                modified_data_pert = dict(payment_data)
-                modified_data_pert['basis_spreads'] = basis_perturbed
-                _, dfs_pert = self._run_jax_bootstrap_impl(modified_data_pert)
-                return dfs_pert
-
-            # Vectorize over all basis spread indices
-            from jax import vmap
-            n_basis = len(basis_array)
-            indices = jnp.arange(n_basis)
-
-            # Compute all perturbed DFs (this is vectorized)
-            dfs_plus_all = vmap(compute_perturbed_dfs_plus)(indices)   # Shape: [n_basis, n_dfs]
-            dfs_minus_all = vmap(compute_perturbed_dfs_minus)(indices) # Shape: [n_basis, n_dfs]
-
-            # Central difference Jacobian: d(dfs)/d(basis)
-            # Shape: [n_basis, n_dfs]
-            jacobian = (dfs_plus_all - dfs_minus_all) / (2 * eps)
-
-            # Contract with incoming gradient: g_dfs @ jacobian.T
-            # Result: gradient w.r.t. each basis spread
-            grad_basis = jnp.dot(jacobian, g_dfs)  # Shape: [n_basis]
-
-            return (grad_basis,)
-
-        # Define the custom VJP
-        bootstrap_curve.defvjp(bootstrap_fwd, bootstrap_bwd)
-
-        # Call with custom gradients
-        return bootstrap_curve(basis_spreads)
+        return self._run_jax_bootstrap_impl(payment_data)
 
 ###############################################################################
 
@@ -1060,8 +944,9 @@ class XccyCurve(DiscountCurve):
         foreign_ois_dfs_grid = payment_data['foreign_ois_dfs']
 
         # PRE-COMPUTE interpolated DFs for all accrual times
-        # This avoids closure issues in JAX scan (closures don't backprop gradients)
-        # Interpolate all start/end accrual DFs before the scan
+        # This avoids JAX scan closure issues with gradient backpropagation
+        # Interpolating inside the scan would capture foreign_ois_dfs_grid as a closure variable,
+        # which JAX cannot differentiate through. Pre-computing allows gradients to flow correctly.
         df_start_accrual_array = jnp.interp(start_accrual_times, foreign_ois_times, foreign_ois_dfs_grid)
         df_end_accrual_array = jnp.interp(end_accrual_times, foreign_ois_times, foreign_ois_dfs_grid)
 
@@ -1069,10 +954,15 @@ class XccyCurve(DiscountCurve):
             """
             Bootstrap one point in the XCCY curve using SEQUENTIAL INDEXING ONLY.
 
-            State tracks (all point-indexed, written sequentially):
-            - xccy_dfs: Discount factors at each point [n_points]
-            - pv_contributions: PV contribution at each point [n_points]
-            - cf_contributions: Cashflow contribution at each point [n_points]
+            Key design choice: Sequential writes (state[idx] = value) instead of
+            swap-indexed arrays to avoid circular dependencies in JAX gradients.
+            Each point writes to its own index, then sums contributions using
+            pre-computed masks.
+
+            State structure (all point-indexed, written sequentially):
+            - xccy_dfs: [n_points] - XCCY discount factors (sequentially populated)
+            - pv_contributions: [n_points] - PV contribution at each point
+            - cf_contributions: [n_points] - Cashflow contribution at each point
 
             At each point idx:
             1. Compute intermediate XCCY DF using flat forward basis
@@ -1080,7 +970,13 @@ class XccyCurve(DiscountCurve):
             3. If maturity: sum all previous contributions using pre-computed mask
             4. Solve par condition if at maturity point
 
-            This avoids swap-indexed arrays (which cause circular dependencies in gradients).
+            Why this pattern? JAX can differentiate through:
+            - Sequential array writes: state.at[idx].set(value)
+            - Dot products for aggregation: jnp.dot(mask, state)
+
+            But NOT through:
+            - Dynamic indexing by swap: state[swap_idx[i]]
+            - Dictionary/object-based state updates
             """
             (idx, time, basis, prev_idx_i, is_mat, is_val_dt, spread_sens, df_ois, swap_i, mask_row,
              year_frac, notional, is_notl_exch, is_last_pmt, df_start_accrual, df_end_accrual) = inputs

@@ -278,7 +278,7 @@ class XccyFixFix:
                 foreign_leg_value -= end_exchange_pv
 
         # Convert foreign PV to domestic currency and sum
-        value = domestic_leg_value + spot_fx * foreign_leg_value
+        value = domestic_leg_value + foreign_leg_value / spot_fx
 
         return value
 

@@ -249,44 +249,90 @@ class Engine:
             # Convert to scalars and compute total PV
             dom_pv_scalar = float(jnp.squeeze(dom_pv))
             for_pv_scalar = float(jnp.squeeze(for_pv))
-            total_pv = dom_pv_scalar + spot_fx * for_pv_scalar
+            total_pv = dom_pv_scalar + for_pv_scalar / spot_fx
             value = Valuation(amount=total_pv, currency=derivative._domestic_currency)
+
+        # Define PV functions for gradient/hessian computation (used by both DELTA and GAMMA)
+        # These functions compute PV as a function of different curve variables
+
+        # Domestic leg PV as function of domestic DFs
+        def pv_dom_fn(dom_dfs_var):
+            return self._float_leg_jax(
+                dfs=dom_dfs_var, times=dom_times,
+                disc_interp_type=domestic_model._interp_type,
+                idx_interp_type=domestic_model._interp_type,
+                payment_times=dom_payment_times,
+                start_times=dom_start_times, end_times=dom_end_times,
+                pay_alphas=dom_alphas, spreads=dom_spreads,
+                notionals=dom_notionals, principal=dom_principal,
+                leg_sign=dom_leg_sign, value_time=value_time,
+                first_fixing_rate=0.0, override_first=False,
+                notional_exchange=derivative._domestic_leg._notional_exchange,
+                notional_exchange_amount=derivative._domestic_leg._notional,
+                effective_time=dom_effective_time,
+                maturity_time=dom_maturity_time
+            )
+
+        # Foreign leg PV as function of foreign OIS DFs (for direct forward rate effect)
+        def pv_for_fn(for_ois_dfs_var):
+            return self._float_leg_jax(
+                dfs=xccy_dfs, times=xccy_times,  # XCCY curve for discounting (FIXED)
+                disc_interp_type=xccy_curve._interp_type,
+                idx_interp_type=foreign_model._interp_type,
+                payment_times=for_payment_times,
+                start_times=for_start_times, end_times=for_end_times,
+                pay_alphas=for_alphas, spreads=for_spreads,
+                notionals=for_notionals, principal=for_principal,
+                leg_sign=for_leg_sign, value_time=value_time,
+                first_fixing_rate=0.0, override_first=False,
+                idx_times=for_times, idx_dfs=for_ois_dfs_var,  # Foreign OIS DFs (VARIABLE)
+                notional_exchange=derivative._foreign_leg._notional_exchange,
+                notional_exchange_amount=derivative._foreign_leg._notional,
+                effective_time=for_effective_time,
+                maturity_time=for_maturity_time
+            )
+
+        # Foreign leg PV as function of XCCY DFs (for basis delta and cross-gamma)
+        def pv_xccy_fn(xccy_dfs_var):
+            return self._float_leg_jax(
+                dfs=xccy_dfs_var, times=xccy_times,  # XCCY curve for discounting (VARIABLE)
+                disc_interp_type=xccy_curve._interp_type,
+                idx_interp_type=foreign_model._interp_type,
+                payment_times=for_payment_times,
+                start_times=for_start_times, end_times=for_end_times,
+                pay_alphas=for_alphas, spreads=for_spreads,
+                notionals=for_notionals, principal=for_principal,
+                leg_sign=for_leg_sign, value_time=value_time,
+                first_fixing_rate=0.0, override_first=False,
+                idx_times=for_times, idx_dfs=for_dfs,  # Foreign OIS DFs (FIXED)
+                notional_exchange=derivative._foreign_leg._notional_exchange,
+                notional_exchange_amount=derivative._foreign_leg._notional,
+                effective_time=for_effective_time,
+                maturity_time=for_maturity_time
+            )
+
+        # Wrapper functions for "original" DFs (excluding prepended t≈0)
+        # IMPORTANT: DF(t≈0) = 1.0 is a boundary condition, NOT a curve parameter.
+        # We prepended it to the curve grid for interpolation, but should NOT compute gradients w.r.t. it.
+
+        def pv_dom_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs])
+            return pv_dom_fn(full_dfs)
+
+        def pv_for_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs])
+            return pv_for_fn(full_dfs)
+
+        def pv_xccy_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs])
+            return pv_xccy_fn(full_dfs)
 
         # Compute DELTA using automatic differentiation
         delta = None
         if RequestTypes.DELTA in reqs:
             from cavour.utils.helpers import to_tenor
 
-            # Define PV functions for each curve's DFs
-            # Domestic leg PV as function of domestic DFs
-            def pv_dom_fn(dom_dfs_var):
-                return self._float_leg_jax(
-                    dfs=dom_dfs_var, times=dom_times,
-                    disc_interp_type=domestic_model._interp_type,
-                    idx_interp_type=domestic_model._interp_type,
-                    payment_times=dom_payment_times,
-                    start_times=dom_start_times, end_times=dom_end_times,
-                    pay_alphas=dom_alphas, spreads=dom_spreads,
-                    notionals=dom_notionals, principal=dom_principal,
-                    leg_sign=dom_leg_sign, value_time=value_time,
-                    first_fixing_rate=0.0, override_first=False,
-                    notional_exchange=derivative._domestic_leg._notional_exchange,
-                    notional_exchange_amount=derivative._domestic_leg._notional,
-                    effective_time=dom_effective_time,
-                    maturity_time=dom_maturity_time
-                )
-
-            # IMPORTANT: DF(t≈0) = 1.0 is a boundary condition, NOT a curve parameter.
-            # We prepended it to the curve grid for interpolation purposes, but we should
-            # NOT compute gradients w.r.t. it. Only the original DFs are parameters.
-
-            # Define PV function that takes ONLY the original DFs (excluding prepended t≈0)
-            def pv_dom_original_dfs(original_dfs):
-                # Prepend DF(0)=1.0 as a constant
-                full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs])
-                return pv_dom_fn(full_dfs)
-
-            # Extract original DFs (excluding prepended point)
+            # Extract original DFs (excluding prepended t≈0 if present)
             dom_dfs_original = dom_dfs[1:] if dom_times[0] < 1e-6 else dom_dfs
 
             # Compute gradients w.r.t. ORIGINAL DFs only (excluding DF(0)=1.0)
@@ -308,94 +354,37 @@ class Engine:
             delta_dom_rates = jnp.dot(grad_dom_dfs_original, jac_dom_original)
             delta_dom_rates = [float(x) * 1e-4 for x in delta_dom_rates]
 
-            # Foreign OIS: DELTA computation for XCCY swaps
-            # Use two-step gradient approach (same as domestic):
-            # 1. Compute grad(PV, foreign_OIS_DFs) using JAX
-            # 2. Apply chain rule with Jacobian jac(DFs, rates) from cached curve
-            #
-            # IMPORTANT: Keep XCCY curve FIXED when computing foreign OIS delta.
-            # The XCCY curve represents basis spreads which are independent market data.
-            # Only the foreign OIS curve (used for forward rates) varies.
-
-            # Define PV function that takes foreign OIS DFs as variable
-            def pv_for_fn(for_ois_dfs_var):
-                """Foreign leg PV as function of foreign OIS DFs (XCCY curve fixed)."""
-                return self._float_leg_jax(
-                    dfs=xccy_dfs, times=xccy_times,  # XCCY curve for discounting (FIXED)
-                    disc_interp_type=xccy_curve._interp_type,
-                    idx_interp_type=foreign_model._interp_type,
-                    payment_times=for_payment_times,
-                    start_times=for_start_times, end_times=for_end_times,
-                    pay_alphas=for_alphas, spreads=for_spreads,
-                    notionals=for_notionals, principal=for_principal,
-                    leg_sign=for_leg_sign, value_time=value_time,
-                    first_fixing_rate=0.0, override_first=False,
-                    idx_times=for_times, idx_dfs=for_ois_dfs_var,  # Foreign OIS DFs (VARIABLE)
-                    notional_exchange=derivative._foreign_leg._notional_exchange,
-                    notional_exchange_amount=derivative._foreign_leg._notional,
-                    effective_time=for_effective_time,
-                    maturity_time=for_maturity_time
-                )
-
-            # Extract original foreign OIS DFs (excluding prepended t≈0 if present)
+            # Foreign OIS: Extract DFs and compute gradients/Jacobians
             for_ois_dfs_original = for_dfs[1:] if for_times[0] < 1e-6 else for_dfs
-
-            # Define PV function that takes ONLY the original DFs (excluding prepended t≈0)
-            def pv_for_original_dfs(original_dfs):
-                # Prepend DF(0)=1.0 as a constant
-                full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs])
-                return pv_for_fn(full_dfs)
-
-            # Compute gradients w.r.t. foreign OIS DFs
             grad_for_dfs_original = grad(lambda d: jnp.squeeze(pv_for_original_dfs(d)))(for_ois_dfs_original)
-
-            # Chain rule: sensitivities to foreign OIS rates
-            # The Jacobian has shape (n_dfs, n_rates)
-            # Skip the first row if it corresponds to prepended DF(0)=1.0
             jac_for_original = for_cache["jac"][1:, :] if for_times[0] < 1e-6 else for_cache["jac"]
-            delta_for_rates_raw = jnp.dot(grad_for_dfs_original, jac_for_original)
 
-            # Convert to GBP per bp
-            # Foreign leg PV is in USD, multiply by spot_fx to convert to GBP
-            # Rates are stored in DECIMAL (0.052 for 5.2%), Jacobian is d(DFs)/d(rate_decimal)
-            # 1bp = 0.0001 in decimal units → multiply by 1e-4
-            delta_for_rates = [float(x) * 1e-4 * spot_fx for x in delta_for_rates_raw]
+            # XCCY: Extract DFs and compute gradients (needed for basis delta/gamma and cross-gamma)
+            xccy_dfs_original = xccy_dfs[1:] if xccy_times[0] < 1e-6 else xccy_dfs
+            grad_xccy_dfs_original = grad(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
+
+            # Foreign OIS DELTA: Only direct effect on forward rates
+            # IMPORTANT: XCCY curve is treated as FIXED market data when bumping foreign OIS rates.
+            # In a risk scenario, we bump foreign OIS rates but XCCY basis spreads remain unchanged
+            # (they are market observables calibrated at a point in time). Therefore, XCCY DFs do NOT
+            # change when we bump foreign OIS, and we only include the direct effect on forward rates.
+            #
+            # This is different from a "market scenario" where changing foreign OIS would cause market
+            # basis spreads to adjust, leading to XCCY re-calibration. For risk purposes, we compute
+            # delta holding XCCY curve fixed, so only forward rate sensitivity matters.
+            term1_foreign = jnp.dot(grad_for_dfs_original, jac_for_original)
+            delta_for_rates_raw = term1_foreign
 
             # XCCY Basis: DELTA computation for basis spread curve
             # Compute sensitivity to basis spread changes (keeping both OIS curves fixed)
             # Only the foreign leg has sensitivity to XCCY curve (used for discounting)
+            # Note: pv_xccy_fn, pv_xccy_original_dfs, and grad_xccy_dfs_original already computed above
 
-            # Define PV function that takes XCCY DFs as variable (both OIS curves FIXED)
-            def pv_xccy_fn(xccy_dfs_var):
-                """Foreign leg PV as function of XCCY DFs (both OIS curves fixed)."""
-                return self._float_leg_jax(
-                    dfs=xccy_dfs_var, times=xccy_times,  # XCCY curve for discounting (VARIABLE)
-                    disc_interp_type=xccy_curve._interp_type,
-                    idx_interp_type=foreign_model._interp_type,
-                    payment_times=for_payment_times,
-                    start_times=for_start_times, end_times=for_end_times,
-                    pay_alphas=for_alphas, spreads=for_spreads,
-                    notionals=for_notionals, principal=for_principal,
-                    leg_sign=for_leg_sign, value_time=value_time,
-                    first_fixing_rate=0.0, override_first=False,
-                    idx_times=for_times, idx_dfs=for_dfs,  # Foreign OIS DFs (FIXED)
-                    notional_exchange=derivative._foreign_leg._notional_exchange,
-                    notional_exchange_amount=derivative._foreign_leg._notional,
-                    effective_time=for_effective_time,
-                    maturity_time=for_maturity_time
-                )
-
-            # Extract original XCCY DFs (excluding prepended t≈0 if present)
-            xccy_dfs_original = xccy_dfs[1:] if xccy_times[0] < 1e-6 else xccy_dfs
-
-            # Define PV function that takes ONLY the original DFs (excluding prepended t≈0)
-            def pv_xccy_original_dfs(original_dfs):
-                # Prepend DF(0)=1.0 as a constant
-                full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs])
-                return pv_xccy_fn(full_dfs)
-
-            # Compute gradients w.r.t. XCCY DFs
-            grad_xccy_dfs_original = grad(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
+            # Convert to GBP per bp
+            # Foreign leg PV is in USD, divide by spot_fx to convert USD to GBP (spot_fx is USD/GBP)
+            # Rates are stored in DECIMAL (0.052 for 5.2%), Jacobian is d(DFs)/d(rate_decimal)
+            # 1bp = 0.0001 in decimal units → multiply by 1e-4
+            delta_for_rates = [float(x) * 1e-4 / spot_fx for x in delta_for_rates_raw]
 
             # Chain rule: sensitivities to basis spreads
             # The XCCY curve has a Jacobian d(DFs)/d(basis_spreads) stored as _jac_basis
@@ -412,10 +401,10 @@ class Engine:
                 delta_basis_rates_raw = jnp.dot(grad_xccy_dfs_original, jac_xccy_pillar)
 
                 # Convert to GBP per bp
-                # Foreign leg PV is in USD, multiply by spot_fx to convert to GBP
+                # Foreign leg PV is in USD, divide by spot_fx to convert USD to GBP (spot_fx is USD/GBP)
                 # Basis spreads are stored in DECIMAL (0.0030 for 30bp), Jacobian is d(DFs)/d(spread_decimal)
                 # 1bp = 0.0001 in decimal units → multiply by 1e-4
-                delta_basis_rates = [float(x) * 1e-4 * spot_fx for x in delta_basis_rates_raw]
+                delta_basis_rates = [float(x) * 1e-4 / spot_fx for x in delta_basis_rates_raw]
 
                 delta_basis = Delta(
                     risk_ladder=delta_basis_rates,
@@ -454,6 +443,20 @@ class Engine:
         if RequestTypes.GAMMA in reqs:
             from cavour.utils.helpers import to_tenor
 
+            # Extract original DFs (excluding prepended t≈0 if present) for all curves
+            dom_dfs_original = dom_dfs[1:] if dom_times[0] < 1e-6 else dom_dfs
+            for_ois_dfs_original = for_dfs[1:] if for_times[0] < 1e-6 else for_dfs
+            xccy_dfs_original = xccy_dfs[1:] if xccy_times[0] < 1e-6 else xccy_dfs
+
+            # Compute gradients and Jacobians (needed for gamma computation)
+            grad_dom_dfs_original = grad(lambda d: jnp.squeeze(pv_dom_original_dfs(d)))(dom_dfs_original)
+            jac_dom_original = dom_cache["jac"][1:, :] if dom_times[0] < 1e-6 else dom_cache["jac"]
+
+            grad_for_dfs_original = grad(lambda d: jnp.squeeze(pv_for_original_dfs(d)))(for_ois_dfs_original)
+            jac_for_original = for_cache["jac"][1:, :] if for_times[0] < 1e-6 else for_cache["jac"]
+
+            grad_xccy_dfs_original = grad(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
+
             # Domestic OIS GAMMA
             # Compute Hessian w.r.t. domestic DFs
             hess_dom_dfs_original = hessian(lambda d: jnp.squeeze(pv_dom_original_dfs(d)))(dom_dfs_original)
@@ -477,23 +480,29 @@ class Engine:
             gammas_dom = np.array(gammas_dom, dtype=np.float64) * 1e-8
 
             # Foreign OIS GAMMA
-            # Compute Hessian w.r.t. foreign DFs
+            # Compute Hessian w.r.t. foreign DFs (direct effect through forward rates)
             hess_for_dfs_original = hessian(lambda d: jnp.squeeze(pv_for_original_dfs(d)))(for_ois_dfs_original)
 
             # Retrieve Hessian of curve bootstrapping
             hess_for_curve = for_cache["hess"][1:, :, :] if for_times[0] < 1e-6 else for_cache["hess"]
 
-            # Chain rule for gamma
+            # Chain rule for gamma - DIRECT effect (foreign OIS -> forward rates -> PV)
             term1_for = jac_for_original.T @ hess_for_dfs_original @ jac_for_original
             term2_for = jnp.sum(grad_for_dfs_original[:, None, None] * hess_for_curve, axis=0)
-            gammas_for_matrix = term1_for + term2_for
+            gammas_for_matrix_direct = term1_for + term2_for
+
+            # Foreign OIS GAMMA: Only direct effect on forward rates
+            # IMPORTANT: XCCY curve is treated as FIXED when bumping foreign OIS rates.
+            # Same rationale as for DELTA - we hold XCCY basis spreads fixed, so XCCY DFs
+            # do not change. Therefore, only the direct effect on forward rates matters.
+            gammas_for_matrix = gammas_for_matrix_direct
 
             # Extract diagonal elements (d²PV/dr_i²) for each tenor
             gammas_for = jnp.diag(gammas_for_matrix)
 
             # Convert to GBP per bp²
             # Foreign leg PV is in USD, multiply by spot_fx to convert to GBP
-            gammas_for = np.array(gammas_for, dtype=np.float64) * 1e-8 * spot_fx
+            gammas_for = np.array(gammas_for, dtype=np.float64) * 1e-8 / spot_fx
 
             # Create Gamma objects for each curve
             gamma_domestic = Gamma(
@@ -513,6 +522,8 @@ class Engine:
             # XCCY Basis GAMMA
             # Compute Hessian w.r.t. XCCY DFs (if Jacobian available)
             if hasattr(xccy_curve, '_jac_basis') and xccy_curve._jac_basis is not None:
+                # Get basis spread tenors from XCCY curve
+                basis_swap_tenors = to_tenor(xccy_curve.swap_times)
                 # Compute Hessian w.r.t. XCCY DFs
                 hess_xccy_dfs_original = hessian(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
 
@@ -537,8 +548,8 @@ class Engine:
                 gammas_xccy = jnp.diag(gammas_xccy_matrix)
 
                 # Convert to GBP per bp²
-                # Foreign leg PV is in USD, multiply by spot_fx to convert to GBP
-                gammas_xccy = np.array(gammas_xccy, dtype=np.float64) * 1e-8 * spot_fx
+                # Foreign leg PV is in USD, divide by spot_fx to convert USD to GBP (spot_fx is USD/GBP)
+                gammas_xccy = np.array(gammas_xccy, dtype=np.float64) * 1e-8 / spot_fx
 
                 gamma_basis = Gamma(
                     risk_ladder=gammas_xccy,
@@ -553,40 +564,69 @@ class Engine:
             # This captures how XCCY basis delta changes when foreign OIS rates move
             cross_gamma_for_basis = None
             if hasattr(xccy_curve, '_mixed_hess_foreign_basis') and xccy_curve._mixed_hess_foreign_basis is not None:
-                # Get required Jacobians
-                jac_xccy_for_ois = xccy_curve._jac_foreign_ois[1:, :] if xccy_times[0] < 1e-6 else xccy_curve._jac_foreign_ois
-                mixed_hess_xccy = xccy_curve._mixed_hess_foreign_basis[1:, :, :] if xccy_times[0] < 1e-6 else xccy_curve._mixed_hess_foreign_basis
+                # DEBUG: Print dimensions
+                print(f"DEBUG Cross-gamma dimensions:")
+                print(f"  for_cache['jac'] shape: {for_cache['jac'].shape}")
+                print(f"  jac_for_original shape: {jac_for_original.shape}")
+                print(f"  mixed_hess shape: {xccy_curve._mixed_hess_foreign_basis.shape}")
+                print(f"  for_times: {for_times}")
+                print(f"  xccy_times: {xccy_times}")
 
-                # Compute Hessian of PV w.r.t. XCCY DFs
-                # This is analogous to hess_dom_dfs_original and hess_for_dfs_original
-                hess_pv_xccy_dfs = hessian(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
+                # Get mixed Hessian and skip prepended points
+                # Shape: [n_xccy_dfs, n_basis, n_for_dfs]
+                # Note: JAX's jacfwd(jacrev(f, argnums=1), argnums=0) gives shape [output, arg1, arg0]
+                mixed_hess_xccy = xccy_curve._mixed_hess_foreign_basis
 
-                # Chain rule for cross-gamma: d2PV / d(for_rates) d(basis)
-                # term1: Propagate mixed Hessian of XCCY curve through PV gradient
-                # Use einsum: sum over xccy_dfs (i) and for_ois (j)
-                # Result[basis_k, for_rate_l] = sum_i sum_j grad[i] * mixed_hess[i,j,k] * jac_for[j,l]
-                term1_cross = jnp.einsum('i,ijk,jl->kl',
+                # Skip first row if XCCY has prepended t≈0
+                if xccy_times[0] < 1e-6:
+                    mixed_hess_xccy = mixed_hess_xccy[1:, :, :]
+
+                # Skip first column of 3rd dimension if foreign curve has prepended t≈0
+                if for_times[0] < 1e-6:
+                    mixed_hess_xccy = mixed_hess_xccy[:, :, 1:]
+
+                # Ensure third dimension matches jac_for_original's first dimension
+                # The foreign curve might have extra points (e.g., spot_days=0 creates value date point)
+                n_for_dfs_expected = jac_for_original.shape[0]
+                n_for_dfs_actual = mixed_hess_xccy.shape[2]
+                if n_for_dfs_actual > n_for_dfs_expected:
+                    # Skip additional points from the beginning
+                    skip_count = n_for_dfs_actual - n_for_dfs_expected
+                    mixed_hess_xccy = mixed_hess_xccy[:, :, skip_count:]
+
+                # Now mixed_hess_xccy shape is [n_xccy_dfs, n_basis, n_for_dfs]
+                # where n_for_dfs matches jac_for_original's first dimension
+
+                # Chain rule for cross-gamma: d²PV / d(for_rates) d(basis)
+                # The mixed Hessian has shape [n_xccy_dfs, n_basis, n_for_dfs] from JAX
+                # We need to chain with:
+                # - PV gradient w.r.t. XCCY DFs: grad_xccy_dfs_original[i]
+                # - Foreign OIS Jacobian (DFs to rates): jac_for_original[j,l]
+                #
+                # Result[k, l] = sum_i sum_j grad[i] * mixed_hess[i,k,j] * jac_for[j,l]
+                # where i=xccy_dfs, k=basis, j=for_dfs, l=for_rates
+                term1_cross = jnp.einsum('i,ikj,jl->kl',
                                          grad_xccy_dfs_original,  # [n_xccy_dfs]
-                                         mixed_hess_xccy,          # [n_xccy_dfs, n_for_ois, n_basis]
-                                         jac_for_original)         # [n_for_ois, n_for_rates]
+                                         mixed_hess_xccy,          # [n_xccy_dfs, n_basis, n_for_dfs]
+                                         jac_for_original)         # [n_for_dfs, n_for_rates]
 
-                # term2: Off-diagonal block of full Hessian
-                term2_cross = jac_for_original.T @ jac_xccy_for_ois.T @ hess_pv_xccy_dfs @ jac_xccy_pillar
-
-                # Total cross-gamma matrix [n_for_rates, n_basis]
-                gamma_cross_matrix = term1_cross.T + term2_cross  # Transpose term1
+                # For cross-gamma, we only need term1 (the mixed Hessian term)
+                # Term2 is not applicable here because jac_xccy_for_ois is at payment level,
+                # not pillar level, and cannot be chained with jac_for_original
+                # Total cross-gamma matrix [n_basis, n_for_rates], transpose to [n_for_rates, n_basis]
+                gamma_cross_matrix = term1_cross.T
 
                 # Convert to GBP per bp2
-                gamma_cross_matrix = gamma_cross_matrix * 1e-8 * spot_fx
+                gamma_cross_matrix = gamma_cross_matrix * 1e-8 / spot_fx
 
-                # Create CrossGamma object
+                # Create CrossGamma object (expects [n_for_rates, n_basis])
                 cross_gamma_for_basis = CrossGamma(
                     risk_matrix=gamma_cross_matrix,
                     tenors_curve1=to_tenor(foreign_model.swap_times),
                     tenors_curve2=basis_swap_tenors,
-                    curve_type_1=foreign_model.curve_type,
-                    curve_type_2=xccy_curve.curve_type,
-                    currency=CurrencyTypes.GBP
+                    curve_type_1=derivative._foreign_floating_index,
+                    curve_type_2=CurveTypes.USD_GBP_BASIS,
+                    currency=derivative._domestic_currency
                 )
 
             # Package gammas into Risk object with cross-gammas
@@ -745,7 +785,7 @@ class Engine:
             domestic_value = domestic_analytics["value"].amount
             foreign_value = foreign_analytics["value"].amount
             # Total PV = domestic PV + spot_FX * foreign PV (converted to domestic currency)
-            total_value = domestic_value + spot_fx * foreign_value
+            total_value = domestic_value + foreign_value / spot_fx
             value = Valuation(amount=total_value, currency=derivative._domestic_currency)
 
         # DELTA and GAMMA not yet implemented for XCCY

@@ -252,8 +252,8 @@ class XccyBasisSwap:
 
         # Convert foreign leg to domestic currency
         # foreign_leg is already PAY, so its PV is negative when we owe money
-        # Multiply by spot_fx to convert to domestic
-        foreign_leg_value_domestic = spot_fx * foreign_leg_value
+        # Divide by spot_fx to convert USD to GBP (spot_fx is USD/GBP)
+        foreign_leg_value_domestic = foreign_leg_value / spot_fx
 
         # Total value in domestic currency
         value = domestic_leg_value + foreign_leg_value_domestic
