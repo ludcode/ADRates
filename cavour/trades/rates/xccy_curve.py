@@ -372,11 +372,13 @@ class XccyCurve(DiscountCurve):
                 temp_xccy_curve.df = types.MethodType(temp_df_override, temp_xccy_curve)
 
             # For foreign leg, we need to split PV into known and unknown parts
-            # The foreign leg is PAY type, so value() will negate the final PV
+            # IMPORTANT: Recompute cashflows dynamically (like _build_curve_ad) instead of
+            # using pre-computed values from foreign_leg._payments which include spread incorrectly
             foreign_leg = swap._foreign_leg
             maturity_dt = swap._maturity_dt
 
-            # Value foreign leg with temp XCCY curve to get cashflows and DFs
+            # First, call value() to populate the payment schedule (including notional exchanges)
+            # We'll discard the PVs but use the payment dates
             _ = foreign_leg.value(
                 value_dt=self._value_dt,
                 discount_curve=temp_xccy_curve,
@@ -384,36 +386,77 @@ class XccyCurve(DiscountCurve):
                 first_fixing_rate=None
             )
 
-            # Now we need to split this into:
-            # 1. PV_known: PV of cashflows before maturity (already discounted and signed)
-            # 2. CF_last: undiscounted cashflows at maturity (before PAY/RECEIVE sign)
-            #
-            # The tricky part: the leg.value() method applies the PAY/RECEIVE sign at the END
-            # So we need to work with the internal _payment_pvs before the final sign flip
+            # Extract payment schedule data from foreign leg (now populated)
+            # This allows us to recompute cashflows dynamically with correct spread handling
+            payment_dts = foreign_leg._payment_dts
+            start_accrual_dts = foreign_leg._start_accrued_dts
+            end_accrual_dts = foreign_leg._end_accrued_dts
+            year_fracs = foreign_leg._year_fracs
+            notionals = foreign_leg._notional_array
+
+            # Get the constant notional for XCCY swaps (all payments use same notional)
+            leg_notional = swap._foreign_notional
+
+            # Determine which payments are notional exchanges vs interest payments
+            # Notional exchanges have year_frac ~ 0
+            from cavour.utils.helpers import times_from_dates
 
             pv_foreign_known = 0.0
             cf_last_foreign = 0.0
 
-            # Loop through the stored PV values
-            for j, pmnt_dt in enumerate(foreign_leg._payment_dts):
-                if pmnt_dt > self._value_dt:  # Exclude payments AT value_dt (already have DF=1.0)
-                    pmnt_amount = foreign_leg._payments[j]
+            # Loop through payments and recompute cashflows dynamically
+            for j, pmnt_dt in enumerate(payment_dts):
+                year_frac = year_fracs[j]
+                # Use indexed notional if available, otherwise use leg notional
+                notional = notionals[j] if j < len(notionals) else leg_notional
+                is_notional_exchange = (year_frac < 1e-10)
+                is_last_payment = (j == len(payment_dts) - 1)
 
+                # Compute cashflow dynamically
+                if is_notional_exchange:
+                    # Notional exchange
+                    if is_last_payment:
+                        cashflow = notional  # Return notional at maturity
+                    else:
+                        cashflow = -notional  # Receive notional at start
+                else:
+                    # Interest payment: recompute from forward rates
+                    start_dt = start_accrual_dts[j]
+                    end_dt = end_accrual_dts[j]
+
+                    # Get foreign OIS DFs at accrual dates
+                    df_start = self._foreign_curve.df(start_dt, self._foreign_curve._dc_type)
+                    df_end = self._foreign_curve.df(end_dt, self._foreign_curve._dc_type)
+
+                    # Compute forward rate (no spread)
+                    fwd_rate = (df_start / df_end - 1.0) / year_frac if year_frac > 1e-10 else 0.0
+
+                    # Base interest (no spread)
+                    base_interest = fwd_rate * year_frac * notional
+
+                    # Add basis spread separately (this is the key fix!)
+                    spread_component = basis_spread * year_frac * notional
+                    cashflow = base_interest + spread_component
+
+                    # If last payment, add notional return
+                    if is_last_payment:
+                        cashflow += notional
+
+                # Now discount cashflow or accumulate for maturity
+                if pmnt_dt > self._value_dt:
                     if pmnt_dt == maturity_dt:
                         # This is at maturity - we'll solve for its DF
-                        # Use the undiscounted cashflow amount
-                        cf_last_foreign += pmnt_amount
+                        cf_last_foreign += cashflow
                     else:
-                        # This is before maturity - use the already-computed PV
-                        # The _payment_pvs already have the cashflow sign (positive or negative)
-                        # but NOT the final PAY/RECEIVE leg type sign flip
-                        pv_foreign_known += foreign_leg._payment_pvs[j]
+                        # This is before maturity - discount with temp XCCY curve
+                        df_xccy = temp_xccy_curve.df(pmnt_dt)
+                        pv_foreign_known += cashflow * df_xccy
                 elif pmnt_dt == self._value_dt:
-                    # Initial notional exchange at value_dt - include in known PV with DF=1.0
-                    pv_foreign_known += foreign_leg._payments[j]
+                    # Initial exchange at value_dt - DF = 1.0
+                    pv_foreign_known += cashflow * 1.0
 
-            # The PAY/RECEIVE sign flip is applied at the END by the leg.value() method
-            # So we need to apply it here too
+            # The PAY/RECEIVE sign flip
+            # For PAY leg, cashflows are negated
             if foreign_leg._leg_type == SwapTypes.PAY:
                 pv_foreign_known = pv_foreign_known * (-1.0)
                 cf_last_foreign = cf_last_foreign * (-1.0)
