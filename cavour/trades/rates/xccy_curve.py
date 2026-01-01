@@ -990,8 +990,14 @@ class XccyCurve(DiscountCurve):
         # This avoids JAX scan closure issues with gradient backpropagation
         # Interpolating inside the scan would capture foreign_ois_dfs_grid as a closure variable,
         # which JAX cannot differentiate through. Pre-computing allows gradients to flow correctly.
-        df_start_accrual_array = jnp.interp(start_accrual_times, foreign_ois_times, foreign_ois_dfs_grid)
-        df_end_accrual_array = jnp.interp(end_accrual_times, foreign_ois_times, foreign_ois_dfs_grid)
+        #
+        # IMPORTANT: Use log-linear interpolation (flat forward rates) to match non-AD version
+        # Linear interpolation on DFs would violate the flat forward rate assumption
+        log_foreign_ois_dfs = jnp.log(foreign_ois_dfs_grid)
+        log_df_start = jnp.interp(start_accrual_times, foreign_ois_times, log_foreign_ois_dfs)
+        log_df_end = jnp.interp(end_accrual_times, foreign_ois_times, log_foreign_ois_dfs)
+        df_start_accrual_array = jnp.exp(log_df_start)
+        df_end_accrual_array = jnp.exp(log_df_end)
 
         def step(state, inputs):
             """
