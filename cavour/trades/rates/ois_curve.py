@@ -156,19 +156,27 @@ class OISCurve(DiscountCurve):
     def _build_curve_ad(self, swap_rates):
 
         pv01 = 0.0
-        df_settle = 1 
+        df_settle = 1
 
         pv01_dict = {}
         pv01 = 0
 
+        # Create log-linear interpolator for swap rates
+        swap_times_array = jnp.array(self.swap_times)
+        swap_rates_array = jnp.array(swap_rates)
+        log_swap_rates = jnp.log(swap_rates_array)
+
+        def interpolate_loglinear(t):
+            # JAX-compatible log-linear interpolation
+            return jnp.exp(jnp.interp(t, swap_times_array, log_swap_rates))
+
         def calculate_single_df(pv01, i, target_maturity=None, step=0):
             if target_maturity is None:
                 t_mat = self.swap_times[i]
-                #swap_rate = swap_rates[i]
+                swap_rate = swap_rates[i]
             else:
                 t_mat = target_maturity
-                #swap_rate = interpolate_loglinear(t_mat)
-            swap_rate = swap_rates[i]
+                swap_rate = interpolate_loglinear(t_mat)
 
             if len(self._used_swaps[i]._fixed_leg._year_fracs) == 1:
                 acc = self._used_swaps[i]._fixed_leg._year_fracs[0]

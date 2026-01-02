@@ -210,53 +210,97 @@ class XccyBasisSwap:
               value_dt: Date,
               domestic_discount_curve: DiscountCurve,
               foreign_discount_curve: DiscountCurve,
-              xccy_discount_curve: DiscountCurve,
-              spot_fx: float,
+              xccy_discount_curve: DiscountCurve = None,
+              xccy_discount_curve_inverted: DiscountCurve = None,
+              spot_fx: float = None,
+              collateral_type = None,
               first_fixing_rate_domestic: float = None,
               first_fixing_rate_foreign: float = None):
         """
-        Value the cross-currency basis swap.
+        Value the cross-currency basis swap with flexible collateral support.
 
         Args:
             value_dt: Valuation date
-            domestic_discount_curve: Discount curve for domestic currency (domestic collateral)
-            foreign_discount_curve: Discount curve for foreign currency (foreign collateral)
-            xccy_discount_curve: XCCY curve for foreign cashflows in domestic collateral
+            domestic_discount_curve: OIS curve for domestic currency projection
+            foreign_discount_curve: OIS curve for foreign currency projection
+            xccy_discount_curve: XCCY curve for foreign cashflows in domestic collateral (default)
+            xccy_discount_curve_inverted: XCCY curve for domestic cashflows in foreign collateral
             spot_fx: Spot FX rate (domestic per unit of foreign)
+            collateral_type: CollateralType enum for auto-curve selection (optional)
             first_fixing_rate_domestic: First fixing rate for domestic leg (if applicable)
             first_fixing_rate_foreign: First fixing rate for foreign leg (if applicable)
 
         Returns:
-            float: Present value in domestic currency
+            float: Present value in collateral currency
 
         Notes:
-            - Domestic leg is valued with domestic_discount_curve for both projection and discounting
-            - Foreign leg is valued with foreign_discount_curve for projection, xccy_discount_curve for discounting
-            - Foreign leg PV is converted to domestic using spot_fx
+            - Default (collateral_type=None): Domestic collateral (current behavior)
+            - Domestic collateral: Domestic leg uses domestic OIS, foreign leg uses XCCY curve
+            - Foreign collateral: Domestic leg uses inverted XCCY curve, foreign leg uses foreign OIS
+            - Result is always in collateral currency
         """
-        # Domestic leg: use domestic curves for both projection and discounting
+        # Import here to avoid circular dependency
+        from cavour.utils.global_types import CollateralType, collateral_to_currency
+
+        # Determine collateral currency
+        if collateral_type is None:
+            # Default to domestic currency (current behavior)
+            collateral_ccy = self._domestic_currency
+        else:
+            collateral_ccy = collateral_to_currency(collateral_type)
+
+        # Select discount curves based on collateral
+        if collateral_ccy == self._domestic_currency:
+            # Domestic collateral (current behavior)
+            dom_disc_curve = domestic_discount_curve
+            for_disc_curve = xccy_discount_curve
+
+            if for_disc_curve is None:
+                raise ValueError(
+                    f"xccy_discount_curve required for domestic collateral "
+                    f"({self._domestic_currency.name})"
+                )
+
+        elif collateral_ccy == self._foreign_currency:
+            # Foreign collateral (NEW)
+            dom_disc_curve = xccy_discount_curve_inverted
+            for_disc_curve = foreign_discount_curve
+
+            if dom_disc_curve is None:
+                raise ValueError(
+                    f"xccy_discount_curve_inverted required for foreign collateral "
+                    f"({self._foreign_currency.name})"
+                )
+
+        else:
+            raise ValueError(
+                f"Third-party collateral not yet supported: {collateral_type}. "
+                f"Only {self._domestic_currency.name} or {self._foreign_currency.name} collateral allowed."
+            )
+
+        # Value legs with selected curves
         domestic_leg_value = self._domestic_leg.value(
             value_dt=value_dt,
-            discount_curve=domestic_discount_curve,
+            discount_curve=dom_disc_curve,
             index_curve=domestic_discount_curve,
             first_fixing_rate=first_fixing_rate_domestic
         )
 
-        # Foreign leg: use foreign curve for projection, XCCY curve for discounting
         foreign_leg_value = self._foreign_leg.value(
             value_dt=value_dt,
-            discount_curve=xccy_discount_curve,
+            discount_curve=for_disc_curve,
             index_curve=foreign_discount_curve,
             first_fixing_rate=first_fixing_rate_foreign
         )
 
-        # Convert foreign leg to domestic currency
-        # foreign_leg is already PAY, so its PV is negative when we owe money
-        # Divide by spot_fx to convert USD to GBP (spot_fx is USD/GBP)
-        foreign_leg_value_domestic = foreign_leg_value / spot_fx
+        # Convert to collateral currency
+        if collateral_ccy == self._domestic_currency:
+            # Convert foreign leg to domestic currency
+            value = domestic_leg_value + foreign_leg_value / spot_fx
+        else:  # Foreign collateral
+            # Convert domestic leg to foreign currency
+            value = domestic_leg_value * spot_fx + foreign_leg_value
 
-        # Total value in domestic currency
-        value = domestic_leg_value + foreign_leg_value_domestic
         return value
 
 ###############################################################################

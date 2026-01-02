@@ -30,18 +30,60 @@ class Engine:
         # cache bootstrapped curves keyed by curve name
         self._curve_cache: Dict[Any, Dict[str, Any]] = {}
 
-    def compute(self, derivative, request_list):
-        """Return analytics for the given derivative and requested measures."""
+    def compute(self, derivative, request_list, collateral_type=None):
+        """Return analytics for the given derivative and requested measures.
+
+        Args:
+            derivative: Derivative instrument (OIS, XCCY swap, etc.)
+            request_list: List of RequestTypes (VALUE, DELTA, GAMMA)
+            collateral_type (CollateralType, optional): Type of collateral for discounting.
+                If None, uses natural currency. For cross-currency collateral, specify
+                the collateral currency (e.g., CollateralType.USD).
+
+        Returns:
+            AnalyticsResult with value, risk (delta), and gamma
+        """
         reqs = set(request_list)
 
         # Route XCCY swaps to separate handler
         if derivative.derivative_type == InstrumentTypes.XCCY_SWAP:
-            return self._compute_xccy(derivative, reqs)
+            return self._compute_xccy(derivative, reqs, collateral_type)
 
-        # Route OIS swaps to existing logic
-        if derivative.derivative_type != InstrumentTypes.OIS_SWAP:
-            raise LibError(f"{derivative.derivative_type} not yet implemented")
+        # Route OIS swaps to new handler (supports collateral)
+        if derivative.derivative_type == InstrumentTypes.OIS_SWAP:
+            return self._compute_ois(derivative, reqs, collateral_type)
 
+        raise LibError(f"{derivative.derivative_type} not yet implemented")
+
+    def _compute_ois(self, derivative, reqs, collateral_type=None):
+        """Compute analytics for OIS swaps with optional cross-currency collateral.
+
+        Args:
+            derivative: OIS swap instance
+            reqs: Set of RequestTypes (VALUE, DELTA, GAMMA)
+            collateral_type (CollateralType, optional): Collateral currency
+
+        Returns:
+            AnalyticsResult with value, risk (delta), and gamma
+        """
+        from cavour.utils.global_types import collateral_to_currency
+
+        # Determine collateral currency
+        if collateral_type is None:
+            collateral_ccy = derivative._currency  # Natural currency (default)
+        else:
+            collateral_ccy = collateral_to_currency(collateral_type)
+
+        # Natural currency path (existing single-curve logic)
+        if collateral_ccy == derivative._currency:
+            return self._compute_ois_natural(derivative, reqs)
+
+        # Cross-currency collateral path (new dual-curve logic)
+        else:
+            return self._compute_ois_xccy_collateral(derivative, reqs, collateral_ccy)
+
+    def _compute_ois_natural(self, derivative, reqs):
+        """Compute OIS with natural currency (single-curve discounting)."""
         ir_model = getattr(self.model.curves, derivative._floating_index.name)
 
         fixed = self._fixed_leg_analytics(
@@ -78,11 +120,291 @@ class Engine:
         if RequestTypes.GAMMA in reqs:
             gamma = fixed.get("gamma") + floating.get("gamma")
 
-        #risk = Risk([delta]) if delta is not None else None
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma)
+
+    def _compute_ois_xccy_collateral(self, derivative, reqs, collateral_ccy):
+        """Compute OIS with cross-currency collateral (dual-curve discounting).
+
+        Uses OIS curve for forward rate projection and XCCY curve for discounting.
+        Follows the same pattern as _compute_xccy() for dual-curve valuation.
+
+        Phase 1: VALUE support only (DELTA and GAMMA to be added later).
+        """
+        import jax.numpy as jnp
+        from cavour.utils.helpers import times_from_dates
+
+        # Get OIS curve for projection
+        ois_model = getattr(self.model.curves, derivative._floating_index.name)
+
+        # Get XCCY curve for discounting
+        swap_ccy_code = derivative._currency.name
+        collateral_ccy_code = collateral_ccy.name
+        xccy_curve_name = f"{swap_ccy_code}_{collateral_ccy_code}_XCCY"
+
+        try:
+            xccy_curve = getattr(self.model.curves, xccy_curve_name)
+            spot_fx = xccy_curve._spot_fx
+        except AttributeError:
+            raise LibError(f"XCCY curve {xccy_curve_name} not found in model. "
+                         f"Required for cross-currency collateral valuation. "
+                         f"Available curves: {[attr for attr in dir(self.model.curves) if not attr.startswith('_')]}")
+
+        # Build OIS curve arrays (for forward rate projection)
+        ois_curve_key = tuple(ois_model.swap_times)
+        ois_cache = self._cached_curve(
+            ois_curve_key,
+            ois_model.swap_rates,
+            ois_model.swap_times,
+            ois_model.year_fracs,
+            ois_model._interp_type
+        )
+        ois_times = ois_cache["times"]
+        ois_dfs = ois_cache["dfs"]
+
+        # Build XCCY curve arrays (for discounting)
+        xccy_times = jnp.array(xccy_curve._times)
+        xccy_dfs = jnp.array(xccy_curve._dfs)
+
+        # Prepare leg parameters for JAX computation
+        # Fixed leg uses XCCY curve for discounting
+        # Float leg uses XCCY curve for discounting, OIS curve for forward rates
+
+        dc_type = derivative._fixed_leg._dc_type
+        value_time = times_from_dates(self.model.value_dt, self.model.value_dt, dc_type)
+
+        # Fixed leg parameters
+        fixed_payment_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                         for dt in derivative._fixed_leg._payment_dts])
+        fixed_alphas = jnp.array(derivative._fixed_leg._year_fracs)
+        fixed_coupons = jnp.full_like(fixed_alphas, derivative._fixed_leg._cpn)
+        # SwapFixedLeg doesn't have _notional_array, only _notional
+        fixed_notionals = jnp.full_like(fixed_alphas, derivative._fixed_leg._notional)
+        fixed_principal = derivative._fixed_leg._principal
+        fixed_leg_sign = +1.0 if derivative._fixed_leg._leg_type == SwapTypes.RECEIVE else -1.0
+
+        # Float leg parameters
+        float_payment_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                         for dt in derivative._float_leg._payment_dts])
+        float_start_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                       for dt in derivative._float_leg._start_accrued_dts])
+        float_end_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                     for dt in derivative._float_leg._end_accrued_dts])
+        float_alphas = jnp.array(derivative._float_leg._year_fracs)
+        float_spreads = jnp.full_like(float_alphas, derivative._float_leg._spread)
+        float_notionals = jnp.array(derivative._float_leg._notional_array or
+                                    [derivative._float_leg._notional] * len(float_alphas))
+        float_principal = derivative._float_leg._principal
+        float_leg_sign = +1.0 if derivative._float_leg._leg_type == SwapTypes.RECEIVE else -1.0
+
+        # Compute VALUE using JAX
+        value = None
+        if RequestTypes.VALUE in reqs:
+            # Fixed leg PV (discounted on XCCY curve)
+            # Compute fixed leg payments: coupon * alpha * notional
+            fixed_payments = fixed_coupons * fixed_alphas * fixed_notionals
+
+            fixed_pv = self._price_fixed_leg_jax(
+                dfs=xccy_dfs,
+                times=xccy_times,
+                interp_type=xccy_curve._interp_type,
+                payment_times=fixed_payment_times,
+                payments=fixed_payments,
+                principal=fixed_principal,
+                notional=derivative._fixed_leg._notional,
+                leg_sign=fixed_leg_sign,
+                value_time=value_time
+            )
+
+            # Float leg PV (dual curve: XCCY for discount, OIS for index)
+            float_pv = self._float_leg_jax(
+                dfs=xccy_dfs,  # XCCY curve for discounting
+                times=xccy_times,
+                disc_interp_type=xccy_curve._interp_type,
+                idx_interp_type=ois_model._interp_type,
+                payment_times=float_payment_times,
+                start_times=float_start_times,
+                end_times=float_end_times,
+                pay_alphas=float_alphas,
+                spreads=float_spreads,
+                notionals=float_notionals,
+                principal=float_principal,
+                leg_sign=float_leg_sign,
+                value_time=value_time,
+                first_fixing_rate=0.0,
+                override_first=False,
+                idx_times=ois_times,  # OIS curve for forward rates
+                idx_dfs=ois_dfs,
+                notional_exchange=False,
+                notional_exchange_amount=0.0,
+                effective_time=value_time,
+                maturity_time=value_time
+            )
+
+            # Convert to scalars and compute total PV
+            fixed_pv_scalar = float(jnp.squeeze(fixed_pv))
+            float_pv_scalar = float(jnp.squeeze(float_pv))
+            total_pv_swap_ccy = fixed_pv_scalar + float_pv_scalar
+
+            # Convert to collateral currency
+            total_pv_collateral_ccy = total_pv_swap_ccy / spot_fx
+
+            value = Valuation(amount=total_pv_collateral_ccy, currency=collateral_ccy)
+
+        # Define PV functions for gradient computation (used by DELTA)
+        # These functions compute PV as a function of different curve variables
+
+        # OIS curve: affects float leg forward rates (XCCY curve fixed)
+        def pv_ois_fn(ois_dfs_var):
+            return self._float_leg_jax(
+                dfs=xccy_dfs,  # XCCY curve for discounting (FIXED)
+                times=xccy_times,
+                disc_interp_type=xccy_curve._interp_type,
+                idx_interp_type=ois_model._interp_type,
+                payment_times=float_payment_times,
+                start_times=float_start_times,
+                end_times=float_end_times,
+                pay_alphas=float_alphas,
+                spreads=float_spreads,
+                notionals=float_notionals,
+                principal=float_principal,
+                leg_sign=float_leg_sign,
+                value_time=value_time,
+                first_fixing_rate=0.0,
+                override_first=False,
+                idx_times=ois_times,
+                idx_dfs=ois_dfs_var,  # OIS DFs (VARIABLE)
+                notional_exchange=False,
+                notional_exchange_amount=0.0,
+                effective_time=value_time,
+                maturity_time=value_time
+            )
+
+        # XCCY curve: affects both fixed and float leg discounting (OIS curve fixed)
+        def pv_xccy_fn(xccy_dfs_var):
+            # Fixed leg PV
+            fixed_payments = fixed_coupons * fixed_alphas * fixed_notionals
+            fixed_pv = self._price_fixed_leg_jax(
+                dfs=xccy_dfs_var,  # XCCY DFs (VARIABLE)
+                times=xccy_times,
+                interp_type=xccy_curve._interp_type,
+                payment_times=fixed_payment_times,
+                payments=fixed_payments,
+                principal=fixed_principal,
+                notional=derivative._fixed_leg._notional,
+                leg_sign=fixed_leg_sign,
+                value_time=value_time
+            )
+
+            # Float leg PV
+            float_pv = self._float_leg_jax(
+                dfs=xccy_dfs_var,  # XCCY DFs (VARIABLE)
+                times=xccy_times,
+                disc_interp_type=xccy_curve._interp_type,
+                idx_interp_type=ois_model._interp_type,
+                payment_times=float_payment_times,
+                start_times=float_start_times,
+                end_times=float_end_times,
+                pay_alphas=float_alphas,
+                spreads=float_spreads,
+                notionals=float_notionals,
+                principal=float_principal,
+                leg_sign=float_leg_sign,
+                value_time=value_time,
+                first_fixing_rate=0.0,
+                override_first=False,
+                idx_times=ois_times,
+                idx_dfs=ois_dfs,  # OIS DFs (FIXED)
+                notional_exchange=False,
+                notional_exchange_amount=0.0,
+                effective_time=value_time,
+                maturity_time=value_time
+            )
+
+            return fixed_pv + float_pv
+
+        # Wrapper functions for "original" DFs (excluding prepended t≈0)
+        def pv_ois_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs])
+            return pv_ois_fn(full_dfs)
+
+        def pv_xccy_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs])
+            return pv_xccy_fn(full_dfs)
+
+        # Compute DELTA using automatic differentiation
+        delta = None
+        if RequestTypes.DELTA in reqs:
+            from jax import grad
+            from cavour.utils.helpers import to_tenor
+
+            # Extract original DFs (excluding prepended t≈0 if present)
+            ois_dfs_original = ois_dfs[1:] if ois_times[0] < 1e-6 else ois_dfs
+            xccy_dfs_original = xccy_dfs[1:] if xccy_times[0] < 1e-6 else xccy_dfs
+
+            # Compute gradients w.r.t. ORIGINAL DFs only (excluding DF(0)=1.0)
+            grad_ois_dfs_original = grad(lambda d: jnp.squeeze(pv_ois_original_dfs(d)))(ois_dfs_original)
+            grad_xccy_dfs_original = grad(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
+
+            # Chain rule: OIS curve sensitivities to rates
+            # Get Jacobian from cached curve
+            jac_ois_original = ois_cache["jac"][1:, :] if ois_times[0] < 1e-6 else ois_cache["jac"]
+            delta_ois_rates_raw = jnp.dot(grad_ois_dfs_original, jac_ois_original)
+
+            # Convert to collateral currency and bp units
+            # PV is in swap currency (GBP), convert to collateral currency (USD)
+            # Then multiply by 1e-4 for bp units
+            delta_ois_rates = [float(x) / spot_fx * 1e-4 for x in delta_ois_rates_raw]
+
+            # Chain rule: XCCY curve sensitivities to basis spreads
+            # Check if JAX-based bootstrap was used (has _jac_basis attribute)
+            if hasattr(xccy_curve, '_jac_basis') and xccy_curve._jac_basis is not None:
+                # Get basis spread tenors
+                basis_swap_tenors = to_tenor(xccy_curve.swap_times)
+
+                # Get Jacobian
+                jac_xccy_pillar = xccy_curve._jac_basis[1:, :] if xccy_times[0] < 1e-6 else xccy_curve._jac_basis
+
+                # Compute delta
+                delta_xccy_rates_raw = jnp.dot(grad_xccy_dfs_original, jac_xccy_pillar)
+
+                # Convert to collateral currency and bp units
+                delta_xccy_rates = [float(x) / spot_fx * 1e-4 for x in delta_xccy_rates_raw]
+
+                delta_xccy = Delta(
+                    risk_ladder=delta_xccy_rates,
+                    tenors=basis_swap_tenors,
+                    currency=collateral_ccy,
+                    curve_type=CurveTypes.USD_GBP_BASIS,
+                )
+            else:
+                # Fallback: no XCCY delta if Jacobian not available
+                delta_xccy = None
+
+            # Create Delta objects for each curve
+            delta_ois = Delta(
+                risk_ladder=delta_ois_rates,
+                tenors=to_tenor(ois_model.swap_times),
+                currency=collateral_ccy,
+                curve_type=derivative._floating_index,
+            )
+
+            # Package deltas into Risk object
+            if delta_xccy is not None:
+                delta = Risk([delta_ois, delta_xccy])
+            else:
+                delta = Risk([delta_ois])
+
+        # GAMMA not yet implemented for cross-currency collateral
+        gamma = None
+        if RequestTypes.GAMMA in reqs:
+            raise NotImplementedError(
+                "GAMMA not yet supported for OIS with cross-currency collateral. "
+                "Only VALUE and DELTA are currently implemented."
+            )
 
         return AnalyticsResult(value=value, risk=delta, gamma=gamma)
 
-    def _compute_xccy(self, derivative, reqs):
+    def _compute_xccy(self, derivative, reqs, collateral_type=None):
         """Compute analytics for cross-currency swaps (VALUE, DELTA, GAMMA).
 
         Handles XccyFixFloat, XccyBasisSwap, and XccyFixFix swaps.
