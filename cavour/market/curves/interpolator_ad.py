@@ -211,21 +211,36 @@ class InterpolatorAd:
             # if tt < 0:
             #     raise LibError("Interpolate times must all be >= 0")
 
-            # Add small epsilon to avoid interpolating at exact grid points
-            # This prevents numerical issues with jnp.interp gradients
+            # Check if we're at an exact grid point to avoid NaN gradients
+            # For exact grid points, return exact value; otherwise interpolate
+            from jax import lax
+
+            distances = jnp.abs(tt - x)
+            min_dist = jnp.min(distances)
+            grid_idx = jnp.argmin(distances)
+            at_grid = min_dist < 1e-10
+
+            # Compute interpolated value
             eps = 1e-12
             tt_adjusted = tt + eps
 
             if method == InterpTypes.LINEAR_ZERO_RATES.value:
-                r = -jnp.log(d) / x
-                return jnp.exp(-jnp.interp(tt_adjusted, x, r) * tt)
-            if method == InterpTypes.FLAT_FWD_RATES.value:
+                # Avoid division by zero for x[0]=0
+                r = -jnp.log(d) / jnp.maximum(x, 1e-15)
+                interp_result = jnp.exp(-jnp.interp(tt_adjusted, x, r) * tt)
+            elif method == InterpTypes.FLAT_FWD_RATES.value:
                 rt = -jnp.log(d)
-                return jnp.exp(-jnp.interp(tt_adjusted, x, rt))
-            if method == InterpTypes.LINEAR_FWD_RATES.value:
-                return jnp.interp(tt_adjusted, x, d)
+                interp_result = jnp.exp(-jnp.interp(tt_adjusted, x, rt))
+            elif method == InterpTypes.LINEAR_FWD_RATES.value:
+                interp_result = jnp.interp(tt_adjusted, x, d)
             else:
                 raise LibError("Invalid interpolation scheme.")
+
+            # Use lax.select to avoid computing gradients through inactive branch
+            # This prevents NaN when differentiating at exact grid points
+            result = lax.select(at_grid, d[grid_idx], interp_result)
+
+            return result
         #return jnp.where(isinstance(t, jnp.ndarray), jax.vmap(_eval_scalar)(t) , _eval_scalar(t))
         tt = jnp.atleast_1d(t)
         out = jax.vmap(_eval_scalar)(tt)

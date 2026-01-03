@@ -59,6 +59,12 @@ class InstrumentTypes(Enum):
     SWAP_FLOAT_LEG = 2
     OIS_SWAP = 3
     XCCY_SWAP = 4
+    ZCIS = 5
+    SWAP_INFLATION_LEG = 6
+    BOND = 7
+    FRN = 8
+    YOY_INFLATION_SWAP = 9
+    SWAP_YOY_INFLATION_LEG = 10
 
 class RequestTypes(Enum):
     VALUE = 1
@@ -82,6 +88,40 @@ class CurveTypes(Enum):
     USD_OIS_SOFR = 2
     EUR_OIS_ESTR = 3
     USD_GBP_BASIS = 4
+    GBP_RPI_INFLATION = 5
+    GBP_CPI_INFLATION = 6
+    USD_CPI_INFLATION = 7
+    EUR_HICP_INFLATION = 8
+
+class InflationIndexTypes(Enum):
+    """Inflation index types for different markets.
+
+    Supported indices:
+    - UK_RPI: UK Retail Price Index (legacy, used for index-linked gilts)
+    - UK_CPI: UK Consumer Price Index (modern standard)
+    - UK_CPIH: UK CPI including housing costs
+    - US_CPI_U: US CPI-U (Urban consumers)
+    - EUR_HICP: Eurozone Harmonised Index of Consumer Prices
+    - EUR_HICP_EX: Eurozone HICP ex-tobacco (standard for swaps)
+    """
+    UK_RPI = 1
+    UK_CPI = 2
+    UK_CPIH = 3
+    US_CPI_U = 4
+    EUR_HICP = 5
+    EUR_HICP_EX = 6
+
+class InflationInterpTypes(Enum):
+    """CPI index interpolation methods for daily values.
+
+    Monthly CPI fixings need interpolation for intra-month dates:
+    - FLAT: Use most recent month's value (conservative)
+    - LINEAR: Linear interpolation between monthly fixings (market standard)
+    - COMPOUND: Compound rate interpolation (rare, used for specific products)
+    """
+    FLAT = 1
+    LINEAR = 2
+    COMPOUND = 3
 
 class CollateralType(Enum):
     """Collateral types for CSA agreements and discounting.

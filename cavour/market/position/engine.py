@@ -10,8 +10,9 @@ from cavour.market.curves.interpolator import *
 from cavour.utils.helpers import to_tenor, times_from_dates
 from cavour.utils.date import Date
 from cavour.utils.day_count import DayCountTypes
+from cavour.utils.error import LibError
 from cavour.market.curves.interpolator_ad import InterpolatorAd
-from cavour.requests.results import Valuation, Gamma, Delta, AnalyticsResult, Risk, CrossGamma
+from cavour.requests.results import Valuation, Gamma, Delta, AnalyticsResult, Risk, CrossGamma, Cashflows, CashflowItem
 from cavour.utils.global_types import (SwapTypes,
                                    InstrumentTypes,
                                    RequestTypes,
@@ -29,6 +30,61 @@ class Engine:
         self.model = model
         # cache bootstrapped curves keyed by curve name
         self._curve_cache: Dict[Any, Dict[str, Any]] = {}
+
+    def _extract_leg_cashflows(self, leg, leg_type_str: str) -> list:
+        """
+        Extract cashflows from a swap leg after value() has been called.
+
+        Args:
+            leg: SwapFixedLeg or SwapFloatLeg instance (must have been valued)
+            leg_type_str: String like "Fixed_Pay", "Float_Rec", "Notional_Pay", etc.
+
+        Returns:
+            List of CashflowItem objects
+        """
+        cashflow_items = []
+
+        # Check if leg has been valued (has payment_dfs attribute)
+        if not hasattr(leg, '_payment_dfs') or not leg._payment_dfs:
+            return cashflow_items
+
+        # Determine sign based on pay/receive
+        # Pay legs are negative cashflows from our perspective, Receive legs are positive
+        sign = -1.0 if 'Pay' in leg_type_str else 1.0
+
+        num_payments = len(leg._payment_dts)
+
+        for i in range(num_payments):
+            # Get notional for this payment (handle notional arrays for floating legs)
+            if hasattr(leg, '_notional_array') and leg._notional_array:
+                notional = float(leg._notional_array[i]) if i < len(leg._notional_array) else float(leg._notional)
+            else:
+                notional = float(leg._notional)
+
+            # Calculate payment fraction (rate * year_frac for fixed, or just the computed rate for float)
+            if notional != 0:
+                payment_fraction = float(leg._payments[i]) / notional
+            else:
+                payment_fraction = 0.0
+
+            # Apply sign convention: Pay = negative, Receive = positive
+            signed_amount = sign * float(leg._payments[i])
+            signed_pv = sign * float(leg._payment_pvs[i])
+
+            # Create cashflow item
+            cf_item = CashflowItem(
+                payment_date=leg._payment_dts[i],
+                notional=notional,
+                payment_fraction=payment_fraction,
+                accrual_period=float(leg._year_fracs[i]),
+                amount=signed_amount,
+                discount_factor=float(leg._payment_dfs[i]),
+                discounted_amount=signed_pv,
+                leg_type=leg_type_str
+            )
+            cashflow_items.append(cf_item)
+
+        return cashflow_items
 
     def compute(self, derivative, request_list, collateral_type=None):
         """Return analytics for the given derivative and requested measures.
@@ -52,6 +108,18 @@ class Engine:
         # Route OIS swaps to new handler (supports collateral)
         if derivative.derivative_type == InstrumentTypes.OIS_SWAP:
             return self._compute_ois(derivative, reqs, collateral_type)
+
+        # Route bonds to bond handler
+        if derivative.derivative_type == InstrumentTypes.BOND:
+            return self._compute_bond(derivative, reqs)
+
+        # Route FRNs to FRN handler
+        if derivative.derivative_type == InstrumentTypes.FRN:
+            return self._compute_frn(derivative, reqs)
+
+        # Route YoY Inflation Swaps to YoY IIS handler
+        if derivative.derivative_type == InstrumentTypes.YOY_INFLATION_SWAP:
+            return self._compute_yoy_iis(derivative, reqs)
 
         raise LibError(f"{derivative.derivative_type} not yet implemented")
 
@@ -120,7 +188,31 @@ class Engine:
         if RequestTypes.GAMMA in reqs:
             gamma = fixed.get("gamma") + floating.get("gamma")
 
-        return AnalyticsResult(value=value, risk=delta, gamma=gamma)
+        # Cashflows extraction
+        cashflows = None
+        if RequestTypes.CASHFLOWS in reqs:
+            all_cashflows = []
+
+            # Value the legs explicitly to populate cashflow data
+            # (The analytics methods use separate copies for AD, so we need to value the original legs)
+            derivative._fixed_leg.value(ir_model._value_dt, ir_model)
+            derivative._float_leg.value(ir_model._value_dt, ir_model, ir_model)
+
+            # Determine leg types based on swap direction
+            fixed_leg_type = "Fixed_Pay" if derivative._fixed_leg._leg_type == SwapTypes.PAY else "Fixed_Rec"
+            float_leg_type = "Float_Rec" if derivative._fixed_leg._leg_type == SwapTypes.PAY else "Float_Pay"
+
+            # Extract cashflows from fixed leg
+            fixed_cfs = self._extract_leg_cashflows(derivative._fixed_leg, fixed_leg_type)
+            all_cashflows.extend(fixed_cfs)
+
+            # Extract cashflows from floating leg
+            float_cfs = self._extract_leg_cashflows(derivative._float_leg, float_leg_type)
+            all_cashflows.extend(float_cfs)
+
+            cashflows = Cashflows(all_cashflows, derivative._currency)
+
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=cashflows)
 
     def _compute_ois_xccy_collateral(self, derivative, reqs, collateral_ccy):
         """Compute OIS with cross-currency collateral (dual-curve discounting).
@@ -402,7 +494,919 @@ class Engine:
                 "Only VALUE and DELTA are currently implemented."
             )
 
-        return AnalyticsResult(value=value, risk=delta, gamma=gamma)
+        # Cashflows extraction (placeholder for future implementation)
+        cashflows = None
+        if RequestTypes.CASHFLOWS in reqs:
+            # TODO: Extract cashflow data from fixed and floating legs
+            cashflows = Cashflows([], derivative._currency)
+
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=cashflows)
+
+    def _compute_bond(self, derivative, reqs):
+        """Compute analytics for bonds (VALUE, DELTA, GAMMA).
+
+        Args:
+            derivative: Bond instance
+            reqs: Set of RequestTypes (VALUE, DELTA, GAMMA)
+
+        Returns:
+            AnalyticsResult with value, risk (delta), and gamma
+        """
+        # Get the curve name from the bond's currency
+        # Bonds discount on the OIS curve for their currency
+        curve_name_map = {
+            CurrencyTypes.GBP: "GBP_OIS_SONIA",
+            CurrencyTypes.USD: "USD_OIS_SOFR",
+            CurrencyTypes.EUR: "EUR_OIS_ESTR",
+        }
+
+        if derivative._currency not in curve_name_map:
+            raise LibError(f"No default OIS curve for currency {derivative._currency}")
+
+        curve_name = curve_name_map[derivative._currency]
+        ir_model = getattr(self.model.curves, curve_name)
+
+        # Get cached curve data
+        curve_key = tuple(ir_model.swap_times)
+        cache = self._cached_curve(
+            curve_key,
+            ir_model.swap_rates,
+            ir_model.swap_times,
+            ir_model.year_fracs,
+            ir_model._interp_type
+        )
+
+        times = cache["times"]
+        dfs = cache["dfs"]
+        jac = cache["jac"]
+        hess_curve = cache["hess"]
+
+        # Extract bond cashflow data
+        dc_type = derivative._dc_type
+        value_dt = ir_model._value_dt
+
+        # Convert payment dates to times
+        payment_times = jnp.array(
+            [times_from_dates(dt, value_dt, dc_type) for dt in derivative._payment_dts]
+        )
+
+        # Get coupon payments
+        payments = jnp.array(derivative._coupon_payments)
+
+        # Principal and notional
+        principal = derivative._face_value
+        notional = derivative._face_value
+
+        # Bonds are always "receive" from investor perspective
+        leg_sign = +1.0
+
+        # Value time
+        value_time = times_from_dates(value_dt, value_dt, dc_type)
+
+        # Create partial function for bond pricing
+        pv_fn = partial(
+            self._price_fixed_leg_jax,
+            times=times,
+            interp_type=ir_model._interp_type,
+            payment_times=payment_times,
+            payments=payments,
+            principal=principal,
+            notional=notional,
+            leg_sign=leg_sign,
+            value_time=value_time,
+        )
+
+        # Initialize results
+        value = None
+        delta = None
+        gamma = None
+
+        # Compute VALUE
+        if RequestTypes.VALUE in reqs:
+            val = pv_fn(dfs)
+            # Convert to scalar
+            val_scalar = float(jnp.atleast_1d(val).item() if jnp.ndim(val) == 0 else val.squeeze())
+            value = Valuation(amount=val_scalar, currency=derivative._currency)
+
+        # Compute gradient (needed for both DELTA and GAMMA)
+        need_grad = RequestTypes.DELTA in reqs or RequestTypes.GAMMA in reqs
+        grad_dfs = None
+        if need_grad:
+            grad_dfs = grad(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
+
+        # Compute DELTA
+        if RequestTypes.DELTA in reqs:
+            # Chain rule: sensitivity to rates = d(PV)/d(DFs) * d(DFs)/d(rates)
+            sensitivities = jnp.dot(grad_dfs, jac)
+            # Convert to bp and extract values
+            sensies = [float(x) * 1e-4 for x in sensitivities]
+
+            # Create curve type enum based on currency
+            curve_type_map = {
+                CurrencyTypes.GBP: CurveTypes.GBP_OIS_SONIA,
+                CurrencyTypes.USD: CurveTypes.USD_OIS_SOFR,
+                CurrencyTypes.EUR: CurveTypes.EUR_OIS_ESTR,
+            }
+            curve_type = curve_type_map.get(derivative._currency, CurveTypes.GBP_OIS_SONIA)
+
+            delta = Delta(
+                risk_ladder=sensies,
+                tenors=to_tenor(ir_model.swap_times),
+                currency=derivative._currency,
+                curve_type=curve_type,
+            )
+
+        # Compute GAMMA
+        if RequestTypes.GAMMA in reqs:
+            # Compute Hessian w.r.t. discount factors
+            hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
+
+            # Chain rule for second derivatives:
+            # d²PV/dr² = d²PV/dDF² * (dDF/dr)² + dPV/dDF * d²DF/dr²
+            term1 = jac.T @ hess_dfs @ jac  # First term
+            term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)  # Second term
+            gammas = term1 + term2
+
+            # Convert to bp²
+            gammas = np.array(gammas, dtype=np.float64) * 1e-8
+
+            # Create curve type enum
+            curve_type_map = {
+                CurrencyTypes.GBP: CurveTypes.GBP_OIS_SONIA,
+                CurrencyTypes.USD: CurveTypes.USD_OIS_SOFR,
+                CurrencyTypes.EUR: CurveTypes.EUR_OIS_ESTR,
+            }
+            curve_type = curve_type_map.get(derivative._currency, CurveTypes.GBP_OIS_SONIA)
+
+            gamma = Gamma(
+                risk_ladder=gammas,
+                tenors=to_tenor(ir_model.swap_times),
+                currency=derivative._currency,
+                curve_type=curve_type,
+            )
+
+        # Cashflows extraction
+        cashflows = None
+        if RequestTypes.CASHFLOWS in reqs:
+            all_cashflows = []
+
+            # Value the bond to populate cashflow data
+            derivative.value(ir_model._value_dt, ir_model)
+
+            # Extract coupon and principal cashflows
+            num_payments = len(derivative._payment_dts)
+
+            for i in range(num_payments):
+                payment_dt = derivative._payment_dts[i]
+                coupon_amt = derivative._coupon_payments[i]
+                principal_amt = derivative._principal_payments[i] if hasattr(derivative, '_principal_payments') else 0.0
+
+                # Add coupon cashflow if non-zero
+                if abs(coupon_amt) > 1e-10:
+                    # Calculate coupon rate from payment amount and notional
+                    notional = derivative._principal_schedule[i] if hasattr(derivative, '_principal_schedule') else derivative._face_value
+                    coupon_fraction = coupon_amt / notional if notional != 0 else 0.0
+
+                    cf_item = CashflowItem(
+                        payment_date=payment_dt,
+                        notional=notional,
+                        payment_fraction=coupon_fraction,
+                        accrual_period=float(derivative._year_fracs[i]),
+                        amount=float(coupon_amt),
+                        discount_factor=float(derivative._payment_dfs[i]),
+                        discounted_amount=float(derivative._coupon_pvs[i]),
+                        leg_type="Coupon"
+                    )
+                    all_cashflows.append(cf_item)
+
+                # Add principal cashflow if non-zero
+                if abs(principal_amt) > 1e-10:
+                    cf_item = CashflowItem(
+                        payment_date=payment_dt,
+                        notional=principal_amt,
+                        payment_fraction=1.0,  # Principal repayment
+                        accrual_period=0.0,  # No accrual for principal
+                        amount=float(principal_amt),
+                        discount_factor=float(derivative._payment_dfs[i]),
+                        discounted_amount=float(derivative._principal_pvs[i]),
+                        leg_type="Principal"
+                    )
+                    all_cashflows.append(cf_item)
+
+            cashflows = Cashflows(all_cashflows, derivative._currency)
+
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=cashflows)
+
+    def _compute_frn(self, derivative, reqs):
+        """Compute analytics for FRNs (Floating Rate Notes) with VALUE, DELTA, GAMMA.
+
+        Args:
+            derivative: FRN instance
+            reqs: Set of RequestTypes (VALUE, DELTA, GAMMA)
+
+        Returns:
+            AnalyticsResult with value, risk (delta), and gamma
+        """
+        # Get the discount curve from the FRN's currency
+        curve_name_map = {
+            CurrencyTypes.GBP: "GBP_OIS_SONIA",
+            CurrencyTypes.USD: "USD_OIS_SOFR",
+            CurrencyTypes.EUR: "EUR_OIS_ESTR",
+        }
+
+        if derivative._currency not in curve_name_map:
+            raise LibError(f"No default OIS curve for currency {derivative._currency}")
+
+        # Get discount curve (for discounting cashflows)
+        discount_curve_name = curve_name_map[derivative._currency]
+        discount_model = getattr(self.model.curves, discount_curve_name)
+
+        # Get index curve (for forward rate projection)
+        index_curve_name = derivative._floating_index.name
+        index_model = getattr(self.model.curves, index_curve_name)
+
+        # Build discount curve cache
+        disc_curve_key = tuple(discount_model.swap_times)
+        disc_cache = self._cached_curve(
+            disc_curve_key,
+            discount_model.swap_rates,
+            discount_model.swap_times,
+            discount_model.year_fracs,
+            discount_model._interp_type
+        )
+
+        disc_times = disc_cache["times"]
+        disc_dfs = disc_cache["dfs"]
+        disc_jac = disc_cache["jac"]
+        disc_hess = disc_cache["hess"]
+
+        # Build index curve cache (may be same as discount curve)
+        if index_curve_name == discount_curve_name:
+            idx_times = disc_times
+            idx_dfs = disc_dfs
+            idx_jac = disc_jac
+            idx_hess = disc_hess
+        else:
+            idx_curve_key = tuple(index_model.swap_times)
+            idx_cache = self._cached_curve(
+                idx_curve_key,
+                index_model.swap_rates,
+                index_model.swap_times,
+                index_model.year_fracs,
+                index_model._interp_type
+            )
+            idx_times = idx_cache["times"]
+            idx_dfs = idx_cache["dfs"]
+            idx_jac = idx_cache["jac"]
+            idx_hess = idx_cache["hess"]
+
+        # Extract FRN cashflow data
+        dc_type = derivative._dc_type
+        value_dt = discount_model._value_dt
+        value_time = times_from_dates(value_dt, value_dt, dc_type)
+
+        # Convert payment dates to times
+        payment_times = jnp.array(
+            [times_from_dates(dt, value_dt, dc_type) for dt in derivative._payment_dts]
+        )
+
+        # Convert start/end accrual dates to times
+        start_times = jnp.array(
+            [times_from_dates(dt, value_dt, dc_type) for dt in derivative._start_accrued_dts]
+        )
+
+        end_times = jnp.array(
+            [times_from_dates(dt, value_dt, dc_type) for dt in derivative._end_accrued_dts]
+        )
+
+        # Year fractions for payment calculation
+        pay_alphas = jnp.array(derivative._year_fracs)
+
+        # Spreads (quoted margin)
+        spreads = jnp.full_like(pay_alphas, derivative._quoted_margin)
+
+        # Notionals (constant for FRN unless amortizing)
+        notionals = jnp.full_like(pay_alphas, derivative._face_value)
+
+        # Principal at maturity
+        principal = derivative._face_value
+
+        # FRNs are always from investor perspective (receive coupons + principal)
+        leg_sign = +1.0
+
+        # First fixing rate handling
+        first_fixing_rate = derivative._first_fixing_rate if derivative._first_fixing_rate is not None else 0.0
+        override_first = derivative._first_fixing_rate is not None
+
+        # Determine if we need separate index curve
+        use_separate_index = index_curve_name != discount_curve_name
+
+        # Function to price floating leg + principal
+        def pv_fn_combined(dfs):
+            # Call _float_leg_jax with appropriate parameters
+            if use_separate_index:
+                float_pv = self._float_leg_jax(
+                    dfs=dfs,
+                    times=disc_times,
+                    disc_interp_type=discount_model._interp_type,
+                    idx_interp_type=index_model._interp_type,
+                    payment_times=payment_times,
+                    start_times=start_times,
+                    end_times=end_times,
+                    pay_alphas=pay_alphas,
+                    spreads=spreads,
+                    notionals=notionals,
+                    principal=0.0,
+                    leg_sign=leg_sign,
+                    value_time=value_time,
+                    first_fixing_rate=first_fixing_rate,
+                    override_first=override_first,
+                    idx_times=idx_times,
+                    idx_dfs=idx_dfs
+                )
+            else:
+                # Single curve case - index and discount are the same
+                float_pv = self._float_leg_jax(
+                    dfs=dfs,
+                    times=disc_times,
+                    disc_interp_type=discount_model._interp_type,
+                    idx_interp_type=index_model._interp_type,
+                    payment_times=payment_times,
+                    start_times=start_times,
+                    end_times=end_times,
+                    pay_alphas=pay_alphas,
+                    spreads=spreads,
+                    notionals=notionals,
+                    principal=0.0,
+                    leg_sign=leg_sign,
+                    value_time=value_time,
+                    first_fixing_rate=first_fixing_rate,
+                    override_first=override_first
+                )
+
+            # Add principal repayment at maturity
+            maturity_time = times_from_dates(derivative._maturity_dt, value_dt, dc_type)
+            if maturity_time > value_time:
+                interp = InterpolatorAd(discount_model._interp_type)
+                df_maturity = interp.simple_interpolate(
+                    maturity_time,
+                    disc_times,
+                    dfs,
+                    discount_model._interp_type.value
+                )
+                principal_pv = principal * leg_sign * df_maturity[0] if jnp.ndim(df_maturity) > 0 else principal * leg_sign * df_maturity
+            else:
+                principal_pv = 0.0
+
+            return float_pv + principal_pv
+
+
+        # Initialize results
+        value = None
+        delta = None
+        gamma = None
+
+        # Compute VALUE
+        if RequestTypes.VALUE in reqs:
+            val = pv_fn_combined(disc_dfs)
+            val_scalar = float(jnp.atleast_1d(val).item() if jnp.ndim(val) == 0 else val.squeeze())
+            value = Valuation(amount=val_scalar, currency=derivative._currency)
+
+        # For DELTA and GAMMA, we need to handle dual-curve sensitivities
+        # For now, implement single-curve case (discount curve sensitivities only)
+        need_grad = RequestTypes.DELTA in reqs or RequestTypes.GAMMA in reqs
+
+        if need_grad:
+            # Check if discount and index curves are the same
+            if index_curve_name == discount_curve_name:
+                # Single curve case - easier
+                # Compute gradient directly
+                grad_dfs = grad(lambda d: jnp.squeeze(pv_fn_combined(d)))(disc_dfs)
+
+                # Compute DELTA
+                if RequestTypes.DELTA in reqs:
+                    sensitivities = jnp.dot(grad_dfs, disc_jac)
+                    sensies = [float(x) * 1e-4 for x in sensitivities]
+
+                    curve_type_map = {
+                        CurrencyTypes.GBP: CurveTypes.GBP_OIS_SONIA,
+                        CurrencyTypes.USD: CurveTypes.USD_OIS_SOFR,
+                        CurrencyTypes.EUR: CurveTypes.EUR_OIS_ESTR,
+                    }
+                    curve_type = curve_type_map.get(derivative._currency, CurveTypes.GBP_OIS_SONIA)
+
+                    delta = Delta(
+                        risk_ladder=sensies,
+                        tenors=to_tenor(discount_model.swap_times),
+                        currency=derivative._currency,
+                        curve_type=curve_type,
+                    )
+
+                # Compute GAMMA
+                if RequestTypes.GAMMA in reqs:
+                    hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn_combined(d)))(disc_dfs)
+
+                    # Chain rule for second derivatives
+                    term1 = disc_jac.T @ hess_dfs @ disc_jac
+                    term2 = jnp.sum(grad_dfs[:, None, None] * disc_hess, axis=0)
+                    gammas = term1 + term2
+
+                    # Convert to bp^2
+                    gammas = np.array(gammas, dtype=np.float64) * 1e-8
+
+                    curve_type = curve_type_map.get(derivative._currency, CurveTypes.GBP_OIS_SONIA)
+
+                    gamma = Gamma(
+                        risk_ladder=gammas,
+                        tenors=to_tenor(discount_model.swap_times),
+                        currency=derivative._currency,
+                        curve_type=curve_type,
+                    )
+            else:
+                # Dual curve case - more complex (TODO: implement cross-curve sensitivities)
+                raise LibError("Dual-curve FRN delta/gamma not yet implemented. "
+                             "Use same curve for discounting and projection.")
+
+        # Cashflows extraction
+        cashflows = None
+        if RequestTypes.CASHFLOWS in reqs:
+            all_cashflows = []
+
+            # Value the FRN to populate cashflow data
+            derivative.value(self.model.value_dt, discount_model, index_model)
+
+            # Extract floating coupon cashflows
+            num_payments = len(derivative._payment_dts)
+
+            for i in range(num_payments):
+                payment_dt = derivative._payment_dts[i]
+                coupon_amt = derivative._coupon_payments[i]
+
+                # Extract principal component from last payment
+                # (FRN value() adds principal to last payment's PV)
+                is_last_payment = (i == num_payments - 1)
+
+                # Coupon cashflow
+                if abs(coupon_amt) > 1e-10:
+                    coupon_fraction = derivative._rates[i]  # Floating rate + margin
+
+                    cf_item = CashflowItem(
+                        payment_date=payment_dt,
+                        notional=derivative._face_value,
+                        payment_fraction=coupon_fraction,
+                        accrual_period=float(derivative._year_fracs[i]),
+                        amount=float(coupon_amt),
+                        discount_factor=float(derivative._payment_dfs[i]),
+                        discounted_amount=float(coupon_amt * derivative._payment_dfs[i]),
+                        leg_type="Floating_Coupon"
+                    )
+                    all_cashflows.append(cf_item)
+
+                # Principal cashflow at maturity
+                if is_last_payment:
+                    principal_amt = derivative._face_value
+                    df = derivative._payment_dfs[i] if i < len(derivative._payment_dfs) else 0.0
+
+                    cf_item = CashflowItem(
+                        payment_date=payment_dt,
+                        notional=principal_amt,
+                        payment_fraction=1.0,  # Principal repayment
+                        accrual_period=0.0,  # No accrual for principal
+                        amount=float(principal_amt),
+                        discount_factor=float(df),
+                        discounted_amount=float(principal_amt * df),
+                        leg_type="Principal"
+                    )
+                    all_cashflows.append(cf_item)
+
+            cashflows = Cashflows(all_cashflows, derivative._currency)
+
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=cashflows)
+
+    def _compute_yoy_iis(self, derivative, reqs):
+        """Compute analytics for Year-on-Year Inflation Swaps (VALUE, DELTA, GAMMA).
+
+        Args:
+            derivative: YoYInflationSwap instance
+            reqs: Set of RequestTypes (VALUE, DELTA, GAMMA)
+
+        Returns:
+            AnalyticsResult with value, risk (delta), and gamma
+        """
+        # Get inflation curve from model based on index type and currency
+        # Map from (currency, index_type) to curve attribute name
+        inflation_curve_map = {
+            (CurrencyTypes.GBP, "UK_RPI"): "GBP_RPI_INFLATION",
+            (CurrencyTypes.GBP, "UK_CPI"): "GBP_CPI_INFLATION",
+            (CurrencyTypes.USD, "US_CPI_U"): "USD_CPI_INFLATION",
+            (CurrencyTypes.EUR, "EUR_HICP"): "EUR_HICP_INFLATION",
+        }
+
+        # Get discount curve based on currency
+        discount_curve_map = {
+            CurrencyTypes.GBP: "GBP_OIS_SONIA",
+            CurrencyTypes.USD: "USD_OIS_SOFR",
+            CurrencyTypes.EUR: "EUR_OIS_ESTR",
+        }
+
+        currency = derivative._inflation_index._currency
+        index_type_name = derivative._inflation_index._index_type.name
+
+        # Get discount curve
+        if currency not in discount_curve_map:
+            raise LibError(f"No default OIS curve for currency {currency}")
+
+        discount_curve_name = discount_curve_map[currency]
+        discount_curve = getattr(self.model.curves, discount_curve_name, None)
+
+        if discount_curve is None:
+            raise LibError(f"Discount curve {discount_curve_name} not found in model")
+
+        # Get inflation curve
+        inflation_curve_key = (currency, index_type_name)
+        if inflation_curve_key not in inflation_curve_map:
+            raise LibError(
+                f"No inflation curve mapping for {currency.name} {index_type_name}. "
+                f"Add to model.curves as {currency.name}_{index_type_name}_INFLATION"
+            )
+
+        inflation_curve_name = inflation_curve_map[inflation_curve_key]
+        inflation_curve = getattr(self.model.curves, inflation_curve_name, None)
+
+        if inflation_curve is None:
+            raise LibError(f"Inflation curve {inflation_curve_name} not found in model")
+
+        # Import JAX dependencies
+        from jax import grad, hessian, jacrev, jacfwd
+        import jax.numpy as jnp
+        from cavour.utils.helpers import times_from_dates
+        from cavour.market.curves.interpolator_ad import InterpolatorAd
+        from functools import partial
+
+        # Get cached discount curve data
+        disc_curve_key = tuple(discount_curve.swap_times)
+        disc_cache = self._cached_curve(
+            disc_curve_key,
+            discount_curve.swap_rates,
+            discount_curve.swap_times,
+            discount_curve.year_fracs,
+            discount_curve._interp_type
+        )
+        disc_times = disc_cache["times"]
+        disc_dfs = disc_cache["dfs"]
+        disc_jac = disc_cache["jac"]
+        disc_hess = disc_cache["hess"]
+
+        # Get inflation curve data (use breakeven rates as inputs)
+        # Note: _times includes t=0, _dfs includes 1.0 at t=0
+        # IMPORTANT: Convert to plain numpy arrays FIRST, before any JAX transformations
+        # This prevents JAX tracer leaks from contaminating the curve object
+        try:
+            # Try to convert directly (will work if no tracers)
+            infl_times_np = np.array(inflation_curve._times, dtype=np.float64).copy()
+            infl_factors_np = np.array(inflation_curve._dfs, dtype=np.float64).copy()
+        except:
+            # If curve is contaminated with tracers, rebuild from breakeven rates
+            infl_breakeven_rates_temp = [zcis._fixed_rate for zcis in inflation_curve._used_swaps]
+            infl_times_rebuild, infl_factors_rebuild = inflation_curve._build_curve_ad(
+                jnp.array(infl_breakeven_rates_temp))
+            infl_times_np = np.array(infl_times_rebuild, dtype=np.float64).copy()
+            infl_factors_np = np.array(infl_factors_rebuild, dtype=np.float64).copy()
+
+        # Now convert to JAX arrays for use in AD
+        infl_times = jnp.array(infl_times_np)
+        infl_factors = jnp.array(infl_factors_np)
+        # Extract breakeven rates from ZCIS instruments
+        infl_breakeven_rates = [zcis._fixed_rate for zcis in inflation_curve._used_swaps]
+
+        # Prepare swap leg parameters
+        dc_type = derivative._fixed_leg._dc_type
+        value_time = times_from_dates(self.model.value_dt, self.model.value_dt, dc_type)
+
+        # Fixed leg parameters
+        fixed_payment_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                         for dt in derivative._fixed_leg._payment_dts])
+        fixed_alphas = jnp.array(derivative._fixed_leg._year_fracs)
+        fixed_coupons = jnp.full_like(fixed_alphas, derivative._fixed_leg._cpn)
+        fixed_notionals = jnp.full_like(fixed_alphas, derivative._fixed_leg._notional)
+        fixed_principal = derivative._fixed_leg._principal
+        fixed_leg_sign = +1.0 if derivative._fixed_leg._leg_type == SwapTypes.RECEIVE else -1.0
+
+        # YoY inflation leg parameters
+        yoy_payment_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                       for dt in derivative._inflation_leg._payment_dts])
+        yoy_start_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                     for dt in derivative._inflation_leg._yoy_start_dts])
+        yoy_end_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                   for dt in derivative._inflation_leg._yoy_end_dts])
+        yoy_alphas = jnp.array(derivative._inflation_leg._year_fracs)
+        yoy_spread = derivative._inflation_leg._spread
+        yoy_notionals = jnp.full_like(yoy_alphas, derivative._inflation_leg._notional)
+        yoy_leg_sign = +1.0 if derivative._inflation_leg._leg_type == SwapTypes.RECEIVE else -1.0
+
+        # Define JAX pricing function for YoY inflation leg
+        def price_yoy_inflation_leg_jax(disc_dfs_var, infl_factors_var, disc_times_var, infl_times_var):
+            """Price YoY inflation leg using JAX-compatible operations."""
+            interp_disc = InterpolatorAd(discount_curve._interp_type)
+            interp_infl = InterpolatorAd(inflation_curve._interp_type)
+
+            # Discount factors for value date and payment dates
+            df_val = jnp.atleast_1d(interp_disc.simple_interpolate(
+                value_time, disc_times_var, disc_dfs_var, discount_curve._interp_type.value))
+            df_pmts = jnp.atleast_1d(interp_disc.simple_interpolate(
+                yoy_payment_times, disc_times_var, disc_dfs_var, discount_curve._interp_type.value))
+
+            # Inflation factors at YoY start and end dates
+            # Note: inflation_factors[0] = 1.0 at t=0, so factors grow with inflation
+            infl_start = jnp.atleast_1d(interp_infl.simple_interpolate(
+                yoy_start_times, infl_times_var, infl_factors_var, inflation_curve._interp_type.value))
+            infl_end = jnp.atleast_1d(interp_infl.simple_interpolate(
+                yoy_end_times, infl_times_var, infl_factors_var, inflation_curve._interp_type.value))
+
+            # YoY inflation rates: (I_end / I_start) - 1
+            yoy_rates = (infl_end / infl_start) - 1.0
+
+            # Total rates including spread
+            total_rates = yoy_rates + yoy_spread
+
+            # Payments: notional × year_frac × (yoy_rate + spread)
+            payments = yoy_notionals * yoy_alphas * total_rates
+
+            # Mask for future cashflows
+            mask = yoy_payment_times > value_time
+
+            # Relative discount factors (df_val should be ~1.0 at value date)
+            df_rel = df_pmts / jnp.squeeze(df_val)
+
+            # PV of payments (only include future cashflows)
+            pv_payments = jnp.where(mask, payments * df_rel, 0.0)
+
+            # Sum payments
+            leg_pv = jnp.sum(pv_payments)
+            return yoy_leg_sign * leg_pv
+
+        # Initialize results
+        value = None
+        delta = None
+        gamma = None
+        cashflows = None
+
+        # Compute VALUE
+        if RequestTypes.VALUE in reqs:
+            # Fixed leg PV
+            fixed_payments = fixed_coupons * fixed_alphas * fixed_notionals
+            fixed_pv = self._price_fixed_leg_jax(
+                dfs=disc_dfs,
+                times=disc_times,
+                interp_type=discount_curve._interp_type,
+                payment_times=fixed_payment_times,
+                payments=fixed_payments,
+                principal=fixed_principal,
+                notional=derivative._fixed_leg._notional,
+                leg_sign=fixed_leg_sign,
+                value_time=value_time
+            )
+
+            # YoY inflation leg PV
+            yoy_pv = price_yoy_inflation_leg_jax(disc_dfs, infl_factors, disc_times, infl_times)
+
+            # Total PV
+            total_pv = float(jnp.squeeze(fixed_pv)) + float(jnp.squeeze(yoy_pv))
+            value = Valuation(amount=total_pv, currency=currency)
+
+        # Compute DELTA (multi-curve sensitivities)
+        if RequestTypes.DELTA in reqs:
+            # Define PV functions for each curve
+
+            # 1. Fixed leg sensitivity to discount curve
+            def pv_fixed_disc_fn(disc_dfs_var):
+                fixed_payments = fixed_coupons * fixed_alphas * fixed_notionals
+                return self._price_fixed_leg_jax(
+                    dfs=disc_dfs_var, times=disc_times,
+                    interp_type=discount_curve._interp_type,
+                    payment_times=fixed_payment_times,
+                    payments=fixed_payments, principal=fixed_principal,
+                    notional=derivative._fixed_leg._notional,
+                    leg_sign=fixed_leg_sign, value_time=value_time
+                )
+
+            # 2. YoY leg sensitivity to discount curve (holding inflation curve fixed)
+            def pv_yoy_disc_fn(disc_dfs_var):
+                return price_yoy_inflation_leg_jax(disc_dfs_var, infl_factors, disc_times, infl_times)
+
+            # 3. YoY leg sensitivity to inflation curve (holding discount curve fixed)
+            def pv_yoy_infl_fn(infl_factors_var):
+                return price_yoy_inflation_leg_jax(disc_dfs, infl_factors_var, disc_times, infl_times)
+
+            # Gradients w.r.t. discount factors
+            grad_fixed_disc = grad(lambda d: jnp.squeeze(pv_fixed_disc_fn(d)))(disc_dfs)
+            grad_yoy_disc = grad(lambda d: jnp.squeeze(pv_yoy_disc_fn(d)))(disc_dfs)
+            grad_total_disc = grad_fixed_disc + grad_yoy_disc
+
+            # Chain rule: sensitivity to discount curve rates
+            disc_sensitivities = jnp.dot(grad_total_disc, disc_jac)
+            disc_sensies = [float(x) * 1e-4 for x in disc_sensitivities]  # Convert to bp
+
+            # Gradient w.r.t. inflation factors
+            grad_yoy_infl = grad(lambda i: jnp.squeeze(pv_yoy_infl_fn(i)))(infl_factors)
+
+            # For inflation curve, we need Jacobian of factors w.r.t. breakeven rates
+            # Use _build_curve_ad to get this Jacobian
+            def inflation_factors_from_rates(rates):
+                _, factors_ad = inflation_curve._build_curve_ad(rates)
+                return factors_ad
+
+            infl_breakeven_rates_jax = jnp.array(infl_breakeven_rates)
+            infl_jac = jacrev(inflation_factors_from_rates)(infl_breakeven_rates_jax)
+
+            # Chain rule: sensitivity to inflation breakeven rates
+            infl_sensitivities = jnp.dot(grad_yoy_infl, infl_jac)
+            infl_sensies = [float(x) * 1e-4 for x in infl_sensitivities]  # Convert to bp
+
+            # Create multi-curve Delta object using Risk container
+            from cavour.requests.results import Risk, Delta
+
+            disc_curve_type_map = {
+                CurrencyTypes.GBP: CurveTypes.GBP_OIS_SONIA,
+                CurrencyTypes.USD: CurveTypes.USD_OIS_SOFR,
+                CurrencyTypes.EUR: CurveTypes.EUR_OIS_ESTR,
+            }
+            disc_curve_type = disc_curve_type_map.get(currency, CurveTypes.GBP_OIS_SONIA)
+
+            infl_curve_type_map = {
+                (CurrencyTypes.GBP, "UK_RPI"): CurveTypes.GBP_RPI_INFLATION,
+                (CurrencyTypes.GBP, "UK_CPI"): CurveTypes.GBP_CPI_INFLATION,
+                (CurrencyTypes.USD, "US_CPI_U"): CurveTypes.USD_CPI_INFLATION,
+                (CurrencyTypes.EUR, "EUR_HICP"): CurveTypes.EUR_HICP_INFLATION,
+            }
+            infl_curve_type = infl_curve_type_map.get(
+                (currency, index_type_name), CurveTypes.GBP_RPI_INFLATION)
+
+            # Create Delta objects for each curve
+            disc_delta_obj = Delta(
+                risk_ladder=disc_sensies,
+                tenors=to_tenor(discount_curve.swap_times),
+                currency=currency,
+                curve_type=disc_curve_type
+            )
+
+            infl_delta_obj = Delta(
+                risk_ladder=infl_sensies,
+                tenors=to_tenor(inflation_curve.swap_times),
+                currency=currency,
+                curve_type=infl_curve_type
+            )
+
+            delta = Risk([disc_delta_obj, infl_delta_obj])
+
+        # Compute GAMMA (multi-curve second-order sensitivities)
+        if RequestTypes.GAMMA in reqs:
+            # Define PV functions (same as DELTA)
+            def pv_fixed_disc_fn(disc_dfs_var):
+                fixed_payments = fixed_coupons * fixed_alphas * fixed_notionals
+                return self._price_fixed_leg_jax(
+                    dfs=disc_dfs_var, times=disc_times,
+                    interp_type=discount_curve._interp_type,
+                    payment_times=fixed_payment_times,
+                    payments=fixed_payments, principal=fixed_principal,
+                    notional=derivative._fixed_leg._notional,
+                    leg_sign=fixed_leg_sign, value_time=value_time
+                )
+
+            def pv_yoy_disc_fn(disc_dfs_var):
+                return price_yoy_inflation_leg_jax(disc_dfs_var, infl_factors, disc_times, infl_times)
+
+            def pv_yoy_infl_fn(infl_factors_var):
+                return price_yoy_inflation_leg_jax(disc_dfs, infl_factors_var, disc_times, infl_times)
+
+            # Total PV function for discount curve
+            def pv_total_disc_fn(disc_dfs_var):
+                return jnp.squeeze(pv_fixed_disc_fn(disc_dfs_var)) + jnp.squeeze(pv_yoy_disc_fn(disc_dfs_var))
+
+            # Gradients (needed for chain rule)
+            grad_total_disc = grad(pv_total_disc_fn)(disc_dfs)
+            grad_yoy_infl = grad(lambda i: jnp.squeeze(pv_yoy_infl_fn(i)))(infl_factors)
+
+            # Hessians w.r.t. discount factors
+            hess_total_disc = hessian(pv_total_disc_fn)(disc_dfs)
+
+            # Hessian w.r.t. inflation factors
+            hess_yoy_infl = hessian(lambda i: jnp.squeeze(pv_yoy_infl_fn(i)))(infl_factors)
+
+            # Get inflation curve Jacobian and Hessian
+            def inflation_factors_from_rates(rates):
+                _, factors_ad = inflation_curve._build_curve_ad(rates)
+                return factors_ad
+
+            infl_breakeven_rates_jax = jnp.array(infl_breakeven_rates)
+            infl_jac = jacrev(inflation_factors_from_rates)(infl_breakeven_rates_jax)
+            infl_hess = jacfwd(jacrev(inflation_factors_from_rates))(infl_breakeven_rates_jax)
+
+            # Chain rule for discount curve gamma
+            disc_gamma_term1 = disc_jac.T @ hess_total_disc @ disc_jac
+            disc_gamma_term2 = jnp.sum(grad_total_disc[:, None, None] * disc_hess, axis=0)
+            disc_gamma = disc_gamma_term1 + disc_gamma_term2
+            disc_gamma = np.array(disc_gamma, dtype=np.float64) * 1e-8  # Convert to bp²
+
+            # Chain rule for inflation curve gamma
+            infl_gamma_term1 = infl_jac.T @ hess_yoy_infl @ infl_jac
+            infl_gamma_term2 = jnp.sum(grad_yoy_infl[:, None, None] * infl_hess, axis=0)
+            infl_gamma = infl_gamma_term1 + infl_gamma_term2
+            infl_gamma = np.array(infl_gamma, dtype=np.float64) * 1e-8  # Convert to bp²
+
+            # TODO: Cross-curve gamma (discount × inflation) - currently zero
+            # This would require computing d²PV/(d_disc × d_infl)
+
+            # Create multi-curve Gamma object using Risk container
+            from cavour.requests.results import Risk, Gamma
+
+            disc_curve_type_map = {
+                CurrencyTypes.GBP: CurveTypes.GBP_OIS_SONIA,
+                CurrencyTypes.USD: CurveTypes.USD_OIS_SOFR,
+                CurrencyTypes.EUR: CurveTypes.EUR_OIS_ESTR,
+            }
+            disc_curve_type = disc_curve_type_map.get(currency, CurveTypes.GBP_OIS_SONIA)
+
+            infl_curve_type_map = {
+                (CurrencyTypes.GBP, "UK_RPI"): CurveTypes.GBP_RPI_INFLATION,
+                (CurrencyTypes.GBP, "UK_CPI"): CurveTypes.GBP_CPI_INFLATION,
+                (CurrencyTypes.USD, "US_CPI_U"): CurveTypes.USD_CPI_INFLATION,
+                (CurrencyTypes.EUR, "EUR_HICP"): CurveTypes.EUR_HICP_INFLATION,
+            }
+            infl_curve_type = infl_curve_type_map.get(
+                (currency, index_type_name), CurveTypes.GBP_RPI_INFLATION)
+
+            disc_gamma_obj = Gamma(
+                risk_ladder=disc_gamma,
+                tenors=to_tenor(discount_curve.swap_times),
+                currency=currency,
+                curve_type=disc_curve_type
+            )
+
+            infl_gamma_obj = Gamma(
+                risk_ladder=infl_gamma,
+                tenors=to_tenor(inflation_curve.swap_times),
+                currency=currency,
+                curve_type=infl_curve_type
+            )
+
+            gamma = Risk([disc_gamma_obj, infl_gamma_obj])
+
+        # CASHFLOWS extraction
+        if RequestTypes.CASHFLOWS in reqs:
+            all_cashflows = []
+
+            # Value the swap to populate cashflow data
+            derivative.value(self.model.value_dt, discount_curve, inflation_curve)
+
+            # Extract fixed leg cashflows
+            fixed_leg_type = "Fixed_Pay" if derivative._fixed_leg_type == SwapTypes.PAY else "Fixed_Rec"
+            fixed_cashflows = self._extract_leg_cashflows(derivative._fixed_leg, fixed_leg_type)
+            all_cashflows.extend(fixed_cashflows)
+
+            # Extract YoY inflation leg cashflows
+            yoy_leg_type = "YoY_Inflation_Rec" if derivative._fixed_leg_type == SwapTypes.PAY else "YoY_Inflation_Pay"
+
+            # Check if YoY leg has been valued (has payment_pvs attribute)
+            if hasattr(derivative._inflation_leg, '_payment_pvs') and derivative._inflation_leg._payment_pvs:
+                sign = +1.0 if 'Rec' in yoy_leg_type else -1.0
+
+                for i in range(len(derivative._inflation_leg._payment_dts)):
+                    notional = float(derivative._inflation_leg._notional)
+
+                    # YoY inflation leg payment = notional × year_frac × (yoy_rate + spread)
+                    if hasattr(derivative._inflation_leg, '_yoy_rates') and i < len(derivative._inflation_leg._yoy_rates):
+                        yoy_rate = float(derivative._inflation_leg._yoy_rates[i])
+                        spread = float(derivative._inflation_leg._spread)
+                        total_rate = yoy_rate + spread
+                    else:
+                        # Compute from payment amount
+                        year_frac = float(derivative._inflation_leg._year_fracs[i])
+                        if notional != 0 and year_frac != 0:
+                            total_rate = float(derivative._inflation_leg._payments[i]) / (notional * year_frac)
+                        else:
+                            total_rate = 0.0
+
+                    payment_amt = float(derivative._inflation_leg._payments[i])
+                    signed_amt = sign * payment_amt
+                    signed_pv = sign * float(derivative._inflation_leg._payment_pvs[i])
+
+                    cf_item = CashflowItem(
+                        payment_date=derivative._inflation_leg._payment_dts[i],
+                        notional=notional,
+                        payment_fraction=total_rate,
+                        accrual_period=float(derivative._inflation_leg._year_fracs[i]),
+                        amount=signed_amt,
+                        discount_factor=float(derivative._inflation_leg._payment_dfs[i]),
+                        discounted_amount=signed_pv,
+                        leg_type=yoy_leg_type
+                    )
+                    all_cashflows.append(cf_item)
+
+            cashflows = Cashflows(all_cashflows, currency)
+
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=cashflows)
+
 
     def _compute_xccy(self, derivative, reqs, collateral_type=None):
         """Compute analytics for cross-currency swaps (VALUE, DELTA, GAMMA).
@@ -793,9 +1797,9 @@ class Engine:
             term2_dom = jnp.sum(grad_dom_dfs_original[:, None, None] * hess_dom_curve, axis=0)
             gammas_dom_matrix = term1_dom + term2_dom
 
-            # Extract diagonal elements (d²PV/dr_i²) for each tenor
-            # The diagonal represents sensitivity of each rate to itself
-            gammas_dom = jnp.diag(gammas_dom_matrix)
+            # Return FULL gamma matrix (not just diagonal)
+            # Shape: (n_dom_rates, n_dom_rates)
+            gammas_dom = gammas_dom_matrix
 
             # Convert to GBP per bp²
             # 1bp = 0.0001 in decimal → (1bp)² = 1e-8
@@ -819,8 +1823,9 @@ class Engine:
             # do not change. Therefore, only the direct effect on forward rates matters.
             gammas_for_matrix = gammas_for_matrix_direct
 
-            # Extract diagonal elements (d²PV/dr_i²) for each tenor
-            gammas_for = jnp.diag(gammas_for_matrix)
+            # Return FULL gamma matrix (not just diagonal)
+            # Shape: (n_for_rates, n_for_rates)
+            gammas_for = gammas_for_matrix
 
             # Convert to GBP per bp²
             # Foreign leg PV is in USD, multiply by spot_fx to convert to GBP
@@ -866,8 +1871,9 @@ class Engine:
                     # Fallback to term1 only (will likely give zero or near-zero)
                     gammas_xccy_matrix = term1_xccy
 
-                # Extract diagonal elements (d²PV/d(spread_i)²) for each pillar
-                gammas_xccy = jnp.diag(gammas_xccy_matrix)
+                # Return FULL gamma matrix (not just diagonal)
+                # Shape: (n_basis, n_basis)
+                gammas_xccy = gammas_xccy_matrix
 
                 # Convert to GBP per bp²
                 # Foreign leg PV is in USD, divide by spot_fx to convert USD to GBP (spot_fx is USD/GBP)
@@ -960,7 +1966,26 @@ class Engine:
             else:
                 gamma = Risk([gamma_domestic, gamma_foreign], cross_gammas=cross_gammas_list)
 
-        return AnalyticsResult(value=value, risk=delta, gamma=gamma)
+        # Cashflows extraction
+        cashflows = None
+        if RequestTypes.CASHFLOWS in reqs:
+            all_cashflows = []
+
+            # Extract domestic leg cashflows
+            if hasattr(derivative, '_domestic_leg'):
+                domestic_leg_type = "Domestic_Pay" if derivative._domestic_leg._leg_type == SwapTypes.PAY else "Domestic_Rec"
+                domestic_cfs = self._extract_leg_cashflows(derivative._domestic_leg, domestic_leg_type)
+                all_cashflows.extend(domestic_cfs)
+
+            # Extract foreign leg cashflows
+            if hasattr(derivative, '_foreign_leg'):
+                foreign_leg_type = "Foreign_Rec" if derivative._domestic_leg._leg_type == SwapTypes.PAY else "Foreign_Pay"
+                foreign_cfs = self._extract_leg_cashflows(derivative._foreign_leg, foreign_leg_type)
+                all_cashflows.extend(foreign_cfs)
+
+            cashflows = Cashflows(all_cashflows, risk_ccy)
+
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=cashflows)
 
     def _compute_xccy_old(self, derivative, reqs):
         """Old array-based implementation - kept for DELTA/GAMMA future work."""
@@ -1114,7 +2139,13 @@ class Engine:
         delta = None
         gamma = None
 
-        return AnalyticsResult(value=value, risk=delta, gamma=gamma)
+        # Cashflows extraction (placeholder for future implementation)
+        cashflows = None
+        if RequestTypes.CASHFLOWS in reqs:
+            # TODO: Extract cashflow data from domestic and foreign legs
+            cashflows = Cashflows([], derivative._domestic_currency)
+
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=cashflows)
 
     def valuation(self,
                   derivative):
@@ -1230,15 +2261,16 @@ class Engine:
 
         Returns:
             tuple[jnp.ndarray, jnp.ndarray]:
-                - all_maturities: All unique intermediate times including swap maturities
-                - all_dfs: Discount factors at all intermediate times
+                - all_maturities: All unique intermediate times including t=0
+                - all_dfs: Discount factors at all intermediate times (df=1.0 at t=0)
 
         Implementation:
             1. Pre-expands all intermediate cashflow points from all swaps
             2. Deduplicates using rounded maturity keys (2 decimal places)
             3. Builds dependency graph via prev_idx mapping
             4. Sequential bootstrap via lax.scan
-            5. Returns dense grid for interpolation (not just swap maturities)
+            5. Prepends t=0, df=1.0 to match OISCurve behavior
+            6. Returns dense grid for interpolation (not just swap maturities)
 
         Note:
             Each intermediate point inherits its parent swap's rate, matching
@@ -1247,8 +2279,19 @@ class Engine:
             not for actual computations.
         """
 
-        # 1) Pre-expand ALL intermediate points (not just swap maturities)
-        points = []
+        # 1) Add t=0, df=1.0 point (matches OISCurve._build_curve_ad line 126-127)
+        points = [{
+            'maturity': 0.0,
+            'maturity_key': 0.0,
+            'acc': 0.0,  # No accrual for t=0 point
+            'prev_mat': 0.0,
+            'prev_key': None,  # No previous point
+            'rate': swap_rates[0],  # Use first swap's rate (doesn't matter, df=1.0 is exact)
+            'is_final': False,
+            'swap_idx': -1  # Special index for t=0
+        }]
+
+        # 2) Pre-expand ALL intermediate points (not just swap maturities)
         for i, (rate, fracs) in enumerate(zip(swap_rates, year_fracs)):
             cumsum = 0.0
             for j, frac in enumerate(fracs):
@@ -1256,46 +2299,41 @@ class Engine:
                 cumsum += frac
                 points.append({
                     'maturity': cumsum,                      # EXACT value for computations
-                    'maturity_key': round(cumsum, 4),       # Rounded key for matching (4 decimals to avoid collisions)
+                    'maturity_key': round(cumsum, 2),       # Rounded key for matching (2 decimals to avoid collisions)
                     'acc': frac,
                     'prev_mat': prev_cum,                    # EXACT previous maturity
-                    'prev_key': round(prev_cum, 4) if j > 0 else None,  # Rounded key (4 decimals)
+                    'prev_key': round(prev_cum, 2) if j > 0 else None,  # Rounded key (2 decimals)
                     'rate': rate,                            # Parent swap's rate
                     'is_final': (j == len(fracs) - 1),      # Is this the swap's final maturity?
                     'swap_idx': i
                 })
 
-        # 2) Sort by exact maturity
+        # 3) Sort by exact maturity
         sorted_points = sorted(points, key=lambda x: x['maturity'])
 
-        # 3) Deduplicate using rounded keys (keep first occurrence like the recursive version)
-        seen_keys = {}
-        unique_points = []
-        for p in sorted_points:
+        # 4) Build maturity_key → first occurrence index mapping (for prev_idx lookup)
+        # Like OISCurve's pv01_dict, we use rounded keys to find which previous point to use
+        # But we keep ALL points in the arrays (no deduplication)
+        maturity_lookup = {}  # rounded_key → FIRST index with this key
+        for idx, p in enumerate(sorted_points):
             key = p['maturity_key']
-            if key not in seen_keys:
-                seen_keys[key] = len(unique_points)
-                unique_points.append(p)
-
-        # 4) Build maturity_key → index mapping (for prev_idx lookup)
-        maturity_lookup = {}  # rounded_key → index in unique_points
-        for idx, p in enumerate(unique_points):
-            maturity_lookup[p['maturity_key']] = idx
+            if key not in maturity_lookup:
+                maturity_lookup[key] = idx  # Store first occurrence
 
         # 5) Build prev_idx for each point using rounded keys
-        for p in unique_points:
+        for p in sorted_points:
             if p['prev_key'] is None:
                 p['prev_idx'] = -1
             else:
                 p['prev_idx'] = maturity_lookup.get(p['prev_key'], -1)
 
         # 6) Convert to JAX arrays
-        n_points = len(unique_points)
-        rates = jnp.array([p['rate'] for p in unique_points])
-        accs = jnp.array([p['acc'] for p in unique_points])
-        prev_idxs = jnp.array([p['prev_idx'] for p in unique_points], dtype=jnp.int32)
+        n_points = len(sorted_points)
+        rates = jnp.array([p['rate'] for p in sorted_points])
+        accs = jnp.array([p['acc'] for p in sorted_points])
+        prev_idxs = jnp.array([p['prev_idx'] for p in sorted_points], dtype=jnp.int32)
 
-        # 7) JAX-friendly scan through all points
+        # 8) JAX-friendly scan through all points
         def step(pv01_arr, inputs):
             i, rate, acc, prev_idx = inputs
             prev_pv01 = jnp.where(prev_idx < 0, 0.0, pv01_arr[prev_idx])
@@ -1310,14 +2348,15 @@ class Engine:
             new_pv01 = pv01_arr.at[i].set(pv01_i)
             return new_pv01, df_i
 
-        # 8) Run the scan
+        # 9) Run the scan
         init_pv01 = jnp.zeros(n_points)
         idxs = jnp.arange(n_points)
         _, all_dfs = lax.scan(step, init_pv01, (idxs, rates, accs, prev_idxs))
 
-        # 9) Return ALL unique intermediate points (not just swap maturities)
+        # 10) Return ALL points (not just swap maturities)
         # This matches ois_curve.py which stores all intermediate DFs for interpolation
-        all_maturities = jnp.array([p['maturity'] for p in unique_points])
+        # We keep ALL points (no deduplication) just like OISCurve
+        all_maturities = jnp.array([p['maturity'] for p in sorted_points])
         return all_maturities, all_dfs
 
     def _cached_curve(self, key, swap_rates, swap_times, year_fracs, interp_type):
