@@ -104,6 +104,8 @@ class OIS:
                  fixed_coupon: float,  # Fixed coupon (annualised)
                  fixed_freq_type: FrequencyTypes,
                  fixed_dc_type: DayCountTypes,
+                 floating_index: CurveTypes,
+                 currency: CurrencyTypes,
                  notional: float = ONE_MILLION,
                  payment_lag: int = 0,  # Number of days after period payment occurs
                  float_spread: float = 0.0,
@@ -111,9 +113,7 @@ class OIS:
                  float_dc_type: DayCountTypes = DayCountTypes.THIRTY_E_360,
                  cal_type: CalendarTypes = CalendarTypes.WEEKEND,
                  bd_type: BusDayAdjustTypes = BusDayAdjustTypes.FOLLOWING,
-                 dg_type: DateGenRuleTypes = DateGenRuleTypes.BACKWARD,
-                 floating_index: CurveTypes = CurveTypes.GBP_OIS_SONIA,
-                 currency: CurrencyTypes = CurrencyTypes.GBP):
+                 dg_type: DateGenRuleTypes = DateGenRuleTypes.BACKWARD):
         """ Create an overnight index swap contract giving the contract start
         date, its maturity, fixed coupon, fixed leg frequency, fixed leg day
         count convention and notional. The floating leg parameters have default
@@ -157,15 +157,15 @@ class OIS:
                                        fixed_coupon,
                                        fixed_freq_type,
                                        fixed_dc_type,
+                                       floating_index,
+                                       currency,
                                        notional,
                                        principal,
                                        payment_lag,
                                        cal_type,
                                        bd_type,
                                        dg_type,
-                                       False,
-                                       floating_index,
-                                       currency)
+                                       False)
 
         self._float_leg = SwapFloatLeg(effective_dt,
                                        self._termination_dt,
@@ -173,6 +173,8 @@ class OIS:
                                        float_spread,
                                        float_freq_type,
                                        float_dc_type,
+                                       floating_index,
+                                       currency,
                                        notional,
                                        principal,
                                        payment_lag,
@@ -180,9 +182,7 @@ class OIS:
                                        bd_type,
                                        dg_type,
                                        False,
-                                       False,
-                                       floating_index,
-                                       currency)
+                                       False)
         
 
         #TEMP Ludo
@@ -208,20 +208,68 @@ class OIS:
 
     def value(self,
               value_dt: Date,
-              ois_curve: DiscountCurve,
+              ois_curve: DiscountCurve = None,
+              discount_curve: DiscountCurve = None,
+              xccy_discount_curve: DiscountCurve = None,
+              spot_fx: float = None,
+              collateral_type = None,
               first_fixing_rate=None):
-        """ Value the interest rate swap on a value date given a single Ibor
-        discount curve. """
+        """ Value the interest rate swap on a value date.
 
-        fixed_leg_value = self._fixed_leg.value(value_dt,
-                                                ois_curve)
+        Supports both natural currency discounting (single-curve) and
+        cross-currency collateral discounting (dual-curve).
+
+        Args:
+            value_dt: Valuation date
+            ois_curve: OIS curve for projection (index curve)
+            discount_curve: Discount curve (optional, defaults to ois_curve for backward compatibility)
+            xccy_discount_curve: XCCY discount curve if cross-currency collateral
+            spot_fx: FX rate (domestic/foreign) if cross-currency collateral
+            collateral_type: CollateralType enum for auto-curve selection (optional)
+            first_fixing_rate: Optional first fixing rate
+
+        Returns:
+            PV in collateral currency if cross-currency, otherwise natural currency
+        """
+        # Import here to avoid circular dependency
+        from cavour.utils.global_types import CollateralType, collateral_to_currency
+
+        # Default to natural currency (backward compatible)
+        if discount_curve is None and collateral_type is None:
+            discount_curve = ois_curve  # Single-curve (current behavior)
+
+        # If collateral_type specified, validate and select curves
+        if collateral_type is not None:
+            collateral_ccy = collateral_to_currency(collateral_type)
+            if collateral_ccy != self._currency:
+                # Cross-currency collateral
+                if xccy_discount_curve is None or spot_fx is None:
+                    raise ValueError(
+                        f"xccy_discount_curve and spot_fx required for "
+                        f"{self._currency.name} swap with {collateral_ccy.name} collateral"
+                    )
+                discount_curve = xccy_discount_curve
+            else:
+                # Natural currency
+                discount_curve = ois_curve
+
+        # Value legs with selected curves
+        fixed_leg_value = self._fixed_leg.value(value_dt, discount_curve)
 
         float_leg_value = self._float_leg.value(value_dt,
-                                                ois_curve,
+                                                discount_curve,
                                                 ois_curve,
                                                 first_fixing_rate)
 
         value = fixed_leg_value + float_leg_value
+
+        # Convert to collateral currency if needed
+        if collateral_type is not None and spot_fx is not None:
+            collateral_ccy = collateral_to_currency(collateral_type)
+            if collateral_ccy != self._currency:
+                # Convert from natural currency to collateral currency
+                value = value / spot_fx
+
         return value
 
 ##########################################################################

@@ -24,6 +24,13 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Dict, Union
 from cavour.utils.currency import CurrencyTypes
 from cavour.utils.global_types import RequestTypes, CurveTypes
+from cavour.requests.results_base import (
+    BaseResult,
+    ExportMixin,
+    AggregationMixin,
+    ValidationMixin
+)
+from cavour.utils.date import Date
 
 
 
@@ -102,7 +109,60 @@ class Valuation:
         if other == 0:
             return self
         return self.__add__(other)
-    
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary representation."""
+        return {
+            'amount': float(self.amount),
+            'currency': self.currency.name
+        }
+
+    def to_json(self, indent: Optional[int] = 2) -> str:
+        """
+        Export valuation to JSON string.
+
+        Args:
+            indent: Number of spaces for indentation (None for compact)
+
+        Returns:
+            str: JSON representation
+        """
+        import json
+        return json.dumps(self.to_dict(), indent=indent)
+
+    def to_csv(self, filepath: Optional[str] = None) -> Optional[str]:
+        """
+        Export valuation to CSV format.
+
+        Args:
+            filepath: Optional path to save CSV file. If None, returns CSV string.
+
+        Returns:
+            str or None: CSV string if filepath is None, otherwise None
+        """
+        df = self.df
+        if filepath:
+            df.to_csv(filepath)
+            return None
+        else:
+            return df.to_csv()
+
+    def to_excel(self, filepath: str, sheet_name: str = 'Valuation'):
+        """
+        Export valuation to Excel file.
+
+        Args:
+            filepath: Path to save Excel file
+            sheet_name: Name of the Excel sheet
+        """
+        df = self.df
+        df.to_excel(filepath, sheet_name=sheet_name)
+
+    @property
+    def df(self) -> pd.DataFrame:
+        """Convert valuation to single-row pandas DataFrame."""
+        return pd.DataFrame([self.to_dict()])
+
 
 
 @dataclass(frozen=True)
@@ -263,6 +323,62 @@ class Delta:
 
     __radd__ = __add__  # support sum() accumulation
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary representation."""
+        return {
+            'risk_ladder': self.risk_ladder.tolist(),
+            'tenors': self.tenors,
+            'currency': self.currency.name,
+            'curve_type': self.curve_type.name,
+            'total': float(jnp.sum(self.risk_ladder))
+        }
+
+    def to_json(self, indent: Optional[int] = 2) -> str:
+        """
+        Export delta to JSON string.
+
+        Args:
+            indent: Number of spaces for indentation (None for compact)
+
+        Returns:
+            str: JSON representation
+        """
+        import json
+        return json.dumps(self.to_dict(), indent=indent)
+
+    def to_csv(self, filepath: Optional[str] = None) -> Optional[str]:
+        """
+        Export delta to CSV format.
+
+        Args:
+            filepath: Optional path to save CSV file. If None, returns CSV string.
+
+        Returns:
+            str or None: CSV string if filepath is None, otherwise None
+        """
+        df = self.df
+        if filepath:
+            df.to_csv(filepath)
+            return None
+        else:
+            return df.to_csv()
+
+    def to_excel(self, filepath: str, sheet_name: str = 'Delta'):
+        """
+        Export delta to Excel file.
+
+        Args:
+            filepath: Path to save Excel file
+            sheet_name: Name of the Excel sheet
+        """
+        df = self.df
+        df.to_excel(filepath, sheet_name=sheet_name)
+
+    @property
+    def df(self) -> pd.DataFrame:
+        """Convert delta to pandas DataFrame."""
+        return self.ladder.df
+
 
 @dataclass(frozen=True)
 class Gamma:
@@ -276,8 +392,8 @@ class Gamma:
     Attributes:
         risk_ladder (jnp.ndarray): Gamma matrix (shape: [N, N]) or vector [N]
         tenors (List[str]): Tenor labels
-        currency (CurrencyTypes): Currency of sensitivities (default: GBP)
-        curve_type (CurveTypes): Curve identifier (default: GBP_OIS_SONIA)
+        currency (CurrencyTypes): Currency of sensitivities
+        curve_type (CurveTypes): Curve identifier
 
     Properties:
         value: Sum of gamma matrix as Value object
@@ -302,8 +418,8 @@ class Gamma:
     """
     risk_ladder: jnp.ndarray       # shape [N] or [N, N]
     tenors:       List[str]        # length N
-    currency:     CurrencyTypes = CurrencyTypes.GBP
-    curve_type:   CurveTypes = CurveTypes.GBP_OIS_SONIA
+    currency:     CurrencyTypes
+    curve_type:   CurveTypes
 
     def __post_init__(self):
         arr = self.risk_ladder
@@ -430,7 +546,296 @@ class Gamma:
 
     __radd__ = __add__
 
+    def to_json(self, indent: Optional[int] = 2) -> str:
+        """
+        Export gamma to JSON string.
+
+        Args:
+            indent: Number of spaces for indentation (None for compact)
+
+        Returns:
+            str: JSON representation
+        """
+        import json
+        # Convert to_dict property to dict
+        data = {
+            'matrix': self.to_dict,
+            'tenors': self.tenors,
+            'currency': self.currency.name,
+            'curve_type': self.curve_type.name,
+            'total': float(jnp.sum(self.risk_ladder))
+        }
+        return json.dumps(data, indent=indent)
+
+    def to_csv(self, filepath: Optional[str] = None) -> Optional[str]:
+        """
+        Export gamma to CSV format.
+
+        Args:
+            filepath: Optional path to save CSV file. If None, returns CSV string.
+
+        Returns:
+            str or None: CSV string if filepath is None, otherwise None
+        """
+        df = self.df
+        if filepath:
+            df.to_csv(filepath)
+            return None
+        else:
+            return df.to_csv()
+
+    def to_excel(self, filepath: str, sheet_name: str = 'Gamma'):
+        """
+        Export gamma to Excel file.
+
+        Args:
+            filepath: Path to save Excel file
+            sheet_name: Name of the Excel sheet
+        """
+        df = self.df
+        df.to_excel(filepath, sheet_name=sheet_name)
+
+    @property
+    def df(self) -> pd.DataFrame:
+        """Convert gamma matrix to pandas DataFrame."""
+        gamma_np = np.array(self.risk_ladder)
+        if gamma_np.ndim == 1:
+            # Convert diagonal to matrix
+            gamma_np = np.diag(gamma_np)
+        return pd.DataFrame(gamma_np, index=self.tenors, columns=self.tenors)
+
+
+@dataclass(frozen=True)
+class CrossGamma:
+    """
+    Cross-curve second-order sensitivity (cross-gamma).
+
+    Represents how delta to one curve changes when a DIFFERENT curve moves.
+    This captures second-order dependencies between curves (e.g., how XCCY 
+    basis delta changes when foreign OIS rates move).
+
+    Attributes:
+        risk_matrix (jnp.ndarray): Cross-gamma matrix (shape: [N1, N2])
+        tenors_curve1 (List[str]): Tenor labels for curve 1 (rows)
+        tenors_curve2 (List[str]): Tenor labels for curve 2 (columns)
+        curve_type_1 (CurveTypes): First curve identifier
+        curve_type_2 (CurveTypes): Second curve identifier
+        currency (CurrencyTypes): Currency of sensitivities
+
+    Properties:
+        value: Sum of cross-gamma matrix as Value object
+        matrix: Display cross-gamma as formatted table (prints to console)
+        to_dict: Export cross-gamma as nested dictionary
+
+    Methods:
+        plot(): Display interactive Plotly heatmap
+
+    Note:
+        Units are value per bp^2, typically scaled by 1e8.
+        Matrix element [i,j] represents: d²PV / d(curve1_rate_i) d(curve2_rate_j)
+
+    Example:
+        >>> cross_gamma = CrossGamma(
+        ...     risk_matrix=jnp.array([[0.5, 0.1], [0.1, 0.8]]),
+        ...     tenors_curve1=[1Y, 5Y],
+        ...     tenors_curve2=[1Y, 3Y],
+        ...     curve_type_1=CurveTypes.USD_OIS_SOFR,
+        ...     curve_type_2=CurveTypes.USD_GBP_BASIS,
+        ...     currency=CurrencyTypes.GBP
+        ... )
+        >>> cross_gamma.plot()  # Interactive heatmap
+    """
+    risk_matrix:     jnp.ndarray       # shape [N1, N2]
+    tenors_curve1:   List[str]         # length N1 (rows)
+    tenors_curve2:   List[str]         # length N2 (columns)
+    curve_type_1:    CurveTypes
+    curve_type_2:    CurveTypes
+    currency:        CurrencyTypes
+
+    def __post_init__(self):
+        arr = self.risk_matrix
+        if isinstance(arr, list):
+            arr = jnp.array(arr)
+            object.__setattr__(self, 'risk_matrix', arr)
+        
+        if arr.ndim != 2:
+            raise ValueError(f"CrossGamma risk_matrix must be 2D, got {arr.ndim}D")
+        
+        n1, n2 = arr.shape
+        if n1 != len(self.tenors_curve1):
+            raise ValueError(f"Expected {n1} tenors for curve 1, got {len(self.tenors_curve1)}")
+        if n2 != len(self.tenors_curve2):
+            raise ValueError(f"Expected {n2} tenors for curve 2, got {len(self.tenors_curve2)}")
+        
+        if not isinstance(self.currency, CurrencyTypes):
+            raise TypeError(f"currency must be CurrencyTypes, got {type(self.currency)}")
+        if not isinstance(self.curve_type_1, CurveTypes):
+            raise TypeError(f"curve_type_1 must be CurveTypes, got {type(self.curve_type_1)}")
+        if not isinstance(self.curve_type_2, CurveTypes):
+            raise TypeError(f"curve_type_2 must be CurveTypes, got {type(self.curve_type_2)}")
+
+    @property
+    def value(self) -> Value:
+        """Sum of the cross-gamma matrix as a Value object."""
+        total = float(jnp.sum(self.risk_matrix))
+        return Value(amount=total, currency=self.currency)
+
+    @property
+    def matrix(self) -> dict:
+        """
+        Return the cross-gamma matrix as a nested dict: {curve1_tenor: {curve2_tenor: value}}.
+        """
+        matrix_dict = self.to_dict
+
+        df = pd.DataFrame(matrix_dict)
+        # Don't drop zero rows/columns for cross-gamma (they may all be informative)
+
+        df.index.name = f"{self.curve_type_1.name} Tenors"
+        df.columns.name = f"{self.curve_type_2.name} Tenors"
+        
+        # Pretty print
+        print(tabulate(df, headers='keys', tablefmt='grid', floatfmt=".4f"))
     
+    @property
+    def to_dict(self) -> dict:
+        """
+        Return the cross-gamma matrix as a nested dict: {curve1_tenor: {curve2_tenor: value}}.
+        """
+        gamma_np = np.array(self.risk_matrix)
+        
+        matrix = {
+            row_tenor: {
+                col_tenor: float(gamma_np[i, j])
+                for j, col_tenor in enumerate(self.tenors_curve2)
+            }
+            for i, row_tenor in enumerate(self.tenors_curve1)
+        }
+        return matrix
+
+    def plot(self):
+        """
+        Plot the cross-gamma heatmap using Plotly.
+        Shows curve1 tenors on Y-axis and curve2 tenors on X-axis.
+        """
+        gamma_np = np.array(self.risk_matrix, dtype=np.float64)
+
+        fig = go.Figure(data=go.Heatmap(
+            z=gamma_np,
+            x=self.tenors_curve2,
+            y=self.tenors_curve1,
+            colorscale="RdYlGn_r",
+            colorbar=dict(title="Cross-Gamma"),
+            zmin=np.min(gamma_np) if gamma_np.size > 0 else 0,
+            zmax=np.max(gamma_np) if gamma_np.size > 0 else 1,
+        ))
+
+        fig.update_layout(
+            title=f"Cross-Gamma: {self.curve_type_1.name} vs {self.curve_type_2.name}",
+            xaxis_title=f"{self.curve_type_2.name} Tenors",
+            yaxis_title=f"{self.curve_type_1.name} Tenors",
+            width=900,
+            height=700,
+        )
+
+        fig.show()
+
+    def __repr__(self):
+        total = self.value.amount
+        cur = self.currency.name
+        n1, n2 = len(self.tenors_curve1), len(self.tenors_curve2)
+        return (
+            f"{self.__class__.__name__}("
+            f"{self.curve_type_1.name} x {self.curve_type_2.name}: "
+            f"{total:.6g} {cur}, shape=[{n1}, {n2}])"
+        )
+
+    def __add__(self, other: Any) -> 'CrossGamma':
+        if not isinstance(other, CrossGamma):
+            return NotImplemented
+        if (self.curve_type_1 != other.curve_type_1 or
+            self.curve_type_2 != other.curve_type_2 or
+            self.currency != other.currency or
+            self.tenors_curve1 != other.tenors_curve1 or
+            self.tenors_curve2 != other.tenors_curve2):
+            raise ValueError(
+                "Cannot add CrossGamma with mismatched curves, currency, or tenors"
+            )
+        summed = self.risk_matrix + other.risk_matrix
+        return CrossGamma(
+            risk_matrix=summed,
+            tenors_curve1=self.tenors_curve1,
+            tenors_curve2=self.tenors_curve2,
+            curve_type_1=self.curve_type_1,
+            curve_type_2=self.curve_type_2,
+            currency=self.currency
+        )
+
+    __radd__ = __add__
+
+    def to_json(self, indent: Optional[int] = 2) -> str:
+        """
+        Export cross-gamma to JSON string.
+
+        Args:
+            indent: Number of spaces for indentation (None for compact)
+
+        Returns:
+            str: JSON representation
+        """
+        import json
+        data = {
+            'matrix': self.to_dict,
+            'tenors_curve1': self.tenors_curve1,
+            'tenors_curve2': self.tenors_curve2,
+            'curve_type_1': self.curve_type_1.name,
+            'curve_type_2': self.curve_type_2.name,
+            'currency': self.currency.name,
+            'total': float(jnp.sum(self.risk_matrix))
+        }
+        return json.dumps(data, indent=indent)
+
+    def to_csv(self, filepath: Optional[str] = None) -> Optional[str]:
+        """
+        Export cross-gamma to CSV format.
+
+        Args:
+            filepath: Optional path to save CSV file. If None, returns CSV string.
+
+        Returns:
+            str or None: CSV string if filepath is None, otherwise None
+        """
+        df = self.df
+        if filepath:
+            df.to_csv(filepath)
+            return None
+        else:
+            return df.to_csv()
+
+    def to_excel(self, filepath: str, sheet_name: str = 'CrossGamma'):
+        """
+        Export cross-gamma to Excel file.
+
+        Args:
+            filepath: Path to save Excel file
+            sheet_name: Name of the Excel sheet
+        """
+        df = self.df
+        df.to_excel(filepath, sheet_name=sheet_name)
+
+    @property
+    def df(self) -> pd.DataFrame:
+        """Convert cross-gamma matrix to pandas DataFrame."""
+        gamma_np = np.array(self.risk_matrix)
+        df = pd.DataFrame(
+            gamma_np,
+            index=self.tenors_curve1,
+            columns=self.tenors_curve2
+        )
+        df.index.name = f"{self.curve_type_1.name}_Tenors"
+        df.columns.name = f"{self.curve_type_2.name}_Tenors"
+        return df
+
+
 class Risk:
     """
     Container for multiple per-curve Delta and Gamma ladders.
@@ -440,12 +845,14 @@ class Risk:
 
     Args:
         ladders (Iterable[Union[Delta, Gamma]]): List of Delta or Gamma objects
+        cross_gammas (Optional[Iterable[CrossGamma]]): List of CrossGamma objects
 
     Access patterns:
         1. Attribute: risk.GBP_OIS_SONIA.value
         2. Attribute: risk.GBP_OIS_SONIA.ladder (for Delta)
         3. Attribute: risk.GBP_OIS_SONIA.matrix (for Gamma)
         4. Callable: risk(CurveTypes.GBP_OIS_SONIA)
+        5. Cross-gamma: risk.cross_gamma(CurveTypes.USD_OIS_SOFR, CurveTypes.USD_GBP_BASIS)
 
     Example:
         >>> delta1 = Delta([10, -5], ["1Y", "5Y"], CurrencyTypes.GBP, CurveTypes.GBP_OIS_SONIA)
@@ -457,8 +864,13 @@ class Risk:
     Raises:
         ValueError: If duplicate curve names provided
     """
-    def __init__(self, ladders: Iterable[Union[Delta, Gamma]]):
+    def __init__(
+        self,
+        ladders: Iterable[Union[Delta, Gamma]],
+        cross_gammas: Optional[Iterable[CrossGamma]] = None
+    ):
         self._by_curve = {}  # type: Dict[str, Union[Delta, Gamma]]
+        self._cross_gammas = {}  # type: Dict[Tuple[str, str], CrossGamma]
 
         for ladder in ladders:
             name = ladder.curve_type.name
@@ -466,6 +878,14 @@ class Risk:
                 raise ValueError(f"Duplicate curve {name}")
             self._by_curve[name] = ladder
             setattr(self, name, ladder)
+
+        # Store cross-gammas keyed by (curve1_name, curve2_name)
+        if cross_gammas is not None:
+            for cg in cross_gammas:
+                key = (cg.curve_type_1.name, cg.curve_type_2.name)
+                if key in self._cross_gammas:
+                    raise ValueError(f"Duplicate cross-gamma for {key}")
+                self._cross_gammas[key] = cg
 
     def __call__(self, curve_type: CurveTypes) -> Union[Delta, Gamma]:
         """
@@ -476,12 +896,229 @@ class Risk:
         except KeyError:
             raise ValueError(f"No risk data for curve: {curve_type.name}")
 
+    def cross_gamma(
+        self,
+        curve_type_1: CurveTypes,
+        curve_type_2: CurveTypes
+    ) -> Optional[CrossGamma]:
+        """
+        Access cross-gamma between two curves.
+
+        Args:
+            curve_type_1: First curve (e.g., USD_OIS_SOFR)
+            curve_type_2: Second curve (e.g., USD_GBP_BASIS)
+
+        Returns:
+            CrossGamma object if exists, None otherwise
+
+        Example:
+            >>> cg = risk.cross_gamma(CurveTypes.USD_OIS_SOFR, CurveTypes.USD_GBP_BASIS)
+            >>> if cg:
+            >>>     print(cg.value)  # Total cross-gamma
+            >>>     cg.plot()  # Heatmap
+        """
+        key = (curve_type_1.name, curve_type_2.name)
+        return self._cross_gammas.get(key, None)
+
+    def has_cross_gamma(
+        self,
+        curve_type_1: CurveTypes,
+        curve_type_2: CurveTypes
+    ) -> bool:
+        """Check if cross-gamma exists for the given curve pair."""
+        key = (curve_type_1.name, curve_type_2.name)
+        return key in self._cross_gammas
+
+    @property
+    def all_cross_gammas(self) -> Dict[Tuple[str, str], CrossGamma]:
+        """Return all cross-gammas as a dictionary."""
+        return self._cross_gammas.copy()
+
     def __repr__(self):
         parts = []
         for name, obj in self._by_curve.items():
             mv = obj.value
             parts.append(f"{name}={mv.amount:.6g} {mv.currency.name}")
         return f"{self.__class__.__name__}({', '.join(parts)})"
+
+
+@dataclass(frozen=True)
+class CashflowItem:
+    """
+    Single cashflow item with complete payment details.
+
+    Represents an individual cashflow from a swap leg, including all information
+    needed for pricing, risk analysis, and reporting.
+
+    Attributes:
+        payment_date: Date when payment is made
+        notional: Notional amount on which cashflow is calculated
+        payment_fraction: Actual multiplier for notional (e.g., 0.05 for 5% coupon)
+        accrual_period: Year fraction for the accrual period
+        amount: Actual payment amount (notional * payment_fraction)
+        discount_factor: Discount factor from payment date to valuation date
+        discounted_amount: Present value of the cashflow
+        leg_type: Type of leg (e.g., "Fixed_Pay", "Float_Rec", "Notional_Pay", "Notional_Rec")
+
+    Example:
+        >>> cf = CashflowItem(
+        ...     payment_date=Date(15, 6, 2026),
+        ...     notional=10_000_000,
+        ...     payment_fraction=0.045,
+        ...     accrual_period=0.5,
+        ...     amount=225_000,
+        ...     discount_factor=0.98,
+        ...     discounted_amount=220_500,
+        ...     leg_type="Fixed_Pay"
+        ... )
+    """
+    payment_date: Date
+    notional: float
+    payment_fraction: float
+    accrual_period: float
+    amount: float
+    discount_factor: float
+    discounted_amount: float
+    leg_type: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert cashflow item to dictionary."""
+        return {
+            'payment_date': str(self.payment_date),
+            'notional': float(self.notional),
+            'payment_fraction': float(self.payment_fraction),
+            'accrual_period': float(self.accrual_period),
+            'amount': float(self.amount),
+            'discount_factor': float(self.discount_factor),
+            'discounted_amount': float(self.discounted_amount),
+            'leg_type': self.leg_type
+        }
+
+
+class Cashflows(BaseResult, ExportMixin, AggregationMixin):
+    """
+    Container for a collection of cashflow items.
+
+    Provides structured access to all cashflows from a trade, with filtering,
+    aggregation, and export capabilities.
+
+    Args:
+        cashflows: List of CashflowItem objects
+        currency: Currency denomination
+
+    Properties:
+        total_amount: Sum of all cashflow amounts (undiscounted)
+        total_pv: Sum of all discounted cashflow amounts
+        df: Pandas DataFrame representation
+
+    Methods:
+        fixed(): Filter to fixed leg cashflows only
+        floating(): Filter to floating leg cashflows only
+        pay(): Filter to pay leg cashflows only
+        receive(): Filter to receive leg cashflows only
+        notional_exchange(): Filter to notional exchange cashflows only
+        to_dict(), to_json(), to_csv(), to_excel(): Export methods
+
+    Example:
+        >>> result = engine.compute(swap, [RequestTypes.CASHFLOWS])
+        >>> cashflows = result.cashflows
+        >>> print(f"Total PV: {cashflows.total_pv:,.2f} {cashflows.currency.name}")
+        >>> fixed_cfs = cashflows.fixed()
+        >>> df = cashflows.df  # Export to DataFrame
+    """
+
+    def __init__(self, cashflows: List[CashflowItem], currency: CurrencyTypes):
+        """
+        Initialize Cashflows container.
+
+        Args:
+            cashflows: List of CashflowItem objects
+            currency: Currency denomination
+        """
+        self.cashflows = cashflows
+        self.currency = currency
+
+    def validate(self) -> bool:
+        """Validate cashflows container."""
+        if not isinstance(self.cashflows, list):
+            raise ValueError("cashflows must be a list")
+        if not all(isinstance(cf, CashflowItem) for cf in self.cashflows):
+            raise ValueError("All items must be CashflowItem instances")
+        return True
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary representation."""
+        return {
+            'currency': self.currency.name,
+            'cashflows': [cf.to_dict() for cf in self.cashflows],
+            'total_amount': float(self.total_amount),
+            'total_pv': float(self.total_pv),
+            'count': len(self.cashflows)
+        }
+
+    @property
+    def df(self) -> pd.DataFrame:
+        """Convert cashflows to pandas DataFrame."""
+        if not self.cashflows:
+            return pd.DataFrame()
+
+        data = [cf.to_dict() for cf in self.cashflows]
+        df = pd.DataFrame(data)
+
+        # Set payment_date as index
+        df.set_index('payment_date', inplace=True)
+
+        return df
+
+    @property
+    def total_amount(self) -> float:
+        """Sum of all cashflow amounts (undiscounted)."""
+        return sum(cf.amount for cf in self.cashflows)
+
+    @property
+    def total_pv(self) -> float:
+        """Sum of all discounted cashflow amounts (present value)."""
+        return sum(cf.discounted_amount for cf in self.cashflows)
+
+    def fixed(self) -> 'Cashflows':
+        """Filter to fixed leg cashflows only."""
+        fixed_cfs = [cf for cf in self.cashflows if 'Fixed' in cf.leg_type]
+        return Cashflows(fixed_cfs, self.currency)
+
+    def floating(self) -> 'Cashflows':
+        """Filter to floating leg cashflows only."""
+        float_cfs = [cf for cf in self.cashflows if 'Float' in cf.leg_type]
+        return Cashflows(float_cfs, self.currency)
+
+    def pay(self) -> 'Cashflows':
+        """Filter to pay leg cashflows only."""
+        pay_cfs = [cf for cf in self.cashflows if 'Pay' in cf.leg_type]
+        return Cashflows(pay_cfs, self.currency)
+
+    def receive(self) -> 'Cashflows':
+        """Filter to receive leg cashflows only."""
+        rec_cfs = [cf for cf in self.cashflows if 'Rec' in cf.leg_type]
+        return Cashflows(rec_cfs, self.currency)
+
+    def notional_exchange(self) -> 'Cashflows':
+        """Filter to notional exchange cashflows only."""
+        notional_cfs = [cf for cf in self.cashflows if 'Notional' in cf.leg_type]
+        return Cashflows(notional_cfs, self.currency)
+
+    def sum(self) -> Valuation:
+        """Sum all cashflows to a single Valuation."""
+        return Valuation(amount=self.total_pv, currency=self.currency)
+
+    def __len__(self) -> int:
+        """Return number of cashflows."""
+        return len(self.cashflows)
+
+    def __repr__(self) -> str:
+        """String representation."""
+        return (
+            f"Cashflows(count={len(self.cashflows)}, "
+            f"total_pv={self.total_pv:,.2f} {self.currency.name})"
+        )
 
 
 class AnalyticsResult:
@@ -496,11 +1133,13 @@ class AnalyticsResult:
         value (Optional[Valuation]): Present value with currency
         risk (Optional[Risk]): Delta risk ladders
         gamma (Optional[Gamma]): Gamma (second-order) sensitivities
+        cashflows (Optional[Cashflows]): Cashflow breakdown
 
     Properties:
         value: Valuation object (present value)
         risk: Risk container with delta ladders
         gamma: Gamma matrix
+        cashflows: Cashflows container with payment details
 
     Example:
         >>> swap = OIS(value_dt, "10Y", 0.04)
@@ -509,17 +1148,20 @@ class AnalyticsResult:
         >>> print(result.value)  # Valuation(amount=1234.56, currency=GBP)
         >>> print(result.risk.GBP_OIS_SONIA)  # Delta ladder
         >>> result.gamma.plot()  # Interactive gamma heatmap
+        >>> result.cashflows.df  # Cashflows as DataFrame
     """
     def __init__(
         self,
         value: Optional[Valuation] = None,
         risk: Optional[Risk] = None,
         gamma: Optional[Gamma] = None,
+        cashflows: Optional[Cashflows] = None,
     ):
         # store inputs directly
         self._value = value
         self._risk  = risk
         self._gamma  = gamma
+        self._cashflows = cashflows
 
     @property
     def value(self) -> Value:
@@ -537,6 +1179,11 @@ class AnalyticsResult:
         """Return the Gamma object (Gamma matrix)."""
         return self._gamma
 
+    @property
+    def cashflows(self) -> Optional[Cashflows]:
+        """Return the Cashflows object."""
+        return self._cashflows
+
     def __repr__(self):
         cls = self.__class__.__name__
         parts = []
@@ -549,4 +1196,7 @@ class AnalyticsResult:
         # gamma
         if self.gamma is not None:
             parts.append(f"gamma={self.gamma!r}")
+        # cashflows
+        if self._cashflows is not None:
+            parts.append(f"cashflows={self._cashflows!r}")
         return f"{cls}({', '.join(parts)})"

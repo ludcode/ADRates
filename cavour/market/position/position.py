@@ -59,13 +59,16 @@ class Position:
         # self.amount = amount
         # self.direction = direction
 
-    def compute(self, request_list):
+    def compute(self, request_list, collateral_type=None):
         """
         Compute requested analytics for the position.
 
         Args:
             request_list (Iterable[RequestTypes]): List of analytics to compute
                 (e.g., [RequestTypes.VALUE, RequestTypes.DELTA])
+            collateral_type (CollateralType, optional): Type of collateral for discounting.
+                If None, uses natural currency (default). For cross-currency collateral,
+                specify the collateral currency (e.g., CollateralType.USD for USD collateral).
 
         Returns:
             AnalyticsResult: Object containing requested analytics (value, risk, gamma)
@@ -74,5 +77,5 @@ class Position:
             Delegates computation to the internal Engine which uses automatic
             differentiation for sensitivities.
         """
-        return self._engine.compute(self.derivative, request_list)
+        return self._engine.compute(self.derivative, request_list, collateral_type)
 

@@ -512,6 +512,8 @@ def to_usable_type(t):
         # t comes from the `typing` module
         if origin is list:
             return (list, np.ndarray)
+        elif origin is dict:
+            return dict
         elif origin is Union:
             types = t.__args__
             return tuple(to_usable_type(tp) for tp in types)

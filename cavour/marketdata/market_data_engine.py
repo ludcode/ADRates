@@ -150,6 +150,133 @@ class MarketCurveBuilder:
 
         return fx_return
 
+    def get_xccy_curve_inputs(self, xccy_curve_key: str, value_date: Date):
+        """
+        Fetch XCCY curve construction inputs from Bloomberg.
+
+        Retrieves basis spreads and all required components for XCCY curve building:
+        - Domestic and foreign OIS curve data
+        - XCCY basis spreads
+        - FX spot rate
+
+        Args:
+            xccy_curve_key (str): XCCY curve name (e.g., "GBPUSD_XCCY_SONIA_SOFR")
+            value_date (Date): Valuation date for market data retrieval
+
+        Returns:
+            dict: XCCY curve construction parameters including:
+                - name: XCCY curve identifier
+                - domestic_curve_name: Domestic OIS curve name (e.g., "USD_OIS_SOFR")
+                - foreign_curve_name: Foreign OIS curve name (e.g., "GBP_OIS_SONIA")
+                - domestic_curve_inputs: Dict with domestic OIS curve data
+                - foreign_curve_inputs: Dict with foreign OIS curve data
+                - basis_spreads: List of basis spreads (in bps)
+                - tenor_list: List of tenors for basis swaps
+                - spot_fx: FX spot rate
+                - fx_pair: FX pair name (e.g., "GBPUSD")
+                - domestic_freq_type: Domestic leg payment frequency
+                - foreign_freq_type: Foreign leg payment frequency
+                - domestic_dc_type: Domestic leg day count
+                - foreign_dc_type: Foreign leg day count
+                - bus_day_type: Business day adjustment
+                - interp_type: Interpolation method
+
+        Raises:
+            KeyError: If xccy_curve_key not found in market_data
+            ValueError: If curve name format is invalid
+            Exception: If Bloomberg connection fails or data unavailable
+
+        Example:
+            >>> inputs = builder.get_xccy_curve_inputs("GBPUSD_XCCY_SONIA_SOFR", value_dt)
+            >>> # Returns all data needed to build GBP/USD XCCY curve
+        """
+        # Get XCCY curve definition
+        if xccy_curve_key not in self.market_data:
+            raise KeyError(f"XCCY curve '{xccy_curve_key}' not found in market data")
+
+        xccy_def = self.market_data[xccy_curve_key]
+
+        # Verify this is an XCCY curve
+        if xccy_def.get("type") != "XCCY":
+            raise ValueError(f"Curve '{xccy_curve_key}' is not an XCCY curve (type: {xccy_def.get('type')})")
+
+        # Parse curve name: "GBPUSD_XCCY_SONIA_SOFR"
+        # Format: {FOREIGN}{DOMESTIC}_XCCY_{FOREIGN_INDEX}_{DOMESTIC_INDEX}
+        parts = xccy_curve_key.split("_")
+        if len(parts) < 4:
+            raise ValueError(f"Invalid XCCY curve name format: {xccy_curve_key}")
+
+        # Extract currency pair (e.g., "GBPUSD")
+        fx_pair = parts[0]
+        if len(fx_pair) != 6:
+            raise ValueError(f"Invalid FX pair in curve name: {fx_pair}")
+
+        foreign_ccy = fx_pair[:3]  # GBP
+        domestic_ccy = fx_pair[3:]  # USD
+
+        # Extract indices
+        foreign_index = parts[2]  # SONIA
+        domestic_index = parts[3]  # SOFR
+
+        # Construct OIS curve names
+        foreign_curve_name = f"{foreign_ccy}_OIS_{foreign_index}"
+        domestic_curve_name = f"{domestic_ccy}_OIS_{domestic_index}"
+
+        # Fetch XCCY basis spreads
+        value_dt = value_date.datetime()
+        tickers_dict = xccy_def["tickers"]
+        tenor_list = list(tickers_dict.keys())
+        ticker_list = list(tickers_dict.values())
+
+        field = "PX_LAST"
+        df = blp.bdh(
+            tickers=ticker_list,
+            flds=field,
+            start_date=value_dt,
+            end_date=value_dt,
+            Per="D"
+        )
+
+        basis_spreads = [df[ticker][field].iloc[0] for ticker in ticker_list]
+
+        # Fetch domestic OIS curve
+        domestic_curve_inputs = self.get_curve_inputs(domestic_curve_name, value_date)
+
+        # Fetch foreign OIS curve
+        foreign_curve_inputs = self.get_curve_inputs(foreign_curve_name, value_date)
+
+        # Fetch FX spot rate
+        fx_data = self.get_fx_rates([fx_pair], value_date)
+        spot_fx = fx_data[fx_pair]["price"]
+
+        # Get conventions
+        conventions = xccy_def["conventions"]
+
+        # For XCCY, foreign leg typically uses ACT_365F for GBP
+        # Domestic leg uses conventions from the config
+        if foreign_ccy == "GBP":
+            foreign_dc_type = DayCountTypes.ACT_365F
+        else:
+            foreign_dc_type = conventions.get("float_day_count", DayCountTypes.ACT_360)
+
+        return {
+            "name": xccy_curve_key,
+            "domestic_curve_name": domestic_curve_name,
+            "foreign_curve_name": foreign_curve_name,
+            "domestic_curve_inputs": domestic_curve_inputs,
+            "foreign_curve_inputs": foreign_curve_inputs,
+            "basis_spreads": basis_spreads,
+            "tenor_list": tenor_list,
+            "spot_fx": spot_fx,
+            "fx_pair": fx_pair,
+            "domestic_freq_type": conventions["fixed_frequency"],
+            "foreign_freq_type": conventions["float_frequency"],
+            "domestic_dc_type": conventions["fixed_day_count"],
+            "foreign_dc_type": foreign_dc_type,
+            "bus_day_type": conventions["business_day_adjustment"],
+            "interp_type": conventions["interp_type"],
+        }
+
 
 
 class FXRoutingEngine:

@@ -13,10 +13,11 @@ precision within acceptable tolerances.
 
 import pytest
 from cavour.utils.date import Date
-from cavour.utils.global_types import SwapTypes, RequestTypes
+from cavour.utils.global_types import SwapTypes, RequestTypes, CurveTypes
 from cavour.utils.day_count import DayCountTypes
 from cavour.utils.frequency import FrequencyTypes
 from cavour.utils.calendar import BusDayAdjustTypes
+from cavour.utils.currency import CurrencyTypes
 from cavour.market.curves.interpolator import InterpTypes
 from cavour.trades.rates.ois import OIS
 from cavour.models.models import Model
@@ -179,6 +180,8 @@ def test_manual_swap_repricing(gbp_model, gbp_value_date, gbp_market_data, gbp_c
             fixed_coupon=px / 100,
             fixed_freq_type=gbp_curve_parameters["fixed_freq_type"],
             fixed_dc_type=gbp_curve_parameters["fixed_dcc_type"],
+            floating_index=CurveTypes.GBP_OIS_SONIA,
+            currency=CurrencyTypes.GBP,
             bd_type=gbp_curve_parameters["bus_day_type"],
             float_freq_type=gbp_curve_parameters["float_freq_type"],
             float_dc_type=gbp_curve_parameters["float_dc_type"]
@@ -355,6 +358,8 @@ def test_manual_swap_repricing_semiannual(gbp_model_semiannual, gbp_value_date, 
             fixed_coupon=px / 100,
             fixed_freq_type=gbp_curve_parameters_semiannual["fixed_freq_type"],
             fixed_dc_type=gbp_curve_parameters_semiannual["fixed_dcc_type"],
+            floating_index=CurveTypes.GBP_OIS_SONIA,
+            currency=CurrencyTypes.GBP,
             bd_type=gbp_curve_parameters_semiannual["bus_day_type"],
             float_freq_type=gbp_curve_parameters_semiannual["float_freq_type"],
             float_dc_type=gbp_curve_parameters_semiannual["float_dc_type"]
@@ -413,6 +418,8 @@ def test_manual_swap_repricing_quarterly(gbp_model_quarterly, gbp_value_date, gb
             fixed_coupon=px / 100,
             fixed_freq_type=gbp_curve_parameters_quarterly["fixed_freq_type"],
             fixed_dc_type=gbp_curve_parameters_quarterly["fixed_dcc_type"],
+            floating_index=CurveTypes.GBP_OIS_SONIA,
+            currency=CurrencyTypes.GBP,
             bd_type=gbp_curve_parameters_quarterly["bus_day_type"],
             float_freq_type=gbp_curve_parameters_quarterly["float_freq_type"],
             float_dc_type=gbp_curve_parameters_quarterly["float_dc_type"]

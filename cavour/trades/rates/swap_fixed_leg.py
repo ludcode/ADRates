@@ -67,15 +67,15 @@ class SwapFixedLeg:
                  coupon: (float),
                  freq_type: FrequencyTypes,
                  dc_type: DayCountTypes,
+                 floating_index: CurveTypes,
+                 currency: CurrencyTypes,
                  notional: float = ONE_MILLION,
                  principal: float = 0.0,
                  payment_lag: int = 0,
                  cal_type: CalendarTypes = CalendarTypes.WEEKEND,
                  bd_type: BusDayAdjustTypes = BusDayAdjustTypes.FOLLOWING,
                  dg_type: DateGenRuleTypes = DateGenRuleTypes.BACKWARD,
-                 end_of_month: bool = False,
-                 floating_index: CurveTypes = CurveTypes.GBP_OIS_SONIA,
-                 currency: CurrencyTypes = CurrencyTypes.GBP):
+                 end_of_month: bool = False):
         """ Create the fixed leg of a swap contract giving the contract start
         date, its maturity, fixed coupon, fixed leg frequency, fixed leg day
         count convention and notional.  """
