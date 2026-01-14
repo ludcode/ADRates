@@ -153,6 +153,7 @@ class Model:
         bus_day_type=BusDayAdjustTypes.MODIFIED_FOLLOWING,
         interp_type=InterpTypes.LINEAR_ZERO_RATES,
         payment_lag: int = 0,
+        use_ad: bool = False,  # Disable by default (grid mismatch issue to be resolved)
     ):
         """
         Manually construct an OIS curve from swap rates.
@@ -169,6 +170,7 @@ class Model:
             float_dc_type (DayCountTypes): Float leg day count (default: ACT_360)
             bus_day_type (BusDayAdjustTypes): Business day convention (default: MODIFIED_FOLLOWING)
             interp_type (InterpTypes): Interpolation method (default: LINEAR_ZERO_RATES)
+            use_ad (bool): If True, compute and store Jacobians/Hessians for AD (default: True)
             payment_lag (int): Payment lag in days (default: 0)
 
         Example:
@@ -209,7 +211,8 @@ class Model:
             value_dt=self.value_dt,
             ois_swaps=swaps,
             interp_type=interp_type,
-            check_refit=True
+            check_refit=True,
+            use_ad=use_ad
         )
         self._curves_dict[name] = curve
 
@@ -225,6 +228,7 @@ class Model:
             "float_dc_type": float_dc_type,
             "bus_day_type": bus_day_type,
             "interp_type": interp_type,
+            "use_ad": use_ad,
         }
 
     def build_fx(self, currency_pairs: list[str], pxs: list[float]) -> dict:

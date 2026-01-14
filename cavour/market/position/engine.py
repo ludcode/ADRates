@@ -1665,19 +1665,27 @@ class Engine:
             grad_dom_dfs_original = grad(lambda d: jnp.squeeze(pv_dom_original_dfs(d)))(dom_dfs_original)
 
             # Chain rule: sensitivities to rates
-            # For DELTA, we need Jacobian d(DFs)/d(rates) via _cached_curve()
-            # This is OK because we're computing sensitivities, not just evaluating PV
-            dom_cache = self._cached_curve(
-                tuple(domestic_model.swap_times),
-                domestic_model.swap_rates,
-                domestic_model.swap_times,
-                domestic_model.year_fracs,
-                domestic_model._interp_type
-            )
+            # For DELTA, we need Jacobian d(DFs)/d(rates)
+            # Use stored Jacobian if available (ensures consistency with VALUE)
+            # Otherwise fallback to _cached_curve() for backward compatibility
 
-            # The Jacobian has shape (n_dfs, n_rates) where n_dfs includes prepended point
-            # Skip the first row (which is zeros for the prepended DF(0)=1.0)
-            jac_dom_original = dom_cache["jac"][1:, :] if dom_times[0] < 1e-6 else dom_cache["jac"]
+            # Domestic OIS: Check for stored Jacobian
+            if hasattr(domestic_model, '_jac') and domestic_model._jac is not None:
+                # Use stored Jacobian from curve construction (consistent with VALUE)
+                jac_dom_original = domestic_model._jac
+            else:
+                # Fallback: Rebuild curve and compute Jacobian (legacy behavior)
+                dom_cache = self._cached_curve(
+                    tuple(domestic_model.swap_times),
+                    domestic_model.swap_rates,
+                    domestic_model.swap_times,
+                    domestic_model.year_fracs,
+                    domestic_model._interp_type
+                )
+                # The Jacobian has shape (n_dfs, n_rates) where n_dfs includes prepended point
+                # Skip the first row (which is zeros for the prepended DF(0)=1.0)
+                jac_dom_original = dom_cache["jac"][1:, :] if dom_times[0] < 1e-6 else dom_cache["jac"]
+
             delta_dom_rates = jnp.dot(grad_dom_dfs_original, jac_dom_original)
             delta_dom_rates = [float(x) * 1e-4 for x in delta_dom_rates]
 
@@ -1685,14 +1693,20 @@ class Engine:
             for_ois_dfs_original = for_dfs[1:] if for_times[0] < 1e-6 else for_dfs
             grad_for_dfs_original = grad(lambda d: jnp.squeeze(pv_for_original_dfs(d)))(for_ois_dfs_original)
 
-            for_cache = self._cached_curve(
-                tuple(foreign_model.swap_times),
-                foreign_model.swap_rates,
-                foreign_model.swap_times,
-                foreign_model.year_fracs,
-                foreign_model._interp_type
-            )
-            jac_for_original = for_cache["jac"][1:, :] if for_times[0] < 1e-6 else for_cache["jac"]
+            # Foreign OIS: Check for stored Jacobian
+            if hasattr(foreign_model, '_jac') and foreign_model._jac is not None:
+                # Use stored Jacobian from curve construction (consistent with VALUE)
+                jac_for_original = foreign_model._jac
+            else:
+                # Fallback: Rebuild curve and compute Jacobian (legacy behavior)
+                for_cache = self._cached_curve(
+                    tuple(foreign_model.swap_times),
+                    foreign_model.swap_rates,
+                    foreign_model.swap_times,
+                    foreign_model.year_fracs,
+                    foreign_model._interp_type
+                )
+                jac_for_original = for_cache["jac"][1:, :] if for_times[0] < 1e-6 else for_cache["jac"]
 
             # XCCY: Extract DFs and compute gradients (needed for basis delta/gamma and cross-gamma)
             xccy_dfs_original = xccy_dfs[1:] if xccy_times[0] < 1e-6 else xccy_dfs
@@ -1789,10 +1803,36 @@ class Engine:
 
             # Compute gradients and Jacobians (needed for gamma computation)
             grad_dom_dfs_original = grad(lambda d: jnp.squeeze(pv_dom_original_dfs(d)))(dom_dfs_original)
-            jac_dom_original = dom_cache["jac"][1:, :] if dom_times[0] < 1e-6 else dom_cache["jac"]
+
+            # Domestic OIS: Get Jacobian and Hessian (use stored if available)
+            if hasattr(domestic_model, '_jac') and domestic_model._jac is not None:
+                jac_dom_original = domestic_model._jac
+            else:
+                # Need to compute via _cached_curve()
+                dom_cache = self._cached_curve(
+                    tuple(domestic_model.swap_times),
+                    domestic_model.swap_rates,
+                    domestic_model.swap_times,
+                    domestic_model.year_fracs,
+                    domestic_model._interp_type
+                )
+                jac_dom_original = dom_cache["jac"][1:, :] if dom_times[0] < 1e-6 else dom_cache["jac"]
 
             grad_for_dfs_original = grad(lambda d: jnp.squeeze(pv_for_original_dfs(d)))(for_ois_dfs_original)
-            jac_for_original = for_cache["jac"][1:, :] if for_times[0] < 1e-6 else for_cache["jac"]
+
+            # Foreign OIS: Get Jacobian (use stored if available)
+            if hasattr(foreign_model, '_jac') and foreign_model._jac is not None:
+                jac_for_original = foreign_model._jac
+            else:
+                # Need to compute via _cached_curve()
+                for_cache = self._cached_curve(
+                    tuple(foreign_model.swap_times),
+                    foreign_model.swap_rates,
+                    foreign_model.swap_times,
+                    foreign_model.year_fracs,
+                    foreign_model._interp_type
+                )
+                jac_for_original = for_cache["jac"][1:, :] if for_times[0] < 1e-6 else for_cache["jac"]
 
             grad_xccy_dfs_original = grad(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
 
@@ -1800,8 +1840,21 @@ class Engine:
             # Compute Hessian w.r.t. domestic DFs
             hess_dom_dfs_original = hessian(lambda d: jnp.squeeze(pv_dom_original_dfs(d)))(dom_dfs_original)
 
-            # Retrieve Hessian of curve bootstrapping (d²DFs/d(rates)²)
-            hess_dom_curve = dom_cache["hess"][1:, :, :] if dom_times[0] < 1e-6 else dom_cache["hess"]
+            # Get Hessian of curve bootstrapping (d²DFs/d(rates)²)
+            if hasattr(domestic_model, '_hess') and domestic_model._hess is not None:
+                # Use stored Hessian from curve construction (consistent with VALUE)
+                hess_dom_curve = domestic_model._hess
+            else:
+                # Fallback: Get from _cached_curve() (may have been computed above)
+                if 'dom_cache' not in locals():
+                    dom_cache = self._cached_curve(
+                        tuple(domestic_model.swap_times),
+                        domestic_model.swap_rates,
+                        domestic_model.swap_times,
+                        domestic_model.year_fracs,
+                        domestic_model._interp_type
+                    )
+                hess_dom_curve = dom_cache["hess"][1:, :, :] if dom_times[0] < 1e-6 else dom_cache["hess"]
 
             # Chain rule for gamma: d²PV/d(rates)² = jac^T @ hess_dfs @ jac + sum(grad_dfs * hess_curve)
             # term1: main chain rule (treating curve as fixed mapping)
@@ -1822,8 +1875,21 @@ class Engine:
             # Compute Hessian w.r.t. foreign DFs (direct effect through forward rates)
             hess_for_dfs_original = hessian(lambda d: jnp.squeeze(pv_for_original_dfs(d)))(for_ois_dfs_original)
 
-            # Retrieve Hessian of curve bootstrapping
-            hess_for_curve = for_cache["hess"][1:, :, :] if for_times[0] < 1e-6 else for_cache["hess"]
+            # Get Hessian of curve bootstrapping (d²DFs/d(rates)²)
+            if hasattr(foreign_model, '_hess') and foreign_model._hess is not None:
+                # Use stored Hessian from curve construction (consistent with VALUE)
+                hess_for_curve = foreign_model._hess
+            else:
+                # Fallback: Get from _cached_curve() (may have been computed above)
+                if 'for_cache' not in locals():
+                    for_cache = self._cached_curve(
+                        tuple(foreign_model.swap_times),
+                        foreign_model.swap_rates,
+                        foreign_model.swap_times,
+                        foreign_model.year_fracs,
+                        foreign_model._interp_type
+                    )
+                hess_for_curve = for_cache["hess"][1:, :, :] if for_times[0] < 1e-6 else for_cache["hess"]
 
             # Chain rule for gamma - DIRECT effect (foreign OIS -> forward rates -> PV)
             term1_for = jac_for_original.T @ hess_for_dfs_original @ jac_for_original
