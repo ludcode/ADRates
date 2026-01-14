@@ -366,7 +366,7 @@ class Model:
             basis_swaps=basis_swaps,
             domestic_curve=domestic_curve,
             foreign_curve=foreign_curve,
-            spot_fx=1/spot_fx,  # XccyCurve expects USD/GBP (inverse)
+            spot_fx=spot_fx,  # XccyCurve expects domestic per unit of foreign
             interp_type=interp_type,
             use_ad=use_ad
         )

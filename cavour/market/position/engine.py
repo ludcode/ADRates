@@ -1441,29 +1441,27 @@ class Engine:
             raise LibError(f"XCCY curve {xccy_curve_name} not found in model. "
                          f"Available curves: {[attr for attr in dir(self.model.curves) if not attr.startswith('_')]}")
 
-        # Build domestic OIS curve arrays
-        dom_curve_key = tuple(domestic_model.swap_times)
-        dom_cache = self._cached_curve(
-            dom_curve_key,
-            domestic_model.swap_rates,
-            domestic_model.swap_times,
-            domestic_model.year_fracs,
-            domestic_model._interp_type
-        )
-        dom_times = dom_cache["times"]
-        dom_dfs = dom_cache["dfs"]
+        # Get domestic OIS curve arrays directly from stored curve
+        # IMPORTANT: Use curve's existing _times and _dfs (from original bootstrap)
+        # DO NOT re-bootstrap via build_curve_ad() as it creates numerical differences
+        dom_times = jnp.array(domestic_model._times)
+        dom_dfs = jnp.array(domestic_model._dfs)
 
-        # Build foreign OIS curve arrays
-        for_curve_key = tuple(foreign_model.swap_times)
-        for_cache = self._cached_curve(
-            for_curve_key,
-            foreign_model.swap_rates,
-            foreign_model.swap_times,
-            foreign_model.year_fracs,
-            foreign_model._interp_type
-        )
-        for_times = for_cache["times"]
-        for_dfs = for_cache["dfs"]
+        # Prepend t=0 point if not present (needed for interpolation at value date)
+        if dom_times[0] > 1e-7:
+            dom_times = jnp.concatenate([jnp.array([1e-8]), dom_times])
+            dom_dfs = jnp.concatenate([jnp.array([1.0]), dom_dfs])
+
+        # Get foreign OIS curve arrays directly from stored curve
+        # IMPORTANT: Use curve's existing _times and _dfs (from original bootstrap)
+        # DO NOT re-bootstrap via build_curve_ad() as it creates numerical differences
+        for_times = jnp.array(foreign_model._times)
+        for_dfs = jnp.array(foreign_model._dfs)
+
+        # Prepend t=0 point if not present (needed for interpolation at value date)
+        if for_times[0] > 1e-7:
+            for_times = jnp.concatenate([jnp.array([1e-8]), for_times])
+            for_dfs = jnp.concatenate([jnp.array([1.0]), for_dfs])
 
         # Get XCCY curve arrays
         # Note: XCCY curve times are in ACT_365F, but we'll use them to interpolate
@@ -1573,9 +1571,11 @@ class Engine:
             )
 
             # Convert to scalars and compute total PV
+            # spot_fx is USD/GBP (domestic/foreign)
+            # for_pv_scalar is in GBP, multiply by spot_fx to convert to USD
             dom_pv_scalar = float(jnp.squeeze(dom_pv))
             for_pv_scalar = float(jnp.squeeze(for_pv))
-            total_pv = dom_pv_scalar + for_pv_scalar / spot_fx
+            total_pv = dom_pv_scalar + for_pv_scalar * spot_fx
             value = Valuation(amount=total_pv, currency=derivative._domestic_currency)
 
         # Define PV functions for gradient/hessian computation (used by both DELTA and GAMMA)
@@ -1665,7 +1665,8 @@ class Engine:
             grad_dom_dfs_original = grad(lambda d: jnp.squeeze(pv_dom_original_dfs(d)))(dom_dfs_original)
 
             # Chain rule: sensitivities to rates
-            # Domestic OIS: simple chain rule
+            # For DELTA, we need Jacobian d(DFs)/d(rates) via _cached_curve()
+            # This is OK because we're computing sensitivities, not just evaluating PV
             dom_cache = self._cached_curve(
                 tuple(domestic_model.swap_times),
                 domestic_model.swap_rates,
@@ -1683,6 +1684,14 @@ class Engine:
             # Foreign OIS: Extract DFs and compute gradients/Jacobians
             for_ois_dfs_original = for_dfs[1:] if for_times[0] < 1e-6 else for_dfs
             grad_for_dfs_original = grad(lambda d: jnp.squeeze(pv_for_original_dfs(d)))(for_ois_dfs_original)
+
+            for_cache = self._cached_curve(
+                tuple(foreign_model.swap_times),
+                foreign_model.swap_rates,
+                foreign_model.swap_times,
+                foreign_model.year_fracs,
+                foreign_model._interp_type
+            )
             jac_for_original = for_cache["jac"][1:, :] if for_times[0] < 1e-6 else for_cache["jac"]
 
             # XCCY: Extract DFs and compute gradients (needed for basis delta/gamma and cross-gamma)
@@ -1706,11 +1715,13 @@ class Engine:
             # Only the foreign leg has sensitivity to XCCY curve (used for discounting)
             # Note: pv_xccy_fn, pv_xccy_original_dfs, and grad_xccy_dfs_original already computed above
 
-            # Convert to GBP per bp
-            # Foreign leg PV is in USD, divide by spot_fx to convert USD to GBP (spot_fx is USD/GBP)
+            # Convert foreign OIS delta to domestic currency per bp
+            # Foreign leg PV is in GBP (foreign currency)
+            # Delta w.r.t. foreign rates is d(PV_GBP)/d(rate)
+            # Multiply by spot_fx (USD/GBP) to convert to d(PV_USD)/d(rate)
             # Rates are stored in DECIMAL (0.052 for 5.2%), Jacobian is d(DFs)/d(rate_decimal)
             # 1bp = 0.0001 in decimal units → multiply by 1e-4
-            delta_for_rates = [float(x) * 1e-4 / spot_fx for x in delta_for_rates_raw]
+            delta_for_rates = [float(x) * 1e-4 * spot_fx for x in delta_for_rates_raw]
 
             # Chain rule: sensitivities to basis spreads
             # The XCCY curve has a Jacobian d(DFs)/d(basis_spreads) stored as _jac_basis
@@ -1726,11 +1737,13 @@ class Engine:
                 # Compute delta: grad(PV, DFs) · Jacobian(DFs, pillar_spreads)
                 delta_basis_rates_raw = jnp.dot(grad_xccy_dfs_original, jac_xccy_pillar)
 
-                # Convert to GBP per bp
-                # Foreign leg PV is in USD, divide by spot_fx to convert USD to GBP (spot_fx is USD/GBP)
+                # Convert basis delta to domestic currency per bp
+                # Foreign leg PV is in GBP (foreign currency)
+                # Delta w.r.t. basis spreads is d(PV_GBP)/d(spread)
+                # Multiply by spot_fx (USD/GBP) to convert to d(PV_USD)/d(spread)
                 # Basis spreads are stored in DECIMAL (0.0030 for 30bp), Jacobian is d(DFs)/d(spread_decimal)
                 # 1bp = 0.0001 in decimal units → multiply by 1e-4
-                delta_basis_rates = [float(x) * 1e-4 / spot_fx for x in delta_basis_rates_raw]
+                delta_basis_rates = [float(x) * 1e-4 * spot_fx for x in delta_basis_rates_raw]
 
                 delta_basis = Delta(
                     risk_ladder=delta_basis_rates,
