@@ -284,6 +284,7 @@ class Model:
         bus_day_type: BusDayAdjustTypes = BusDayAdjustTypes.MODIFIED_FOLLOWING,
         interp_type: InterpTypes = InterpTypes.FLAT_FWD_RATES,
         use_ad: bool = True,
+        compute_gamma: bool = False,
     ):
         """
         Build a cross-currency basis swap curve from basis spreads.
@@ -303,6 +304,7 @@ class Model:
             bus_day_type (BusDayAdjustTypes): Business day convention
             interp_type (InterpTypes): Interpolation method
             use_ad (bool): Enable JAX automatic differentiation (default: True)
+            compute_gamma (bool): Compute Hessians for GAMMA (slow, default: False)
 
         Raises:
             ValueError: If domestic or foreign curve not found in model
@@ -372,7 +374,8 @@ class Model:
             foreign_curve=foreign_curve,
             spot_fx=spot_fx,  # XccyCurve expects domestic per unit of foreign
             interp_type=interp_type,
-            use_ad=use_ad
+            use_ad=use_ad,
+            compute_gamma=compute_gamma
         )
 
         self._curves_dict[name] = xccy_curve

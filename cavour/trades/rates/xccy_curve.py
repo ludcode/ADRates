@@ -114,7 +114,8 @@ class XccyCurve(DiscountCurve):
                  spot_fx: float,
                  interp_type: InterpTypes = InterpTypes.FLAT_FWD_RATES,
                  check_refit: bool = False,
-                 use_ad: bool = False):
+                 use_ad: bool = False,
+                 compute_gamma: bool = False):
         """
         Create a cross-currency discount curve from basis swaps.
 
@@ -127,6 +128,7 @@ class XccyCurve(DiscountCurve):
             interp_type: Interpolation method for discount factors
             check_refit: If True, verify calibration swaps reprice to zero
             use_ad: If True, use JAX-compatible _build_curve_ad() for automatic differentiation
+            compute_gamma: If True, compute Hessians for GAMMA (slow). If False, only Jacobians for DELTA (fast).
 
         Notes:
             - All basis swaps must have same effective date (XCCY spot date)
@@ -143,6 +145,7 @@ class XccyCurve(DiscountCurve):
         self._interp_type = interp_type
         self._check_refit = check_refit
         self._use_ad = use_ad
+        self._compute_gamma = compute_gamma
         self._interpolator = None
 
         # Sort swaps by maturity
@@ -595,15 +598,19 @@ class XccyCurve(DiscountCurve):
 
         # 4a-ii: Hessian w.r.t. basis spreads: d²(xccy_dfs) / d(basis_spreads)²
         # This is needed for computing gamma (second-order sensitivities)
-        #
-        # Phase 2: Using JAX automatic differentiation (fast!)
-        # jacfwd(jacrev(...)) computes Hessian for vector-valued functions
-        # This is equivalent to forward-over-reverse mode AD
-        from jax import jacfwd
-        hess_basis_func = jacfwd(jacrev(dfs_from_basis_pillar))
-        hess_basis = hess_basis_func(basis_spreads_pillar)
-        # Result shape: [n_xccy_dfs, n_spreads, n_spreads]
-        self._hess_basis = hess_basis
+        # IMPORTANT: Hessian computation is O(n²) and slow - only compute if needed for GAMMA
+        if self._compute_gamma:
+            # Phase 2: Using JAX automatic differentiation (fast!)
+            # jacfwd(jacrev(...)) computes Hessian for vector-valued functions
+            # This is equivalent to forward-over-reverse mode AD
+            from jax import jacfwd
+            hess_basis_func = jacfwd(jacrev(dfs_from_basis_pillar))
+            hess_basis = hess_basis_func(basis_spreads_pillar)
+            # Result shape: [n_xccy_dfs, n_spreads, n_spreads]
+            self._hess_basis = hess_basis
+        else:
+            # Skip Hessian for DELTA-only computations (much faster)
+            self._hess_basis = None
 
         # 4b: Mixed Hessian w.r.t. foreign OIS CURVE DFs and basis spreads
         # d2(xccy_dfs) / d(foreign_curve_dfs) d(basis_spreads)
@@ -671,25 +678,30 @@ class XccyCurve(DiscountCurve):
         # Shape: [n_xccy_dfs, n_foreign_dfs]
 
         # Compute mixed Hessian: d²(xccy_dfs) / d(basis) d(foreign_curve)
+        # This is only needed for GAMMA (cross-gamma between foreign OIS and XCCY basis)
         # KEY: Use jacrev(jacfwd(...)) not jacfwd(jacrev(...))!
         # jacrev(jacfwd(f, argnums=1), argnums=0) gives [n_xccy, n_foreign_curve, n_basis]
-        mixed_hess_func = jacrev(jacfwd(compute_xccy_from_foreign_curve, argnums=1), argnums=0)
-        mixed_hess_raw = mixed_hess_func(basis_spreads_pillar, foreign_curve_dfs)
+        if self._compute_gamma:
+            mixed_hess_func = jacrev(jacfwd(compute_xccy_from_foreign_curve, argnums=1), argnums=0)
+            mixed_hess_raw = mixed_hess_func(basis_spreads_pillar, foreign_curve_dfs)
 
-        # Verify dimensions
-        # Expected shape: [n_xccy, n_foreign_curve, n_basis]
-        n_xccy_result = mixed_hess_raw.shape[0]
-        n_foreign_result = mixed_hess_raw.shape[1]
-        n_basis_result = mixed_hess_raw.shape[2]
+            # Verify dimensions
+            # Expected shape: [n_xccy, n_foreign_curve, n_basis]
+            n_xccy_result = mixed_hess_raw.shape[0]
+            n_foreign_result = mixed_hess_raw.shape[1]
+            n_basis_result = mixed_hess_raw.shape[2]
 
-        if n_foreign_result == len(foreign_curve_dfs) and n_basis_result == len(basis_spreads_pillar):
-            # Already in the correct format [n_xccy, n_foreign_curve, n_basis]
-            # But we need [n_xccy, n_basis, n_foreign_curve] for engine.py
-            self._mixed_hess_foreign_basis = jnp.transpose(mixed_hess_raw, (0, 2, 1))
+            if n_foreign_result == len(foreign_curve_dfs) and n_basis_result == len(basis_spreads_pillar):
+                # Already in the correct format [n_xccy, n_foreign_curve, n_basis]
+                # But we need [n_xccy, n_basis, n_foreign_curve] for engine.py
+                self._mixed_hess_foreign_basis = jnp.transpose(mixed_hess_raw, (0, 2, 1))
+            else:
+                print(f"WARNING: Mixed Hessian dimensions incorrect!")
+                print(f"  Got: [{n_xccy_result}, {n_foreign_result}, {n_basis_result}]")
+                print(f"  Expected: [?, {len(foreign_curve_dfs)}, {len(basis_spreads_pillar)}]")
+                self._mixed_hess_foreign_basis = None
         else:
-            print(f"WARNING: Mixed Hessian dimensions incorrect!")
-            print(f"  Got: [{n_xccy_result}, {n_foreign_result}, {n_basis_result}]")
-            print(f"  Expected: [?, {len(foreign_curve_dfs)}, {len(basis_spreads_pillar)}]")
+            # Skip mixed Hessian for DELTA-only computations (much faster)
             self._mixed_hess_foreign_basis = None
 
 

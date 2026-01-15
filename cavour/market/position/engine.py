@@ -2352,10 +2352,12 @@ class Engine:
             6. Returns dense grid for interpolation (not just swap maturities)
 
         Note:
-            Each intermediate point inherits its parent swap's rate, matching
-            the recursive version's behavior. Rounding to 2 decimals supports
-            quarterly swaps (0.25) and is used only for dictionary key matching,
-            not for actual computations.
+            Deduplication uses "first occurrence wins": when multiple swaps have cashflows
+            at the same time (e.g., multiple 1Y+ swaps all have t=1.0), the FIRST swap to
+            reach that time computes the DF using its rate. Subsequent swaps skip that time.
+            This matches the original recursive OISCurve behavior where pv01_dict cached the
+            first computation. Rounding to 2 decimals supports quarterly swaps (0.25) and is
+            used only for deduplication keys, not for actual DF computations.
         """
 
         # 1) Add t=0, df=1.0 point (matches OISCurve._build_curve_ad line 126-127)
@@ -2370,22 +2372,31 @@ class Engine:
             'swap_idx': -1  # Special index for t=0
         }]
 
-        # 2) Pre-expand ALL intermediate points (not just swap maturities)
+        # 2) Pre-expand ALL intermediate points with DEDUPLICATION
+        # Track seen keys to implement "first occurrence wins" (matches original OISCurve)
+        seen_keys = set([0.0])  # t=0 already added above
+
         for i, (rate, fracs) in enumerate(zip(swap_rates, year_fracs)):
             cumsum = 0.0
             for j, frac in enumerate(fracs):
                 prev_cum = cumsum
                 cumsum += frac
-                points.append({
-                    'maturity': cumsum,                      # EXACT value for computations
-                    'maturity_key': round(cumsum, 2),       # Rounded key for matching (2 decimals to avoid collisions)
-                    'acc': frac,
-                    'prev_mat': prev_cum,                    # EXACT previous maturity
-                    'prev_key': round(prev_cum, 2) if j > 0 else None,  # Rounded key (2 decimals)
-                    'rate': rate,                            # Parent swap's rate
-                    'is_final': (j == len(fracs) - 1),      # Is this the swap's final maturity?
-                    'swap_idx': i
-                })
+                key = round(cumsum, 2)
+
+                # DEDUPLICATION: Only add if this is the FIRST occurrence of this rounded key
+                # This matches original OISCurve behavior where first swap to reach a time "owns" it
+                if key not in seen_keys:
+                    points.append({
+                        'maturity': cumsum,                      # EXACT value for computations
+                        'maturity_key': key,                     # Rounded key for matching (2 decimals)
+                        'acc': frac,
+                        'prev_mat': prev_cum,                    # EXACT previous maturity
+                        'prev_key': round(prev_cum, 2) if j > 0 else None,  # Rounded key (2 decimals)
+                        'rate': rate,                            # First swap's rate for this time
+                        'is_final': (j == len(fracs) - 1),      # Is this the swap's final maturity?
+                        'swap_idx': i
+                    })
+                    seen_keys.add(key)
 
         # 3) Sort by exact maturity
         sorted_points = sorted(points, key=lambda x: x['maturity'])
