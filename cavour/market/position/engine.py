@@ -1973,7 +1973,6 @@ class Engine:
             if hasattr(xccy_curve, '_mixed_hess_foreign_basis') and xccy_curve._mixed_hess_foreign_basis is not None:
                 # DEBUG: Print dimensions
                 print(f"DEBUG Cross-gamma dimensions:")
-                print(f"  for_cache['jac'] shape: {for_cache['jac'].shape}")
                 print(f"  jac_for_original shape: {jac_for_original.shape}")
                 print(f"  mixed_hess shape: {xccy_curve._mixed_hess_foreign_basis.shape}")
                 print(f"  for_times: {for_times}")

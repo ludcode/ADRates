@@ -296,10 +296,12 @@ class XccyBasisSwap:
         # Convert to collateral currency
         if collateral_ccy == self._domestic_currency:
             # Convert foreign leg to domestic currency
-            value = domestic_leg_value + foreign_leg_value / spot_fx
+            # Foreign leg is in GBP, multiply by spot_fx (USD/GBP) to convert to USD
+            value = domestic_leg_value + foreign_leg_value * spot_fx
         else:  # Foreign collateral
             # Convert domestic leg to foreign currency
-            value = domestic_leg_value * spot_fx + foreign_leg_value
+            # Domestic leg is in USD, divide by spot_fx (USD/GBP) to convert to GBP
+            value = domestic_leg_value / spot_fx + foreign_leg_value
 
         return value
 
