@@ -363,17 +363,122 @@ class Engine:
             )
             value_batch = [float(pv) for pv in pv_array]
 
-        # DELTA and GAMMA not yet implemented for batch
+        # Compute DELTA if requested
+        delta_batch = None
         if RequestTypes.DELTA in reqs:
-            raise NotImplementedError("compute_batch does not yet support DELTA (coming soon)")
+            from cavour.utils.helpers import to_tenor
+            from cavour.requests.results import Delta, Risk
+
+            # Extract Jacobians (shared across batch)
+            # Check if curves were built with AD (have stored Jacobians)
+            if hasattr(domestic_model, '_jac') and domestic_model._jac is not None:
+                dom_jac = domestic_model._jac
+            else:
+                raise LibError(
+                    f"Domestic curve {dom_idx_name} must be built with use_ad=True for batched DELTA. "
+                    "Rebuild curve with: model.build_curve(..., use_ad=True)"
+                )
+
+            if hasattr(foreign_model, '_jac') and foreign_model._jac is not None:
+                for_jac = foreign_model._jac
+            else:
+                raise LibError(
+                    f"Foreign curve {for_idx_name} must be built with use_ad=True for batched DELTA. "
+                    "Rebuild curve with: model.build_curve(..., use_ad=True)"
+                )
+
+            if hasattr(xccy_curve, '_jac_basis') and xccy_curve._jac_basis is not None:
+                # Skip first row if curve has prepended t=0 (to match original DFs)
+                xccy_jac_basis = xccy_curve._jac_basis[1:, :] if xccy_times[0] < 1e-6 else xccy_curve._jac_basis
+            else:
+                raise LibError(
+                    f"XCCY curve {xccy_curve_name} must be built with use_ad=True for batched DELTA. "
+                    "Rebuild curve with: model.build_xccy_curve(..., use_ad=True)"
+                )
+
+            # Create vectorized DELTA function
+            # in_axes: None = shared (curves, Jacobians), 0 = batched (swap params)
+            delta_batch_fn = vmap(
+                lambda dom_pmt, dom_start, dom_end, dom_alpha, dom_spr, dom_not,
+                       dom_prin, dom_sign, dom_notex, dom_eff, dom_mat,
+                       for_pmt, for_start, for_end, for_alpha, for_spr, for_not,
+                       for_prin, for_sign, for_notex, for_eff, for_mat:
+                    self._xccy_delta_pure(
+                        dom_dfs, dom_times, domestic_model._interp_type,
+                        for_dfs, for_times, foreign_model._interp_type,
+                        xccy_dfs, xccy_times, xccy_curve._interp_type,
+                        dom_jac, for_jac, xccy_jac_basis,
+                        dom_pmt, dom_start, dom_end, dom_alpha, dom_spr, dom_not,
+                        dom_prin, dom_sign, dom_notex, dom_eff, dom_mat,
+                        for_pmt, for_start, for_end, for_alpha, for_spr, for_not,
+                        for_prin, for_sign, for_notex, for_eff, for_mat,
+                        value_time, spot_fx
+                    ),
+                in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  # Domestic leg batched
+                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)   # Foreign leg batched
+            )
+
+            # Compute batched DELTA
+            deltas_tuple = delta_batch_fn(
+                dom_payment_times_batch, dom_start_times_batch, dom_end_times_batch,
+                dom_alphas_batch, dom_spreads_batch, dom_notionals_batch,
+                dom_principal_batch, dom_leg_sign_batch, dom_notional_exchange_batch,
+                dom_effective_time_batch, dom_maturity_time_batch,
+                for_payment_times_batch, for_start_times_batch, for_end_times_batch,
+                for_alphas_batch, for_spreads_batch, for_notionals_batch,
+                for_principal_batch, for_leg_sign_batch, for_notional_exchange_batch,
+                for_effective_time_batch, for_maturity_time_batch
+            )
+
+            # Unpack deltas (returned as tuple of 3 arrays)
+            delta_dom_batch = deltas_tuple[0]  # [batch_size, n_dom_rates]
+            delta_for_batch = deltas_tuple[1]  # [batch_size, n_for_rates]
+            delta_basis_batch = deltas_tuple[2]  # [batch_size, n_basis]
+
+            # Convert to tenor strings
+            dom_tenors = to_tenor(domestic_model.swap_times)
+            for_tenors = to_tenor(foreign_model.swap_times)
+            basis_tenors = to_tenor(xccy_curve.swap_times)
+
+            # Package into Delta/Risk objects for each swap
+            delta_batch = []
+            for i in range(batch_size):
+                # Create Delta objects for each curve
+                delta_domestic = Delta(
+                    risk_ladder=[float(x) for x in delta_dom_batch[i]],
+                    tenors=dom_tenors,
+                    currency=derivatives[i]._domestic_currency,
+                    curve_type=derivatives[i]._domestic_floating_index,
+                )
+
+                delta_foreign = Delta(
+                    risk_ladder=[float(x) for x in delta_for_batch[i]],
+                    tenors=for_tenors,
+                    currency=derivatives[i]._domestic_currency,
+                    curve_type=derivatives[i]._foreign_floating_index,
+                )
+
+                delta_basis = Delta(
+                    risk_ladder=[float(x) for x in delta_basis_batch[i]],
+                    tenors=basis_tenors,
+                    currency=derivatives[i]._domestic_currency,
+                    curve_type=CurveTypes.USD_GBP_BASIS,  # TODO: Derive from currencies
+                )
+
+                # Package into Risk object
+                risk = Risk([delta_domestic, delta_foreign, delta_basis])
+                delta_batch.append(risk)
+
+        # GAMMA not yet implemented for batch
         if RequestTypes.GAMMA in reqs:
-            raise NotImplementedError("compute_batch does not yet support GAMMA (coming soon)")
+            raise NotImplementedError("compute_batch does not yet support GAMMA (Phase 3 - coming soon)")
 
         # Package results
         results = []
         for i in range(batch_size):
             value_obj = Valuation(amount=value_batch[i], currency=derivatives[i]._domestic_currency) if value_batch else None
-            result = AnalyticsResult(value=value_obj, risk=None, gamma=None)
+            delta_obj = delta_batch[i] if delta_batch else None
+            result = AnalyticsResult(value=value_obj, risk=delta_obj, gamma=None)
             results.append(result)
 
         return results
@@ -3257,6 +3362,176 @@ class Engine:
 
         # Return scalar (squeeze any extra dimensions from JAX arrays)
         return jnp.squeeze(total_pv)
+
+
+    def _xccy_delta_pure(self,
+                        dom_dfs, dom_times, dom_interp_type,
+                        for_dfs, for_times, for_interp_type,
+                        xccy_dfs, xccy_times, xccy_interp_type,
+                        dom_jac, for_jac, xccy_jac_basis,
+                        dom_payment_times, dom_start_times, dom_end_times,
+                        dom_alphas, dom_spreads, dom_notionals,
+                        dom_principal, dom_leg_sign,
+                        dom_notional_exchange, dom_effective_time, dom_maturity_time,
+                        for_payment_times, for_start_times, for_end_times,
+                        for_alphas, for_spreads, for_notionals,
+                        for_principal, for_leg_sign,
+                        for_notional_exchange, for_effective_time, for_maturity_time,
+                        value_time, spot_fx):
+        """
+        Compute XCCY swap DELTA for a single swap (JAX-compatible, vmap-ready).
+
+        This pure function computes first-order sensitivities (DELTA) to:
+        - Domestic OIS curve rates
+        - Foreign OIS curve rates
+        - XCCY basis spreads
+
+        Uses automatic differentiation to compute gradients w.r.t. discount factors,
+        then applies chain rule with pre-computed Jacobians.
+
+        Architecture:
+        1. Define PV functions for each curve (domestic, foreign, xccy)
+        2. Compute gradients: grad(PV, DFs) for each curve
+        3. Chain rule: delta = grad(PV, DFs) · Jacobian(DFs, rates)
+        4. Convert to bp units and domestic currency
+
+        Args:
+            Curve arrays (shared across batch):
+                dom_dfs, dom_times: Domestic OIS discount factors and times
+                dom_interp_type: Interpolation type for domestic curve
+                for_dfs, for_times: Foreign OIS discount factors and times
+                for_interp_type: Interpolation type for foreign curve
+                xccy_dfs, xccy_times: XCCY curve discount factors and times
+                xccy_interp_type: Interpolation type for XCCY curve
+
+            Jacobians (shared across batch):
+                dom_jac: [n_dfs, n_rates] Jacobian d(DFs)/d(rates) for domestic OIS
+                for_jac: [n_dfs, n_rates] Jacobian d(DFs)/d(rates) for foreign OIS
+                xccy_jac_basis: [n_dfs, n_basis] Jacobian d(DFs)/d(basis_spreads) for XCCY
+
+            Swap parameters (per-swap, batched via vmap):
+                dom_* : Domestic leg parameters (payment times, alphas, spreads, etc.)
+                for_* : Foreign leg parameters
+                value_time: Valuation time
+                spot_fx: FX spot rate (domestic/foreign)
+
+        Returns:
+            Tuple of (delta_dom, delta_for, delta_basis):
+                delta_dom: [n_dom_rates] - domestic OIS delta in USD/bp
+                delta_for: [n_for_rates] - foreign OIS delta in USD/bp
+                delta_basis: [n_basis] - XCCY basis delta in USD/bp
+
+        Performance:
+            - Pure JAX function: JIT compilable, vmap-compatible
+            - Shared Jacobians amortize overhead across batch
+            - Per-swap gradients computed in parallel via vmap
+        """
+        from jax import grad
+        import jax.numpy as jnp
+
+        # Define PV functions for each curve (same pattern as sequential _compute_xccy)
+
+        # Domestic leg PV as function of domestic DFs
+        def pv_dom_fn(dom_dfs_var):
+            return self._float_leg_jax(
+                dfs=dom_dfs_var, times=dom_times,
+                disc_interp_type=dom_interp_type,
+                idx_interp_type=dom_interp_type,
+                payment_times=dom_payment_times,
+                start_times=dom_start_times, end_times=dom_end_times,
+                pay_alphas=dom_alphas, spreads=dom_spreads,
+                notionals=dom_notionals, principal=dom_principal,
+                leg_sign=dom_leg_sign, value_time=value_time,
+                first_fixing_rate=0.0, override_first=False,
+                idx_times=None, idx_dfs=None,
+                notional_exchange=dom_notional_exchange,
+                notional_exchange_amount=dom_notionals[0],
+                effective_time=dom_effective_time,
+                maturity_time=dom_maturity_time
+            )
+
+        # Foreign leg PV as function of foreign OIS DFs (for forward rate sensitivity)
+        def pv_for_fn(for_ois_dfs_var):
+            return self._float_leg_jax(
+                dfs=xccy_dfs, times=xccy_times,  # XCCY curve for discounting (FIXED)
+                disc_interp_type=xccy_interp_type,
+                idx_interp_type=for_interp_type,
+                payment_times=for_payment_times,
+                start_times=for_start_times, end_times=for_end_times,
+                pay_alphas=for_alphas, spreads=for_spreads,
+                notionals=for_notionals, principal=for_principal,
+                leg_sign=for_leg_sign, value_time=value_time,
+                first_fixing_rate=0.0, override_first=False,
+                idx_times=for_times, idx_dfs=for_ois_dfs_var,  # Foreign OIS DFs (VARIABLE)
+                notional_exchange=for_notional_exchange,
+                notional_exchange_amount=for_notionals[0],
+                effective_time=for_effective_time,
+                maturity_time=for_maturity_time
+            )
+
+        # Foreign leg PV as function of XCCY DFs (for basis spread sensitivity)
+        def pv_xccy_fn(xccy_dfs_var):
+            return self._float_leg_jax(
+                dfs=xccy_dfs_var, times=xccy_times,  # XCCY curve for discounting (VARIABLE)
+                disc_interp_type=xccy_interp_type,
+                idx_interp_type=for_interp_type,
+                payment_times=for_payment_times,
+                start_times=for_start_times, end_times=for_end_times,
+                pay_alphas=for_alphas, spreads=for_spreads,
+                notionals=for_notionals, principal=for_principal,
+                leg_sign=for_leg_sign, value_time=value_time,
+                first_fixing_rate=0.0, override_first=False,
+                idx_times=for_times, idx_dfs=for_dfs,  # Foreign OIS DFs (FIXED)
+                notional_exchange=for_notional_exchange,
+                notional_exchange_amount=for_notionals[0],
+                effective_time=for_effective_time,
+                maturity_time=for_maturity_time
+            )
+
+        # Use wrapper functions to handle prepended t=0 (same pattern as sequential _compute_xccy)
+        # IMPORTANT: DF(t≈0) = 1.0 is a boundary condition, NOT a curve parameter.
+        # Jacobians are w.r.t. "original" DFs (excluding prepended point).
+
+        # Extract original DFs (excluding prepended t=0 if present)
+        dom_dfs_original = dom_dfs[1:] if dom_times[0] < 1e-6 else dom_dfs
+        for_dfs_original = for_dfs[1:] if for_times[0] < 1e-6 else for_dfs
+        xccy_dfs_original = xccy_dfs[1:] if xccy_times[0] < 1e-6 else xccy_dfs
+
+        # Wrapper functions that prepend t=0 before calling PV function
+        def pv_dom_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs]) if dom_times[0] < 1e-6 else original_dfs
+            return pv_dom_fn(full_dfs)
+
+        def pv_for_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs]) if for_times[0] < 1e-6 else original_dfs
+            return pv_for_fn(full_dfs)
+
+        def pv_xccy_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs]) if xccy_times[0] < 1e-6 else original_dfs
+            return pv_xccy_fn(full_dfs)
+
+        # Compute gradients w.r.t. ORIGINAL DFs only (excluding DF(0)=1.0)
+        grad_dom_original = grad(lambda d: jnp.squeeze(pv_dom_original_dfs(d)))(dom_dfs_original)
+        grad_for_original = grad(lambda d: jnp.squeeze(pv_for_original_dfs(d)))(for_dfs_original)
+        grad_xccy_original = grad(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
+
+        # Apply chain rule with Jacobians
+        delta_dom_rates_raw = jnp.dot(grad_dom_original, dom_jac)
+        delta_for_rates_raw = jnp.dot(grad_for_original, for_jac)
+        delta_basis_rates_raw = jnp.dot(grad_xccy_original, xccy_jac_basis)
+
+        # Convert to bp units (rates stored in decimal, 1bp = 0.0001) and domestic currency
+        # Domestic leg: already in domestic currency (USD)
+        delta_dom = delta_dom_rates_raw * 1e-4
+
+        # Foreign leg: delta is d(PV_foreign)/d(rate), need to convert to domestic currency
+        # Foreign PV is in foreign currency (GBP), multiply by spot_fx (USD/GBP) to get USD
+        delta_for = delta_for_rates_raw * 1e-4 * spot_fx
+
+        # XCCY basis: delta is d(PV_foreign)/d(basis), need to convert to domestic currency
+        delta_basis = delta_basis_rates_raw * 1e-4 * spot_fx
+
+        return delta_dom, delta_for, delta_basis
 
     def value_float_leg(self,
                     swap_rates,
