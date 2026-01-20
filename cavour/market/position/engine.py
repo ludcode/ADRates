@@ -1971,13 +1971,6 @@ class Engine:
             # This captures how XCCY basis delta changes when foreign OIS rates move
             cross_gamma_for_basis = None
             if hasattr(xccy_curve, '_mixed_hess_foreign_basis') and xccy_curve._mixed_hess_foreign_basis is not None:
-                # DEBUG: Print dimensions
-                print(f"DEBUG Cross-gamma dimensions:")
-                print(f"  jac_for_original shape: {jac_for_original.shape}")
-                print(f"  mixed_hess shape: {xccy_curve._mixed_hess_foreign_basis.shape}")
-                print(f"  for_times: {for_times}")
-                print(f"  xccy_times: {xccy_times}")
-
                 # Get mixed Hessian and skip prepended points
                 # Shape: [n_xccy_dfs, n_basis, n_for_dfs]
                 # Note: JAX's jacfwd(jacrev(f, argnums=1), argnums=0) gives shape [output, arg1, arg0]

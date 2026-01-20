@@ -88,7 +88,8 @@ class OISCurve(DiscountCurve):
                  ois_swaps: list,
                  interp_type: InterpTypes = InterpTypes.FLAT_FWD_RATES,
                  check_refit: bool = False,  # Set to True to test it works
-                 use_ad: bool = True):  # Enable AD storage by default
+                 use_ad: bool = True,  # Enable AD storage by default
+                 compute_gamma: bool = False):  # Compute Hessians for GAMMA (slow)
         """ Create an instance of an overnight index rate swap curve given a
         valuation date and a set of OIS rates. Some of these may
         be left None and the algorithm will just use what is provided. An
@@ -103,7 +104,10 @@ class OISCurve(DiscountCurve):
             ois_swaps: List of OIS instruments for calibration
             interp_type: Interpolation method for discount factors
             check_refit: If True, verify calibration swaps reprice correctly
-            use_ad: If True, compute and store Jacobians/Hessians for AD
+            use_ad: If True, compute and store Jacobians for DELTA sensitivities
+            compute_gamma: If True, compute Hessians for GAMMA (second-order sensitivities).
+                          Default False for performance (3-5x faster curve construction).
+                          Set to True only when GAMMA risk measures are required.
         """
 
         check_argument_types(getattr(self, _func_name(), None), locals())
@@ -113,6 +117,7 @@ class OISCurve(DiscountCurve):
         self._interp_type = interp_type
         self._check_refit = check_refit
         self._use_ad = use_ad
+        self._compute_gamma = compute_gamma
         self._interpolator = None
 
         # Initialize AD attributes
@@ -220,10 +225,13 @@ class OISCurve(DiscountCurve):
 
     def _compute_ad_derivatives(self, swap_rates):
         """
-        Compute and store Jacobian and Hessian for automatic differentiation.
+        Compute and store Jacobian and optionally Hessian for automatic differentiation.
 
         Uses Engine's build_curve_ad() method for consistent bootstrap logic.
         This ensures VALUE, DELTA, and GAMMA all use the same underlying curve.
+
+        Jacobian is always computed (needed for DELTA).
+        Hessian is only computed if compute_gamma=True (needed for GAMMA).
 
         Args:
             swap_rates: Array of par swap rates used to build the curve
@@ -243,12 +251,15 @@ class OISCurve(DiscountCurve):
             )
             return dfs
 
-        # Compute Jacobian: d(DFs)/d(rates)
+        # Compute Jacobian: d(DFs)/d(rates) - ALWAYS needed for DELTA
         rates_array = jnp.array(swap_rates)
         jac_full = jacrev(build_dfs_from_rates)(rates_array)
 
-        # Compute Hessian: d²(DFs)/d(rates)²
-        hess_full = hessian(build_dfs_from_rates)(rates_array)
+        # Compute Hessian: d²(DFs)/d(rates)² - ONLY needed for GAMMA (expensive!)
+        if self._compute_gamma:
+            hess_full = hessian(build_dfs_from_rates)(rates_array)
+        else:
+            hess_full = None  # Skip expensive Hessian computation for DELTA-only workflows
 
         # Engine.build_curve_ad() returns DFs including t=0 (DF[0] = 1.0)
         # Engine gradients exclude t=0 (since it's a boundary condition, not a free parameter)
@@ -262,7 +273,7 @@ class OISCurve(DiscountCurve):
             # Jacobian shape changes from (n_dfs, n_rates) to (n_dfs-1, n_rates)
             self._jac = jac_full[1:, :]
             # Hessian shape changes from (n_dfs, n_rates, n_rates) to (n_dfs-1, n_rates, n_rates)
-            self._hess = hess_full[1:, :, :]
+            self._hess = hess_full[1:, :, :] if hess_full is not None else None
         else:
             # No t=0 point, use full Jacobian/Hessian
             self._jac = jac_full

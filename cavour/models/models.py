@@ -154,6 +154,7 @@ class Model:
         interp_type=InterpTypes.LINEAR_ZERO_RATES,
         payment_lag: int = 0,
         use_ad: bool = False,  # Disable by default (grid mismatch issue to be resolved)
+        compute_gamma: bool = False,  # Compute Hessians for GAMMA (slow, default False)
     ):
         """
         Manually construct an OIS curve from swap rates.
@@ -170,8 +171,12 @@ class Model:
             float_dc_type (DayCountTypes): Float leg day count (default: ACT_360)
             bus_day_type (BusDayAdjustTypes): Business day convention (default: MODIFIED_FOLLOWING)
             interp_type (InterpTypes): Interpolation method (default: LINEAR_ZERO_RATES)
-            use_ad (bool): If True, compute and store Jacobians/Hessians for AD (default: True)
             payment_lag (int): Payment lag in days (default: 0)
+            use_ad (bool): If True, compute and store Jacobians for DELTA sensitivities (default: False)
+            compute_gamma (bool): If True, compute Hessians for GAMMA (second-order sensitivities).
+                                 Default False for performance (3-5x faster curve construction).
+                                 Set to True only when GAMMA risk measures are required.
+                                 Note: Requires use_ad=True to have any effect.
 
         Example:
             >>> model.build_curve(
@@ -212,7 +217,8 @@ class Model:
             ois_swaps=swaps,
             interp_type=interp_type,
             check_refit=True,
-            use_ad=use_ad
+            use_ad=use_ad,
+            compute_gamma=compute_gamma
         )
         self._curves_dict[name] = curve
 
@@ -229,6 +235,7 @@ class Model:
             "bus_day_type": bus_day_type,
             "interp_type": interp_type,
             "use_ad": use_ad,
+            "compute_gamma": compute_gamma,
         }
 
     def build_fx(self, currency_pairs: list[str], pxs: list[float]) -> dict:
