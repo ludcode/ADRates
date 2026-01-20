@@ -2,7 +2,7 @@
 
 import numpy as np
 import jax.numpy as jnp
-from jax import lax, jit, grad, hessian, jacrev, linearize
+from jax import lax, grad, hessian, jacrev, linearize
 from functools import partial
 from typing import Sequence, Any, Dict
 
