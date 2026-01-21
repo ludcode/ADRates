@@ -139,8 +139,8 @@ class Engine:
             - Very heterogeneous: 1.5-2x speedup
 
         Constraints:
-            - All derivatives must be the same type (currently only XCCY swaps supported)
-            - All derivatives must use the same curves (same currency pair)
+            - All derivatives must be the same type (XCCY swaps or OIS swaps)
+            - All derivatives must use the same curves (same currency pair for XCCY, same index for OIS)
             - All derivatives must have the same structure (frequency, daycount)
 
         Args:
@@ -153,7 +153,7 @@ class Engine:
 
         Raises:
             LibError: If derivatives have incompatible types or structures
-            NotImplementedError: If requested for non-XCCY swaps or with collateral
+            NotImplementedError: If requested for unsupported derivatives or with collateral
 
         Example:
             >>> swaps = [create_xccy_swap(maturity=f'{i}Y') for i in range(5, 25, 5)]
@@ -178,14 +178,32 @@ class Engine:
         if collateral_type is not None:
             raise NotImplementedError("compute_batch does not yet support collateral_type")
 
-        # Validate all derivatives are XCCY swaps
+        # Validate all derivatives are the same supported type
         first_type = derivatives[0].derivative_type
-        if first_type != InstrumentTypes.XCCY_SWAP:
-            raise NotImplementedError(f"compute_batch currently only supports XCCY swaps, got {first_type}")
+        if first_type not in [InstrumentTypes.XCCY_SWAP, InstrumentTypes.OIS_SWAP]:
+            raise NotImplementedError(
+                f"compute_batch currently supports XCCY swaps and OIS swaps, got {first_type}"
+            )
 
+        # Route to appropriate implementation
+        if first_type == InstrumentTypes.XCCY_SWAP:
+            return self._compute_batch_xccy(derivatives, reqs)
+        elif first_type == InstrumentTypes.OIS_SWAP:
+            return self._compute_batch_ois(derivatives, reqs)
+        else:
+            raise LibError(f"Unsupported derivative type: {first_type}")
+
+    def _compute_batch_xccy(self, derivatives, reqs):
+        """Internal method for batched XCCY swap computation."""
+        from jax import vmap
+        import jax.numpy as jnp
+        from cavour.utils.helpers import times_from_dates
+        from cavour.requests.results import AnalyticsResult, Valuation
+
+        # Validate all derivatives are XCCY swaps
         for i, deriv in enumerate(derivatives):
-            if deriv.derivative_type != first_type:
-                raise LibError(f"All derivatives must be same type. derivatives[{i}] is {deriv.derivative_type}, expected {first_type}")
+            if deriv.derivative_type != InstrumentTypes.XCCY_SWAP:
+                raise LibError(f"All derivatives must be XCCY swaps. derivatives[{i}] is {deriv.derivative_type}")
 
         # Validate all swaps use same curves (same currency pair)
         first = derivatives[0]
@@ -483,6 +501,231 @@ class Engine:
 
         return results
 
+    def _compute_batch_ois(self, derivatives, reqs):
+        """Internal method for batched OIS swap computation (natural currency collateral).
+
+        Handles VALUE and DELTA requests for OIS swaps using JAX vectorization.
+        Simpler than XCCY: fixed leg + floating leg, single curve, no FX conversion.
+
+        Expected performance: 3-6x speedup for batches of 10+ swaps.
+        """
+        from jax import vmap
+        import jax.numpy as jnp
+        import numpy as np
+        from cavour.utils.helpers import times_from_dates, to_tenor
+        from cavour.requests.results import AnalyticsResult, Valuation, Delta, Risk
+
+        # Validate all derivatives are OIS swaps
+        for i, deriv in enumerate(derivatives):
+            if deriv.derivative_type != InstrumentTypes.OIS_SWAP:
+                raise LibError(f"All derivatives must be OIS swaps. derivatives[{i}] is {deriv.derivative_type}")
+
+        # Validate all swaps use same OIS curve (same floating index)
+        first = derivatives[0]
+        ois_idx_name = first._floating_index.name
+
+        for i, deriv in enumerate(derivatives):
+            if deriv._floating_index.name != ois_idx_name:
+                raise LibError(
+                    f"All OIS swaps must use same floating index. "
+                    f"derivatives[{i}] uses {deriv._floating_index.name}, expected {ois_idx_name}"
+                )
+
+        # Get OIS curve (shared across batch)
+        ois_model = getattr(self.model.curves, ois_idx_name)
+
+        # Extract curve data once (shared across all swaps)
+        ois_times = jnp.array(ois_model._times)
+        ois_dfs = jnp.array(ois_model._dfs)
+
+        # Get valuation time
+        value_dt = ois_model._value_dt
+        value_time = times_from_dates([value_dt], value_dt, ois_model._dc_type)[0]
+
+        batch_size = len(derivatives)
+
+        # Extract and pad fixed leg parameters
+        max_fixed_cashflows = max(len(d._fixed_leg._payment_dts) for d in derivatives)
+
+        fixed_payment_times_batch = jnp.zeros((batch_size, max_fixed_cashflows))
+        fixed_payments_batch = jnp.zeros((batch_size, max_fixed_cashflows))
+        fixed_principal_batch = jnp.zeros(batch_size)
+        fixed_leg_sign_batch = jnp.zeros(batch_size)
+
+        for i, deriv in enumerate(derivatives):
+            n_fixed = len(deriv._fixed_leg._payment_dts)
+
+            # Payment times
+            times_fixed = jnp.array(times_from_dates(
+                deriv._fixed_leg._payment_dts,
+                value_dt,
+                deriv._fixed_leg._dc_type
+            ))
+            fixed_payment_times_batch = fixed_payment_times_batch.at[i, :n_fixed].set(times_fixed)
+
+            # Payments
+            payments_fixed = jnp.array(deriv._fixed_leg._payments)
+            fixed_payments_batch = fixed_payments_batch.at[i, :n_fixed].set(payments_fixed)
+
+            # Principal and leg sign
+            fixed_principal_batch = fixed_principal_batch.at[i].set(deriv._fixed_leg._principal)
+            leg_sign = +1.0 if deriv._fixed_leg._leg_type == SwapTypes.RECEIVE else -1.0
+            fixed_leg_sign_batch = fixed_leg_sign_batch.at[i].set(leg_sign)
+
+        # Extract and pad float leg parameters
+        max_float_cashflows = max(len(d._float_leg._payment_dts) for d in derivatives)
+
+        float_payment_times_batch = jnp.zeros((batch_size, max_float_cashflows))
+        float_start_times_batch = jnp.zeros((batch_size, max_float_cashflows))
+        float_end_times_batch = jnp.zeros((batch_size, max_float_cashflows))
+        float_alphas_batch = jnp.zeros((batch_size, max_float_cashflows))
+        float_spreads_batch = jnp.zeros((batch_size, max_float_cashflows))
+        float_notionals_batch = jnp.zeros((batch_size, max_float_cashflows))
+        float_principal_batch = jnp.zeros(batch_size)
+        float_leg_sign_batch = jnp.zeros(batch_size)
+
+        for i, deriv in enumerate(derivatives):
+            n_float = len(deriv._float_leg._payment_dts)
+
+            # Payment times
+            times_float = jnp.array(times_from_dates(
+                deriv._float_leg._payment_dts,
+                value_dt,
+                deriv._float_leg._dc_type
+            ))
+            float_payment_times_batch = float_payment_times_batch.at[i, :n_float].set(times_float)
+
+            # Start times (for forward rate calculation)
+            start_times_float = jnp.array(times_from_dates(
+                deriv._float_leg._start_accrued_dts,
+                value_dt,
+                deriv._float_leg._dc_type
+            ))
+            float_start_times_batch = float_start_times_batch.at[i, :n_float].set(start_times_float)
+
+            # End times (for forward rate calculation)
+            end_times_float = jnp.array(times_from_dates(
+                deriv._float_leg._end_accrued_dts,
+                value_dt,
+                deriv._float_leg._dc_type
+            ))
+            float_end_times_batch = float_end_times_batch.at[i, :n_float].set(end_times_float)
+
+            # Year fractions (alphas)
+            alphas_float = jnp.array(deriv._float_leg._year_fracs)
+            float_alphas_batch = float_alphas_batch.at[i, :n_float].set(alphas_float)
+
+            # Spreads (broadcast scalar to array)
+            spreads_float = np.full(n_float, deriv._float_leg._spread)
+            float_spreads_batch = float_spreads_batch.at[i, :n_float].set(spreads_float)
+
+            # Notionals (use _notional_array if available, otherwise broadcast _notional)
+            if hasattr(deriv._float_leg, '_notional_array') and deriv._float_leg._notional_array:
+                notionals_float = np.array(deriv._float_leg._notional_array)
+            else:
+                notionals_float = np.full(n_float, deriv._float_leg._notional)
+            float_notionals_batch = float_notionals_batch.at[i, :n_float].set(notionals_float)
+
+            # Principal and leg sign
+            float_principal_batch = float_principal_batch.at[i].set(deriv._float_leg._principal)
+            leg_sign = +1.0 if deriv._float_leg._leg_type == SwapTypes.RECEIVE else -1.0
+            float_leg_sign_batch = float_leg_sign_batch.at[i].set(leg_sign)
+
+        # Compute VALUE if requested
+        value_batch = None
+        if RequestTypes.VALUE in reqs:
+            # Create vectorized PV function
+            pv_batch_fn = vmap(
+                lambda fixed_pmt, fixed_pay, fixed_prin, fixed_sign,
+                       float_pmt, float_start, float_end, float_alpha, float_spr, float_not, float_prin, float_sign:
+                    self._ois_pv_pure(
+                        ois_dfs, ois_times, ois_model._interp_type,
+                        fixed_pmt, fixed_pay, fixed_prin, fixed_sign,
+                        float_pmt, float_start, float_end, float_alpha, float_spr, float_not, float_prin, float_sign,
+                        value_time
+                    ),
+                in_axes=(0, 0, 0, 0,  # Fixed leg batched
+                         0, 0, 0, 0, 0, 0, 0, 0)  # Float leg batched
+            )
+
+            # Compute batched PV
+            pv_array = pv_batch_fn(
+                fixed_payment_times_batch, fixed_payments_batch, fixed_principal_batch, fixed_leg_sign_batch,
+                float_payment_times_batch, float_start_times_batch, float_end_times_batch,
+                float_alphas_batch, float_spreads_batch, float_notionals_batch,
+                float_principal_batch, float_leg_sign_batch
+            )
+
+            # Squeeze to remove any extra dimensions and convert to Python list
+            pv_array_squeezed = jnp.squeeze(pv_array)
+            value_batch = [float(pv) for pv in pv_array_squeezed]
+
+        # Compute DELTA if requested
+        delta_batch = None
+        if RequestTypes.DELTA in reqs:
+            # Extract Jacobian (shared across batch)
+            if hasattr(ois_model, '_jac') and ois_model._jac is not None:
+                ois_jac = ois_model._jac
+            else:
+                raise LibError(
+                    f"OIS curve {ois_idx_name} must be built with use_ad=True for batched DELTA. "
+                    "Rebuild curve with: model.build_curve(..., use_ad=True)"
+                )
+
+            # Create vectorized DELTA function
+            delta_batch_fn = vmap(
+                lambda fixed_pmt, fixed_pay, fixed_prin, fixed_sign,
+                       float_pmt, float_start, float_end, float_alpha, float_spr, float_not, float_prin, float_sign:
+                    self._ois_delta_pure(
+                        ois_dfs, ois_times, ois_model._interp_type, ois_jac,
+                        fixed_pmt, fixed_pay, fixed_prin, fixed_sign,
+                        float_pmt, float_start, float_end, float_alpha, float_spr, float_not, float_prin, float_sign,
+                        value_time
+                    ),
+                in_axes=(0, 0, 0, 0,  # Fixed leg batched
+                         0, 0, 0, 0, 0, 0, 0, 0)  # Float leg batched
+            )
+
+            # Compute batched DELTA
+            delta_array = delta_batch_fn(
+                fixed_payment_times_batch, fixed_payments_batch, fixed_principal_batch, fixed_leg_sign_batch,
+                float_payment_times_batch, float_start_times_batch, float_end_times_batch,
+                float_alphas_batch, float_spreads_batch, float_notionals_batch,
+                float_principal_batch, float_leg_sign_batch
+            )
+
+            # Convert to tenor strings
+            ois_tenors = to_tenor(ois_model.swap_times)
+
+            # Package into Delta objects for each swap
+            # Note: OIS sequential code returns a single Delta object (not wrapped in Risk)
+            # This is different from XCCY which returns Risk with multiple Delta objects
+            delta_batch = []
+            for i in range(batch_size):
+                delta_ois = Delta(
+                    risk_ladder=[float(x) for x in delta_array[i]],
+                    tenors=ois_tenors,
+                    currency=derivatives[i]._currency,
+                    curve_type=derivatives[i]._floating_index,
+                )
+                delta_batch.append(delta_ois)
+
+        # Package results
+        results = []
+        for i in range(batch_size):
+            value_obj = None
+            if value_batch is not None:
+                value_obj = Valuation(
+                    amount=value_batch[i],
+                    currency=derivatives[i]._currency
+                )
+
+            delta_obj = delta_batch[i] if delta_batch is not None else None
+
+            result = AnalyticsResult(value=value_obj, risk=delta_obj, gamma=None)
+            results.append(result)
+
+        return results
 
     def _compute_ois(self, derivative, reqs, collateral_type=None):
         """Compute analytics for OIS swaps with optional cross-currency collateral.
@@ -3532,6 +3775,171 @@ class Engine:
         delta_basis = delta_basis_rates_raw * 1e-4 * spot_fx
 
         return delta_dom, delta_for, delta_basis
+
+    def _ois_pv_pure(self,
+                    dfs, times, interp_type,
+                    fixed_payment_times, fixed_payments, fixed_principal, fixed_leg_sign,
+                    float_payment_times, float_start_times, float_end_times,
+                    float_alphas, float_spreads, float_notionals, float_principal, float_leg_sign,
+                    value_time):
+        """
+        Compute OIS swap PV for a single swap (JAX-compatible, vmap-ready).
+
+        Pure function for batched OIS pricing with natural currency collateral (single-curve).
+
+        Args:
+            dfs: Discount factors [N]
+            times: Curve times [N]
+            interp_type: Interpolation method
+
+            fixed_payment_times: Fixed leg payment times [M_fixed]
+            fixed_payments: Fixed leg payment amounts [M_fixed]
+            fixed_principal: Final principal for fixed leg (scalar)
+            fixed_leg_sign: +1 (receive fixed) or -1 (pay fixed)
+
+            float_payment_times: Float leg payment times [M_float]
+            float_start_times: Float leg period start times [M_float]
+            float_end_times: Float leg period end times [M_float]
+            float_alphas: Float leg year fractions [M_float]
+            float_spreads: Float leg spreads [M_float]
+            float_notionals: Float leg notionals [M_float]
+            float_principal: Final principal for float leg (scalar)
+            float_leg_sign: +1 (receive float) or -1 (pay float)
+
+            value_time: Valuation time (scalar)
+
+        Returns:
+            float: Total swap PV (fixed_pv + float_pv)
+
+        Notes:
+            - Natural currency pricing uses single curve for both discounting and projection
+            - Fixed leg: Discounts known fixed coupon payments
+            - Float leg: Projects forward rates and discounts, all from same OIS curve
+            - No notional exchange (standard OIS structure)
+            - No FX conversion (single currency)
+
+        Performance:
+            - Pure JAX function: JIT compilable, vmap-compatible
+            - Simpler than XCCY: one fixed leg + one float leg vs two float legs
+            - No notional exchange overhead
+            - Shared curves amortize overhead across batch
+        """
+        import jax.numpy as jnp
+
+        # Price fixed leg
+        # Reuses existing _price_fixed_leg_jax pure function
+        fixed_pv = self._price_fixed_leg_jax(
+            dfs=dfs,
+            times=times,
+            interp_type=interp_type,
+            payment_times=fixed_payment_times,
+            payments=fixed_payments,
+            principal=fixed_principal,
+            notional=1.0,  # Notional already baked into payments
+            leg_sign=fixed_leg_sign,
+            value_time=value_time
+        )
+
+        # Price floating leg (single-curve mode)
+        # Reuses existing _float_leg_jax pure function
+        # For natural currency OIS: same curve used for discounting and forward rate projection
+        float_pv = self._float_leg_jax(
+            dfs=dfs,
+            times=times,
+            disc_interp_type=interp_type,
+            idx_interp_type=interp_type,
+            payment_times=float_payment_times,
+            start_times=float_start_times,
+            end_times=float_end_times,
+            pay_alphas=float_alphas,
+            spreads=float_spreads,
+            notionals=float_notionals,
+            principal=float_principal,
+            leg_sign=float_leg_sign,
+            value_time=value_time,
+            first_fixing_rate=0.0,
+            override_first=False,
+            idx_times=None,  # Single-curve: use same DFs for forward rates
+            idx_dfs=None,
+            notional_exchange=False,  # No notional exchange for OIS
+            notional_exchange_amount=0.0,
+            effective_time=0.0,
+            maturity_time=0.0
+        )
+
+        # Combine legs
+        return fixed_pv + float_pv
+
+    def _ois_delta_pure(self,
+                       dfs, times, interp_type, jac,
+                       fixed_payment_times, fixed_payments, fixed_principal, fixed_leg_sign,
+                       float_payment_times, float_start_times, float_end_times,
+                       float_alphas, float_spreads, float_notionals, float_principal, float_leg_sign,
+                       value_time):
+        """
+        Compute OIS swap DELTA for a single swap (JAX-compatible, vmap-ready).
+
+        Pure function for batched OIS DELTA computation using automatic differentiation.
+
+        Args:
+            dfs: Discount factors [N]
+            times: Curve times [N]
+            interp_type: Interpolation method
+            jac: Jacobian d(DFs)/d(rates) [N, M] - pre-computed from curve construction
+
+            [Same fixed and float leg parameters as _ois_pv_pure]
+
+        Returns:
+            jnp.array: Delta sensitivities [M] in USD/bp units
+
+        Notes:
+            - Uses JAX automatic differentiation for gradient computation
+            - Chain rule: delta = grad(PV, DFs) @ Jacobian(DFs, rates)
+            - Jacobian shared across batch (computed once during curve construction)
+            - Handles prepended t=0 point via wrapper functions (same as XCCY)
+            - Converts to bp units (×1e-4)
+
+        Performance:
+            - Pure JAX function: JIT compilable, vmap-compatible
+            - Shared Jacobian amortizes overhead across batch
+            - Per-swap gradients computed in parallel via vmap
+        """
+        from jax import grad
+        import jax.numpy as jnp
+
+        # Define PV function w.r.t. discount factors
+        def pv_fn(dfs_var):
+            return self._ois_pv_pure(
+                dfs_var, times, interp_type,
+                fixed_payment_times, fixed_payments, fixed_principal, fixed_leg_sign,
+                float_payment_times, float_start_times, float_end_times,
+                float_alphas, float_spreads, float_notionals, float_principal, float_leg_sign,
+                value_time
+            )
+
+        # Use wrapper function to handle prepended t=0 (same pattern as XCCY DELTA)
+        # IMPORTANT: DF(t≈0) = 1.0 is a boundary condition, NOT a curve parameter.
+        # Jacobian is w.r.t. "original" DFs (excluding prepended point).
+
+        # Extract original DFs (excluding prepended t=0 if present)
+        dfs_original = dfs[1:] if times[0] < 1e-6 else dfs
+
+        # Wrapper function that prepends t=0 before calling PV function
+        def pv_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs]) if times[0] < 1e-6 else original_dfs
+            return pv_fn(full_dfs)
+
+        # Compute gradient w.r.t. ORIGINAL DFs only (excluding DF(0)=1.0)
+        grad_original = grad(lambda d: jnp.squeeze(pv_original_dfs(d)))(dfs_original)
+
+        # Apply chain rule with Jacobian
+        # delta = grad(PV, DFs) @ Jacobian(DFs, rates)
+        delta_rates_raw = jnp.dot(grad_original, jac)
+
+        # Convert to bp units (rates stored in decimal, 1bp = 0.0001)
+        delta = delta_rates_raw * 1e-4
+
+        return delta
 
     def value_float_leg(self,
                     swap_rates,
