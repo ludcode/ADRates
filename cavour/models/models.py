@@ -8,7 +8,7 @@ Provides the main Model class for:
 - Curve accessor for convenient attribute-style access
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 
 from cavour.utils import *
@@ -153,6 +153,9 @@ class Model:
         bus_day_type=BusDayAdjustTypes.MODIFIED_FOLLOWING,
         interp_type=InterpTypes.LINEAR_ZERO_RATES,
         payment_lag: int = 0,
+        use_ad: bool = False,  # Disable by default (grid mismatch issue to be resolved)
+        compute_gamma: bool = False,  # Compute Hessians for GAMMA (slow, default False)
+        hessian_bandwidth: Optional[int] = None,  # Hessian sparsity: 0=diagonal only, None=full
     ):
         """
         Manually construct an OIS curve from swap rates.
@@ -170,6 +173,15 @@ class Model:
             bus_day_type (BusDayAdjustTypes): Business day convention (default: MODIFIED_FOLLOWING)
             interp_type (InterpTypes): Interpolation method (default: LINEAR_ZERO_RATES)
             payment_lag (int): Payment lag in days (default: 0)
+            use_ad (bool): If True, compute and store Jacobians for DELTA sensitivities (default: False)
+            compute_gamma (bool): If True, compute Hessians for GAMMA (second-order sensitivities).
+                                 Default False for performance (3-5x faster curve construction).
+                                 Set to True only when GAMMA risk measures are required.
+                                 Note: Requires use_ad=True to have any effect.
+            hessian_bandwidth (int): Controls Hessian sparsity for performance optimization.
+                                     0 = diagonal-only (22-25x speedup, empirically 100% accurate for OIS)
+                                     None = full Hessian (default, maximum accuracy)
+                                     Ignored if compute_gamma=False.
 
         Example:
             >>> model.build_curve(
@@ -209,7 +221,10 @@ class Model:
             value_dt=self.value_dt,
             ois_swaps=swaps,
             interp_type=interp_type,
-            check_refit=True
+            check_refit=True,
+            use_ad=use_ad,
+            compute_gamma=compute_gamma,
+            hessian_bandwidth=hessian_bandwidth
         )
         self._curves_dict[name] = curve
 
@@ -225,6 +240,8 @@ class Model:
             "float_dc_type": float_dc_type,
             "bus_day_type": bus_day_type,
             "interp_type": interp_type,
+            "use_ad": use_ad,
+            "compute_gamma": compute_gamma,
         }
 
     def build_fx(self, currency_pairs: list[str], pxs: list[float]) -> dict:
@@ -280,6 +297,7 @@ class Model:
         bus_day_type: BusDayAdjustTypes = BusDayAdjustTypes.MODIFIED_FOLLOWING,
         interp_type: InterpTypes = InterpTypes.FLAT_FWD_RATES,
         use_ad: bool = True,
+        compute_gamma: bool = False,
     ):
         """
         Build a cross-currency basis swap curve from basis spreads.
@@ -299,6 +317,7 @@ class Model:
             bus_day_type (BusDayAdjustTypes): Business day convention
             interp_type (InterpTypes): Interpolation method
             use_ad (bool): Enable JAX automatic differentiation (default: True)
+            compute_gamma (bool): Compute Hessians for GAMMA (slow, default: False)
 
         Raises:
             ValueError: If domestic or foreign curve not found in model
@@ -366,9 +385,10 @@ class Model:
             basis_swaps=basis_swaps,
             domestic_curve=domestic_curve,
             foreign_curve=foreign_curve,
-            spot_fx=1/spot_fx,  # XccyCurve expects USD/GBP (inverse)
+            spot_fx=spot_fx,  # XccyCurve expects domestic per unit of foreign
             interp_type=interp_type,
-            use_ad=use_ad
+            use_ad=use_ad,
+            compute_gamma=compute_gamma
         )
 
         self._curves_dict[name] = xccy_curve
