@@ -487,16 +487,142 @@ class Engine:
                 risk = Risk([delta_domestic, delta_foreign, delta_basis])
                 delta_batch.append(risk)
 
-        # GAMMA not yet implemented for batch
+        # Compute GAMMA if requested
+        gamma_batch = None
         if RequestTypes.GAMMA in reqs:
-            raise NotImplementedError("compute_batch does not yet support GAMMA (Phase 3 - coming soon)")
+            from cavour.utils.helpers import to_tenor
+            from cavour.requests.results import Gamma, Risk
+
+            # Extract Hessians (shared across batch)
+            # Check if curves were built with compute_gamma=True (have stored Hessians)
+            if hasattr(domestic_model, '_hess') and domestic_model._hess is not None:
+                dom_hess = domestic_model._hess
+            else:
+                raise LibError(
+                    f"Domestic curve {dom_idx_name} must be built with compute_gamma=True for batched GAMMA. "
+                    "Rebuild curve with: model.build_curve(..., use_ad=True, compute_gamma=True)"
+                )
+
+            if hasattr(foreign_model, '_hess') and foreign_model._hess is not None:
+                for_hess = foreign_model._hess
+            else:
+                raise LibError(
+                    f"Foreign curve {for_idx_name} must be built with compute_gamma=True for batched GAMMA. "
+                    "Rebuild curve with: model.build_curve(..., use_ad=True, compute_gamma=True)"
+                )
+
+            if hasattr(xccy_curve, '_hess_basis') and xccy_curve._hess_basis is not None:
+                # Skip first row if curve has prepended t=0 (same as Jacobian)
+                if xccy_times[0] < 1e-6:
+                    if xccy_curve._hess_basis.ndim == 2:
+                        xccy_hess_basis = xccy_curve._hess_basis[1:, :]  # Diagonal
+                    else:
+                        xccy_hess_basis = xccy_curve._hess_basis[1:, :, :]  # Full
+                else:
+                    xccy_hess_basis = xccy_curve._hess_basis
+            else:
+                raise LibError(
+                    f"XCCY curve {xccy_curve_name} must be built with compute_gamma=True for batched GAMMA. "
+                    "Rebuild curve with: model.build_xccy_curve(..., use_ad=True, compute_gamma=True)"
+                )
+
+            # Also need Jacobians for GAMMA computation
+            if not hasattr(domestic_model, '_jac') or domestic_model._jac is None:
+                raise LibError(
+                    f"Domestic curve {dom_idx_name} must be built with use_ad=True for GAMMA. "
+                    "Rebuild curve with: model.build_curve(..., use_ad=True, compute_gamma=True)"
+                )
+            if not hasattr(foreign_model, '_jac') or foreign_model._jac is None:
+                raise LibError(
+                    f"Foreign curve {for_idx_name} must be built with use_ad=True for GAMMA. "
+                    "Rebuild curve with: model.build_curve(..., use_ad=True, compute_gamma=True)"
+                )
+
+            dom_jac = domestic_model._jac
+            for_jac = foreign_model._jac
+            xccy_jac_basis = xccy_curve._jac_basis[1:, :] if xccy_times[0] < 1e-6 else xccy_curve._jac_basis
+
+            # Create vectorized GAMMA function
+            # in_axes: None = shared (curves, Jacobians, Hessians), 0 = batched (swap params)
+            gamma_batch_fn = vmap(
+                lambda dom_pmt, dom_start, dom_end, dom_alpha, dom_spr, dom_not,
+                       dom_prin, dom_sign, dom_notex, dom_eff, dom_mat,
+                       for_pmt, for_start, for_end, for_alpha, for_spr, for_not,
+                       for_prin, for_sign, for_notex, for_eff, for_mat:
+                    self._xccy_gamma_pure(
+                        dom_dfs, dom_times, domestic_model._interp_type,
+                        for_dfs, for_times, foreign_model._interp_type,
+                        xccy_dfs, xccy_times, xccy_curve._interp_type,
+                        dom_jac, for_jac, xccy_jac_basis,
+                        dom_hess, for_hess, xccy_hess_basis,
+                        dom_pmt, dom_start, dom_end, dom_alpha, dom_spr, dom_not,
+                        dom_prin, dom_sign, dom_notex, dom_eff, dom_mat,
+                        for_pmt, for_start, for_end, for_alpha, for_spr, for_not,
+                        for_prin, for_sign, for_notex, for_eff, for_mat,
+                        value_time, spot_fx
+                    ),
+                in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  # Domestic leg batched
+                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)   # Foreign leg batched
+            )
+
+            # Compute batched GAMMA
+            gammas_tuple = gamma_batch_fn(
+                dom_payment_times_batch, dom_start_times_batch, dom_end_times_batch,
+                dom_alphas_batch, dom_spreads_batch, dom_notionals_batch,
+                dom_principal_batch, dom_leg_sign_batch, dom_notional_exchange_batch,
+                dom_effective_time_batch, dom_maturity_time_batch,
+                for_payment_times_batch, for_start_times_batch, for_end_times_batch,
+                for_alphas_batch, for_spreads_batch, for_notionals_batch,
+                for_principal_batch, for_leg_sign_batch, for_notional_exchange_batch,
+                for_effective_time_batch, for_maturity_time_batch
+            )
+
+            # Unpack gammas (returned as tuple of 3 matrices)
+            gamma_dom_batch = gammas_tuple[0]  # [batch_size, n_dom_rates, n_dom_rates]
+            gamma_for_batch = gammas_tuple[1]  # [batch_size, n_for_rates, n_for_rates]
+            gamma_basis_batch = gammas_tuple[2]  # [batch_size, n_basis, n_basis]
+
+            # Convert to tenor strings
+            dom_tenors = to_tenor(domestic_model.swap_times)
+            for_tenors = to_tenor(foreign_model.swap_times)
+            basis_tenors = to_tenor(xccy_curve.swap_times)
+
+            # Package into Gamma/Risk objects for each swap
+            gamma_batch = []
+            for i in range(batch_size):
+                # Create Gamma objects for each curve
+                gamma_domestic = Gamma(
+                    risk_ladder=gamma_dom_batch[i],  # Already numpy array
+                    tenors=dom_tenors,
+                    currency=derivatives[i]._domestic_currency,
+                    curve_type=derivatives[i]._domestic_floating_index,
+                )
+
+                gamma_foreign = Gamma(
+                    risk_ladder=gamma_for_batch[i],
+                    tenors=for_tenors,
+                    currency=derivatives[i]._domestic_currency,
+                    curve_type=derivatives[i]._foreign_floating_index,
+                )
+
+                gamma_basis = Gamma(
+                    risk_ladder=gamma_basis_batch[i],
+                    tenors=basis_tenors,
+                    currency=derivatives[i]._domestic_currency,
+                    curve_type=CurveTypes.USD_GBP_BASIS,  # TODO: Derive from currencies
+                )
+
+                # Package into Risk object (with cross-gammas=None for now)
+                risk = Risk([gamma_domestic, gamma_foreign, gamma_basis], cross_gammas=None)
+                gamma_batch.append(risk)
 
         # Package results
         results = []
         for i in range(batch_size):
             value_obj = Valuation(amount=value_batch[i], currency=derivatives[i]._domestic_currency) if value_batch else None
             delta_obj = delta_batch[i] if delta_batch else None
-            result = AnalyticsResult(value=value_obj, risk=delta_obj, gamma=None)
+            gamma_obj = gamma_batch[i] if gamma_batch else None
+            result = AnalyticsResult(value=value_obj, risk=delta_obj, gamma=gamma_obj)
             results.append(result)
 
         return results
@@ -656,9 +782,10 @@ class Engine:
                 float_principal_batch, float_leg_sign_batch
             )
 
-            # Squeeze to remove any extra dimensions and convert to Python list
-            pv_array_squeezed = jnp.squeeze(pv_array)
-            value_batch = [float(pv) for pv in pv_array_squeezed]
+            # Convert to Python list (ensure scalars)
+            # pv_array may have extra dimensions, so squeeze and flatten
+            pv_array_flat = jnp.atleast_1d(jnp.squeeze(pv_array))
+            value_batch = [float(pv) for pv in pv_array_flat]
 
         # Compute DELTA if requested
         delta_batch = None
@@ -711,6 +838,83 @@ class Engine:
                 delta_batch.append(delta_ois)
 
         # Package results
+        # Compute GAMMA if requested
+        gamma_batch = None
+        if RequestTypes.GAMMA in reqs:
+            from cavour.utils.helpers import to_tenor
+            from cavour.requests.results import Gamma
+            from jax import hessian
+
+            # Extract Hessian (shared across batch)
+            # IMPORTANT: Must recompute full 3D Hessian to match sequential behavior
+            # The stored _hess is 2D diagonal when hessian_bandwidth=0, but sequential
+            # code uses _cached_curve which always computes full 3D Hessian
+            # Also need Jacobian for GAMMA computation (should already be available from DELTA)
+            if not hasattr(ois_model, '_jac') or ois_model._jac is None:
+                raise LibError(
+                    f"OIS curve {ois_curve_name} must be built with use_ad=True for GAMMA. "
+                    "Rebuild curve with: model.build_curve(..., use_ad=True, compute_gamma=True)"
+                )
+
+            ois_jac = ois_model._jac
+
+            # Recompute full 3D Hessian (matching _cached_curve behavior)
+            # IMPORTANT: build_curve_ad returns DFs including prepended t=0 point
+            # We need to strip the first row to match stored _jac shape
+            swap_rates_jax = jnp.array(ois_model.swap_rates)
+            swap_times_list = ois_model.swap_times
+            year_fracs_list = ois_model.year_fracs
+
+            def build_dfs_original(r):
+                _, dfs_out = self.build_curve_ad(r, swap_times_list, year_fracs_list)
+                return dfs_out
+
+            hess_full = hessian(build_dfs_original)(swap_rates_jax)
+
+            # Strip first row if curve has prepended t=0 (matching stored _jac shape)
+            if ois_times[0] < 1e-6:
+                ois_hess = hess_full[1:, :, :]  # Remove t=0 row
+            else:
+                ois_hess = hess_full
+
+            # Create vectorized GAMMA function
+            # in_axes: None = shared (curves, Jacobian, Hessian), 0 = batched (swap params)
+            gamma_batch_fn = vmap(
+                lambda fixed_pmt, fixed_pay, fixed_prin, fixed_sign,
+                       float_pmt, float_start, float_end, float_alpha, float_spr, float_not, float_prin, float_sign:
+                    self._ois_gamma_pure(
+                        ois_dfs, ois_times, ois_model._interp_type, ois_jac, ois_hess,
+                        fixed_pmt, fixed_pay, fixed_prin, fixed_sign,
+                        float_pmt, float_start, float_end, float_alpha, float_spr, float_not, float_prin, float_sign,
+                        value_time
+                    ),
+                in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            )
+
+            # Compute batched GAMMA
+            gamma_array = gamma_batch_fn(
+                fixed_payment_times_batch, fixed_payments_batch, fixed_principal_batch, fixed_leg_sign_batch,
+                float_payment_times_batch, float_start_times_batch, float_end_times_batch,
+                float_alphas_batch, float_spreads_batch, float_notionals_batch,
+                float_principal_batch, float_leg_sign_batch
+            )
+
+            # Convert to tenor strings
+            ois_tenors = to_tenor(ois_model.swap_times)
+
+            # Package into Gamma objects for each swap
+            # Note: OIS returns single Gamma object (not wrapped in Risk like XCCY)
+            gamma_batch = []
+            for i in range(batch_size):
+                gamma_ois = Gamma(
+                    risk_ladder=gamma_array[i],  # Already numpy array
+                    tenors=ois_tenors,
+                    currency=derivatives[i]._currency,
+                    curve_type=derivatives[i]._floating_index,
+                )
+                gamma_batch.append(gamma_ois)
+
+        # Package results
         results = []
         for i in range(batch_size):
             value_obj = None
@@ -721,8 +925,9 @@ class Engine:
                 )
 
             delta_obj = delta_batch[i] if delta_batch is not None else None
+            gamma_obj = gamma_batch[i] if gamma_batch is not None else None
 
-            result = AnalyticsResult(value=value_obj, risk=delta_obj, gamma=None)
+            result = AnalyticsResult(value=value_obj, risk=delta_obj, gamma=gamma_obj)
             results.append(result)
 
         return results
@@ -2446,7 +2651,8 @@ class Engine:
 
             # Get Hessian of curve bootstrapping (d²DFs/d(rates)²)
             if hasattr(domestic_model, '_hess') and domestic_model._hess is not None:
-                # Use stored Hessian from curve construction (consistent with VALUE)
+                # Use stored Hessian from curve construction
+                # NOTE: Stored Hessians already exclude prepended t=0 row (shape matches jac)
                 hess_dom_curve = domestic_model._hess
             else:
                 # Fallback: Get from _cached_curve() (may have been computed above)
@@ -2464,7 +2670,17 @@ class Engine:
             # term1: main chain rule (treating curve as fixed mapping)
             # term2: correction for curve Hessian (derivative of Jacobian itself)
             term1_dom = jac_dom_original.T @ hess_dom_dfs_original @ jac_dom_original
-            term2_dom = jnp.sum(grad_dom_dfs_original[:, None, None] * hess_dom_curve, axis=0)
+
+            # Handle diagonal or full curve Hessian
+            if hess_dom_curve.ndim == 2:
+                # Diagonal Hessian: shape (n_dfs, n_rates)
+                # For diagonal: term2[j,k] = sum_i grad[i] * hess[i,j] if j==k, else 0
+                term2_diag = jnp.dot(grad_dom_dfs_original, hess_dom_curve)  # Shape: (n_rates,)
+                term2_dom = jnp.diag(term2_diag)  # Shape: (n_rates, n_rates)
+            else:
+                # Full Hessian: shape (n_dfs, n_rates, n_rates)
+                term2_dom = jnp.sum(grad_dom_dfs_original[:, None, None] * hess_dom_curve, axis=0)
+
             gammas_dom_matrix = term1_dom + term2_dom
 
             # Return FULL gamma matrix (not just diagonal)
@@ -2481,7 +2697,8 @@ class Engine:
 
             # Get Hessian of curve bootstrapping (d²DFs/d(rates)²)
             if hasattr(foreign_model, '_hess') and foreign_model._hess is not None:
-                # Use stored Hessian from curve construction (consistent with VALUE)
+                # Use stored Hessian from curve construction
+                # NOTE: Stored Hessians already exclude prepended t=0 row (shape matches jac)
                 hess_for_curve = foreign_model._hess
             else:
                 # Fallback: Get from _cached_curve() (may have been computed above)
@@ -2497,7 +2714,16 @@ class Engine:
 
             # Chain rule for gamma - DIRECT effect (foreign OIS -> forward rates -> PV)
             term1_for = jac_for_original.T @ hess_for_dfs_original @ jac_for_original
-            term2_for = jnp.sum(grad_for_dfs_original[:, None, None] * hess_for_curve, axis=0)
+
+            # Handle diagonal or full curve Hessian
+            if hess_for_curve.ndim == 2:
+                # Diagonal Hessian: shape (n_dfs, n_rates)
+                term2_diag = jnp.dot(grad_for_dfs_original, hess_for_curve)  # Shape: (n_rates,)
+                term2_for = jnp.diag(term2_diag)  # Shape: (n_rates, n_rates)
+            else:
+                # Full Hessian: shape (n_dfs, n_rates, n_rates)
+                term2_for = jnp.sum(grad_for_dfs_original[:, None, None] * hess_for_curve, axis=0)
+
             gammas_for_matrix_direct = term1_for + term2_for
 
             # Foreign OIS GAMMA: Only direct effect on forward rates
@@ -2547,8 +2773,25 @@ class Engine:
 
                 # Check if curve Hessian is available (added in xccy_curve.py)
                 if hasattr(xccy_curve, "_hess_basis") and xccy_curve._hess_basis is not None:
-                    hess_xccy_curve = xccy_curve._hess_basis[1:, :, :] if xccy_times[0] < 1e-6 else xccy_curve._hess_basis
-                    term2_xccy = jnp.sum(grad_xccy_dfs_original[:, None, None] * hess_xccy_curve, axis=0)
+                    # NOTE: XCCY curve stores Hessian with prepended t=0 row (unlike OIS curves)
+                    # Skip first row if curve has prepended t=0 to match original DFs
+                    if xccy_times[0] < 1e-6:
+                        if xccy_curve._hess_basis.ndim == 2:
+                            hess_xccy_curve = xccy_curve._hess_basis[1:, :]  # Diagonal: (n_dfs, n_basis)
+                        else:
+                            hess_xccy_curve = xccy_curve._hess_basis[1:, :, :]  # Full: (n_dfs, n_basis, n_basis)
+                    else:
+                        hess_xccy_curve = xccy_curve._hess_basis
+
+                    # Handle diagonal or full curve Hessian
+                    if hess_xccy_curve.ndim == 2:
+                        # Diagonal Hessian: shape (n_dfs, n_basis)
+                        term2_diag = jnp.dot(grad_xccy_dfs_original, hess_xccy_curve)  # Shape: (n_basis,)
+                        term2_xccy = jnp.diag(term2_diag)  # Shape: (n_basis, n_basis)
+                    else:
+                        # Full Hessian: shape (n_dfs, n_basis, n_basis)
+                        term2_xccy = jnp.sum(grad_xccy_dfs_original[:, None, None] * hess_xccy_curve, axis=0)
+
                     gammas_xccy_matrix = term1_xccy + term2_xccy
                 else:
                     # Fallback to term1 only (will likely give zero or near-zero)
@@ -3776,6 +4019,228 @@ class Engine:
 
         return delta_dom, delta_for, delta_basis
 
+    def _xccy_gamma_pure(self,
+                        dom_dfs, dom_times, dom_interp_type,
+                        for_dfs, for_times, for_interp_type,
+                        xccy_dfs, xccy_times, xccy_interp_type,
+                        dom_jac, for_jac, xccy_jac_basis,
+                        dom_hess, for_hess, xccy_hess_basis,
+                        dom_payment_times, dom_start_times, dom_end_times,
+                        dom_alphas, dom_spreads, dom_notionals,
+                        dom_principal, dom_leg_sign,
+                        dom_notional_exchange, dom_effective_time, dom_maturity_time,
+                        for_payment_times, for_start_times, for_end_times,
+                        for_alphas, for_spreads, for_notionals,
+                        for_principal, for_leg_sign,
+                        for_notional_exchange, for_effective_time, for_maturity_time,
+                        value_time, spot_fx):
+        """
+        Compute XCCY swap GAMMA for a single swap (JAX-compatible, vmap-ready).
+
+        This pure function computes second-order sensitivities (GAMMA) to:
+        - Domestic OIS curve rates
+        - Foreign OIS curve rates
+        - XCCY basis spreads
+
+        Uses automatic differentiation to compute Hessians w.r.t. discount factors,
+        then applies chain rule with pre-computed Jacobians and curve Hessians.
+
+        Architecture:
+        1. Define PV functions for each curve (domestic, foreign, xccy)
+        2. Compute gradients: grad(PV, DFs) for each curve
+        3. Compute Hessians: hess(PV, DFs) for each curve
+        4. Chain rule: gamma = jac^T @ hess(PV, DFs) @ jac + sum(grad * hess_curve)
+        5. Convert to bp² units and domestic currency
+
+        Args:
+            Curve arrays (shared across batch):
+                dom_dfs, dom_times: Domestic OIS discount factors and times
+                dom_interp_type: Interpolation type for domestic curve
+                for_dfs, for_times: Foreign OIS discount factors and times
+                for_interp_type: Interpolation type for foreign curve
+                xccy_dfs, xccy_times: XCCY curve discount factors and times
+                xccy_interp_type: Interpolation type for XCCY curve
+
+            Jacobians (shared across batch):
+                dom_jac: [n_dfs, n_rates] Jacobian d(DFs)/d(rates) for domestic OIS
+                for_jac: [n_dfs, n_rates] Jacobian d(DFs)/d(rates) for foreign OIS
+                xccy_jac_basis: [n_dfs, n_basis] Jacobian d(DFs)/d(basis_spreads) for XCCY
+
+            Hessians (shared across batch):
+                dom_hess: [n_dfs, n_rates, n_rates] Hessian d²(DFs)/d(rates)² for domestic OIS
+                for_hess: [n_dfs, n_rates, n_rates] Hessian d²(DFs)/d(rates)² for foreign OIS
+                xccy_hess_basis: [n_dfs, n_basis, n_basis] Hessian d²(DFs)/d(basis_spreads)²
+
+            Swap parameters (per-swap, batched via vmap):
+                dom_* : Domestic leg parameters (payment times, alphas, spreads, etc.)
+                for_* : Foreign leg parameters
+                value_time: Valuation time
+                spot_fx: FX spot rate (domestic/foreign)
+
+        Returns:
+            Tuple of (gamma_dom, gamma_for, gamma_basis):
+                gamma_dom: [n_dom_rates, n_dom_rates] - domestic OIS gamma in USD/bp²
+                gamma_for: [n_for_rates, n_for_rates] - foreign OIS gamma in USD/bp²
+                gamma_basis: [n_basis, n_basis] - XCCY basis gamma in USD/bp²
+
+        Performance:
+            - Pure JAX function: JIT compilable, vmap-compatible
+            - Shared Jacobians/Hessians amortize overhead across batch
+            - Per-swap Hessians computed in parallel via vmap
+        """
+        from jax import grad, hessian
+        import jax.numpy as jnp
+
+        # Define PV functions for each curve (same pattern as _xccy_delta_pure)
+
+        # Domestic leg PV as function of domestic DFs
+        def pv_dom_fn(dom_dfs_var):
+            return self._float_leg_jax(
+                dfs=dom_dfs_var, times=dom_times,
+                disc_interp_type=dom_interp_type,
+                idx_interp_type=dom_interp_type,
+                payment_times=dom_payment_times,
+                start_times=dom_start_times, end_times=dom_end_times,
+                pay_alphas=dom_alphas, spreads=dom_spreads,
+                notionals=dom_notionals, principal=dom_principal,
+                leg_sign=dom_leg_sign, value_time=value_time,
+                first_fixing_rate=0.0, override_first=False,
+                idx_times=None, idx_dfs=None,
+                notional_exchange=dom_notional_exchange,
+                notional_exchange_amount=dom_notionals[0],
+                effective_time=dom_effective_time,
+                maturity_time=dom_maturity_time
+            )
+
+        # Foreign leg PV as function of foreign OIS DFs (for forward rate sensitivity)
+        def pv_for_fn(for_ois_dfs_var):
+            return self._float_leg_jax(
+                dfs=xccy_dfs, times=xccy_times,  # XCCY curve for discounting (FIXED)
+                disc_interp_type=xccy_interp_type,
+                idx_interp_type=for_interp_type,
+                payment_times=for_payment_times,
+                start_times=for_start_times, end_times=for_end_times,
+                pay_alphas=for_alphas, spreads=for_spreads,
+                notionals=for_notionals, principal=for_principal,
+                leg_sign=for_leg_sign, value_time=value_time,
+                first_fixing_rate=0.0, override_first=False,
+                idx_times=for_times, idx_dfs=for_ois_dfs_var,  # Foreign OIS DFs (VARIABLE)
+                notional_exchange=for_notional_exchange,
+                notional_exchange_amount=for_notionals[0],
+                effective_time=for_effective_time,
+                maturity_time=for_maturity_time
+            )
+
+        # Foreign leg PV as function of XCCY DFs (for basis spread sensitivity)
+        def pv_xccy_fn(xccy_dfs_var):
+            return self._float_leg_jax(
+                dfs=xccy_dfs_var, times=xccy_times,  # XCCY curve for discounting (VARIABLE)
+                disc_interp_type=xccy_interp_type,
+                idx_interp_type=for_interp_type,
+                payment_times=for_payment_times,
+                start_times=for_start_times, end_times=for_end_times,
+                pay_alphas=for_alphas, spreads=for_spreads,
+                notionals=for_notionals, principal=for_principal,
+                leg_sign=for_leg_sign, value_time=value_time,
+                first_fixing_rate=0.0, override_first=False,
+                idx_times=for_times, idx_dfs=for_dfs,  # Foreign OIS DFs (FIXED)
+                notional_exchange=for_notional_exchange,
+                notional_exchange_amount=for_notionals[0],
+                effective_time=for_effective_time,
+                maturity_time=for_maturity_time
+            )
+
+        # Use wrapper functions to handle prepended t=0 (same pattern as _xccy_delta_pure)
+        # IMPORTANT: DF(t≈0) = 1.0 is a boundary condition, NOT a curve parameter.
+        # Jacobians/Hessians are w.r.t. "original" DFs (excluding prepended point).
+
+        # Extract original DFs (excluding prepended t=0 if present)
+        dom_dfs_original = dom_dfs[1:] if dom_times[0] < 1e-6 else dom_dfs
+        for_dfs_original = for_dfs[1:] if for_times[0] < 1e-6 else for_dfs
+        xccy_dfs_original = xccy_dfs[1:] if xccy_times[0] < 1e-6 else xccy_dfs
+
+        # Wrapper functions that prepend t=0 before calling PV function
+        def pv_dom_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs]) if dom_times[0] < 1e-6 else original_dfs
+            return pv_dom_fn(full_dfs)
+
+        def pv_for_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs]) if for_times[0] < 1e-6 else original_dfs
+            return pv_for_fn(full_dfs)
+
+        def pv_xccy_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs]) if xccy_times[0] < 1e-6 else original_dfs
+            return pv_xccy_fn(full_dfs)
+
+        # Compute gradients and Hessians w.r.t. ORIGINAL DFs only (excluding DF(0)=1.0)
+
+        # Domestic OIS GAMMA
+        grad_dom_original = grad(lambda d: jnp.squeeze(pv_dom_original_dfs(d)))(dom_dfs_original)
+        hess_dom_dfs = hessian(lambda d: jnp.squeeze(pv_dom_original_dfs(d)))(dom_dfs_original)
+
+        # Chain rule: gamma = jac^T @ hess_pv_dfs @ jac + sum(grad * hess_curve)
+        term1_dom = dom_jac.T @ hess_dom_dfs @ dom_jac
+
+        # Handle diagonal or full curve Hessian
+        if dom_hess.ndim == 2:
+            # Diagonal Hessian: shape (n_dfs, n_rates)
+            term2_diag = jnp.dot(grad_dom_original, dom_hess)  # Shape: (n_rates,)
+            term2_dom = jnp.diag(term2_diag)  # Shape: (n_rates, n_rates)
+        else:
+            # Full Hessian: shape (n_dfs, n_rates, n_rates)
+            term2_dom = jnp.sum(grad_dom_original[:, None, None] * dom_hess, axis=0)
+
+        gamma_dom_matrix = term1_dom + term2_dom
+
+        # Convert to USD per bp² (1bp = 0.0001 → bp² = 1e-8)
+        gamma_dom = gamma_dom_matrix * 1e-8
+
+        # Foreign OIS GAMMA (direct effect through forward rates)
+        grad_for_original = grad(lambda d: jnp.squeeze(pv_for_original_dfs(d)))(for_dfs_original)
+        hess_for_dfs = hessian(lambda d: jnp.squeeze(pv_for_original_dfs(d)))(for_dfs_original)
+
+        # Chain rule (direct effect only - XCCY curve held fixed)
+        term1_for = for_jac.T @ hess_for_dfs @ for_jac
+
+        # Handle diagonal or full curve Hessian
+        if for_hess.ndim == 2:
+            # Diagonal Hessian: shape (n_dfs, n_rates)
+            term2_diag = jnp.dot(grad_for_original, for_hess)  # Shape: (n_rates,)
+            term2_for = jnp.diag(term2_diag)  # Shape: (n_rates, n_rates)
+        else:
+            # Full Hessian: shape (n_dfs, n_rates, n_rates)
+            term2_for = jnp.sum(grad_for_original[:, None, None] * for_hess, axis=0)
+
+        gamma_for_matrix = term1_for + term2_for
+
+        # Convert to USD per bp²
+        # NOTE: Sequential code divides by spot_fx (matching line 2515 in _compute_xccy)
+        gamma_for = gamma_for_matrix * 1e-8 / spot_fx
+
+        # XCCY Basis GAMMA
+        grad_xccy_original = grad(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
+        hess_xccy_dfs = hessian(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
+
+        # Chain rule (with curve Hessian if available)
+        term1_xccy = xccy_jac_basis.T @ hess_xccy_dfs @ xccy_jac_basis
+
+        # Handle diagonal or full curve Hessian
+        if xccy_hess_basis.ndim == 2:
+            # Diagonal Hessian: shape (n_dfs, n_basis)
+            term2_diag = jnp.dot(grad_xccy_original, xccy_hess_basis)  # Shape: (n_basis,)
+            term2_xccy = jnp.diag(term2_diag)  # Shape: (n_basis, n_basis)
+        else:
+            # Full Hessian: shape (n_dfs, n_basis, n_basis)
+            term2_xccy = jnp.sum(grad_xccy_original[:, None, None] * xccy_hess_basis, axis=0)
+
+        gamma_basis_matrix = term1_xccy + term2_xccy
+
+        # Convert to USD per bp²
+        # NOTE: Sequential code divides by spot_fx (matching line 2601 in _compute_xccy)
+        gamma_basis = gamma_basis_matrix * 1e-8 / spot_fx
+
+        return gamma_dom, gamma_for, gamma_basis
+
     def _ois_pv_pure(self,
                     dfs, times, interp_type,
                     fixed_payment_times, fixed_payments, fixed_principal, fixed_leg_sign,
@@ -3940,6 +4405,157 @@ class Engine:
         delta = delta_rates_raw * 1e-4
 
         return delta
+
+    def _ois_gamma_pure(self,
+                       dfs, times, interp_type, jac, hess,
+                       fixed_payment_times, fixed_payments, fixed_principal, fixed_leg_sign,
+                       float_payment_times, float_start_times, float_end_times,
+                       float_alphas, float_spreads, float_notionals, float_principal, float_leg_sign,
+                       value_time):
+        """
+        Compute OIS swap GAMMA for a single swap (JAX-compatible, vmap-ready).
+
+        Pure function for batched OIS GAMMA computation using automatic differentiation.
+        Computes second-order sensitivities (GAMMA) to OIS curve rates.
+
+        Architecture:
+        1. Define PV function for OIS swap (fixed + float legs)
+        2. Compute gradient and Hessian w.r.t. discount factors
+        3. Apply chain rule: gamma = jac^T @ hess(PV, DFs) @ jac + sum(grad * hess_curve)
+        4. Convert to bp² units
+
+        Args:
+            dfs: Discount factors [N]
+            times: Curve times [N]
+            interp_type: Interpolation method
+            jac: Jacobian d(DFs)/d(rates) [N, M] - pre-computed from curve construction
+            hess: Hessian d²(DFs)/d(rates)² [N, M] or [N, M, M] - diagonal or full
+
+            fixed_payment_times: Fixed leg payment times [M_fixed]
+            fixed_payments: Fixed leg payment amounts [M_fixed]
+            fixed_principal: Final principal for fixed leg (scalar)
+            fixed_leg_sign: +1 (receive fixed) or -1 (pay fixed)
+
+            float_payment_times: Float leg payment times [M_float]
+            float_start_times: Float leg period start times [M_float]
+            float_end_times: Float leg period end times [M_float]
+            float_alphas: Float leg year fractions [M_float]
+            float_spreads: Float leg spreads [M_float]
+            float_notionals: Float leg notionals [M_float]
+            float_principal: Final principal for float leg (scalar)
+            float_leg_sign: +1 (receive float) or -1 (pay float)
+
+            value_time: Valuation time (scalar)
+
+        Returns:
+            jnp.array: Gamma matrix [M, M] in USD/bp² units
+
+        Notes:
+            - Single curve used for both discounting and projection (natural currency collateral)
+            - No FX conversion needed (unlike XCCY)
+            - Uses JAX automatic differentiation for Hessian computation
+            - Chain rule: gamma = jac^T @ hess_pv_dfs @ jac + sum(grad * hess_curve)
+            - Handles diagonal (ndim=2) or full (ndim=3) curve Hessians
+            - Curve Hessian already excludes prepended t=0 row (shape matches Jacobian)
+            - Converts to bp² units (×1e-8)
+
+        Performance:
+            - Pure JAX function: JIT compilable, vmap-compatible
+            - Shared Jacobian/Hessian amortizes overhead across batch
+            - Per-swap Hessians computed in parallel via vmap
+        """
+        from jax import grad, hessian
+        import jax.numpy as jnp
+
+        # Define PV function w.r.t. discount factors (reuse _ois_pv_pure)
+        def pv_fn(dfs_var):
+            return self._ois_pv_pure(
+                dfs_var, times, interp_type,
+                fixed_payment_times, fixed_payments, fixed_principal, fixed_leg_sign,
+                float_payment_times, float_start_times, float_end_times,
+                float_alphas, float_spreads, float_notionals, float_principal, float_leg_sign,
+                value_time
+            )
+
+        # Use wrapper function to handle prepended t=0 (same pattern as DELTA/XCCY GAMMA)
+        # IMPORTANT: DF(t≈0) = 1.0 is a boundary condition, NOT a curve parameter.
+        # Jacobian and Hessian are w.r.t. "original" DFs (excluding prepended point).
+
+        # Extract original DFs (excluding prepended t=0 if present)
+        dfs_original = dfs[1:] if times[0] < 1e-6 else dfs
+
+        # Wrapper function that prepends t=0 before calling PV function
+        def pv_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs]) if times[0] < 1e-6 else original_dfs
+            return pv_fn(full_dfs)
+
+        # Define separate PV functions for fixed and float legs (matching sequential approach)
+        def pv_fixed_fn(dfs_var):
+            return self._price_fixed_leg_jax(
+                dfs=dfs_var, times=times, interp_type=interp_type,
+                payment_times=fixed_payment_times, payments=fixed_payments,
+                principal=fixed_principal, leg_sign=fixed_leg_sign, value_time=value_time,
+                notional=1.0
+            )
+
+        def pv_float_fn(dfs_var):
+            return self._float_leg_jax(
+                dfs=dfs_var, times=times,
+                disc_interp_type=interp_type, idx_interp_type=interp_type,
+                payment_times=float_payment_times,
+                start_times=float_start_times, end_times=float_end_times,
+                pay_alphas=float_alphas, spreads=float_spreads,
+                notionals=float_notionals, principal=float_principal,
+                leg_sign=float_leg_sign, value_time=value_time,
+                first_fixing_rate=0.0, override_first=False,
+                idx_times=None, idx_dfs=None,
+                notional_exchange=False, notional_exchange_amount=0.0,
+                effective_time=0.0, maturity_time=0.0
+            )
+
+        # Wrapper functions for fixed and float legs
+        def pv_fixed_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs]) if times[0] < 1e-6 else original_dfs
+            return pv_fixed_fn(full_dfs)
+
+        def pv_float_original_dfs(original_dfs):
+            full_dfs = jnp.concatenate([jnp.array([1.0]), original_dfs]) if times[0] < 1e-6 else original_dfs
+            return pv_float_fn(full_dfs)
+
+        # Compute gradients and Hessians separately for each leg (matching sequential)
+        grad_fixed = grad(lambda d: jnp.squeeze(pv_fixed_original_dfs(d)))(dfs_original)
+        hess_fixed_pv_dfs = hessian(lambda d: jnp.squeeze(pv_fixed_original_dfs(d)))(dfs_original)
+
+        grad_float = grad(lambda d: jnp.squeeze(pv_float_original_dfs(d)))(dfs_original)
+        hess_float_pv_dfs = hessian(lambda d: jnp.squeeze(pv_float_original_dfs(d)))(dfs_original)
+
+        # Combined gradient and Hessian
+        grad_original = grad_fixed + grad_float
+        hess_pv_dfs = hess_fixed_pv_dfs + hess_float_pv_dfs
+
+        # Apply chain rule: gamma = jac^T @ hess_pv_dfs @ jac + sum(grad * hess_curve)
+        # term1: main chain rule (treating curve as fixed mapping)
+        # term2: correction for curve Hessian (derivative of Jacobian itself)
+        term1 = jac.T @ hess_pv_dfs @ jac
+
+        # Handle diagonal or full curve Hessian
+        # NOTE: Stored Hessians already exclude prepended t=0 row (shape matches Jacobian)
+        if hess.ndim == 2:
+            # Diagonal Hessian: shape (n_dfs, n_rates)
+            # For diagonal: term2[j,k] = sum_i grad[i] * hess[i,j] if j==k, else 0
+            term2_diag = jnp.dot(grad_original, hess)  # Shape: (n_rates,)
+            term2 = jnp.diag(term2_diag)  # Shape: (n_rates, n_rates)
+        else:
+            # Full Hessian: shape (n_dfs, n_rates, n_rates)
+            term2 = jnp.sum(grad_original[:, None, None] * hess, axis=0)
+
+        gamma_matrix = term1 + term2
+
+        # Convert to bp² units (1bp = 0.0001 → bp² = 1e-8)
+        # OIS is in domestic currency, no FX conversion needed
+        gamma = gamma_matrix * 1e-8
+
+        return gamma
 
     def value_float_leg(self,
                     swap_rates,
