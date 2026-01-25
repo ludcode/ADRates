@@ -229,8 +229,10 @@ class InterpolatorAd:
                 r = -jnp.log(d) / jnp.maximum(x, 1e-15)
                 interp_result = jnp.exp(-jnp.interp(tt_adjusted, x, r) * tt)
             elif method == InterpTypes.FLAT_FWD_RATES.value:
-                rt = -jnp.log(d)
-                interp_result = jnp.exp(-jnp.interp(tt_adjusted, x, rt))
+                # Log-linear interpolation of discount factors (mathematically equivalent to flat forwards)
+                # Simplified: exp(-interp(t, x, -log(d))) = exp(interp(t, x, log(d)))
+                log_dfs = jnp.log(d)
+                interp_result = jnp.exp(jnp.interp(tt_adjusted, x, log_dfs))
             elif method == InterpTypes.LINEAR_FWD_RATES.value:
                 interp_result = jnp.interp(tt_adjusted, x, d)
             else:

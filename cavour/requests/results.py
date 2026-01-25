@@ -836,6 +836,99 @@ class CrossGamma:
         return df
 
 
+@dataclass(frozen=True)
+class FXDelta:
+    """
+    FX sensitivity (FX01) for cross-currency instruments.
+
+    Represents how position value changes with respect to 1% move in spot FX rate.
+    For XCCY swaps: FX01 = foreign_leg_PV * spot_fx * 0.01
+
+    The sensitivity captures the linear FX exposure from the foreign currency leg.
+    A positive FX01 means the position benefits when the domestic currency weakens
+    (spot FX rate increases, meaning more domestic per unit foreign).
+
+    Attributes:
+        sensitivity (float): PV change for 1% spot FX move (domestic currency units)
+        spot_fx (float): Current spot FX rate (domestic per foreign)
+        currency (CurrencyTypes): Currency of the sensitivity (always domestic)
+        domestic_currency (CurrencyTypes): Domestic currency identifier
+        foreign_currency (CurrencyTypes): Foreign currency identifier
+
+    Properties:
+        value: Sensitivity as Value object
+        percent_sensitivity: Sensitivity per 1% move (same as sensitivity)
+
+    Methods:
+        to_dict(): Export as dictionary
+        __repr__(): String representation with currency pair and spot
+
+    Example:
+        >>> fx01 = FXDelta(
+        ...     sensitivity=12750.0,
+        ...     spot_fx=1.27,
+        ...     currency=CurrencyTypes.USD,
+        ...     domestic_currency=CurrencyTypes.USD,
+        ...     foreign_currency=CurrencyTypes.GBP
+        ... )
+        >>> print(fx01.value)  # Value(12750.0 USD)
+        >>> print(fx01)  # FXDelta(USD/GBP: 12750.00 USD per 1% spot move, spot=1.2700)
+
+    Notes:
+        - Units: Domestic currency per 1% change in spot FX
+        - Sign convention: Positive = gains when domestic weakens
+        - Spot FX convention: Domestic currency per unit of foreign currency
+        - Calculation: sensitivity = foreign_leg_PV_in_foreign * spot_fx * 0.01
+    """
+    sensitivity: float
+    spot_fx: float
+    currency: CurrencyTypes
+    domestic_currency: CurrencyTypes
+    foreign_currency: CurrencyTypes
+
+    def __post_init__(self):
+        """Validate currency types on construction."""
+        if not isinstance(self.currency, CurrencyTypes):
+            raise TypeError(f"currency must be CurrencyTypes, got {type(self.currency)}")
+        if not isinstance(self.domestic_currency, CurrencyTypes):
+            raise TypeError(f"domestic_currency must be CurrencyTypes, got {type(self.domestic_currency)}")
+        if not isinstance(self.foreign_currency, CurrencyTypes):
+            raise TypeError(f"foreign_currency must be CurrencyTypes, got {type(self.foreign_currency)}")
+        if self.currency != self.domestic_currency:
+            raise ValueError(f"currency must match domestic_currency for FX sensitivity")
+        if self.spot_fx <= 0:
+            raise ValueError(f"spot_fx must be positive, got {self.spot_fx}")
+
+    @property
+    def value(self) -> Valuation:
+        """Return sensitivity as a Valuation object."""
+        return Valuation(amount=self.sensitivity, currency=self.currency)
+
+    @property
+    def percent_sensitivity(self) -> float:
+        """Return sensitivity per 1% move in spot (same as sensitivity field)."""
+        return self.sensitivity
+
+    def __repr__(self) -> str:
+        """String representation with currency pair and spot rate."""
+        return (
+            f"FXDelta({self.domestic_currency.name}/{self.foreign_currency.name}: "
+            f"{self.sensitivity:.2f} {self.currency.name} per 1% spot move, "
+            f"spot={self.spot_fx:.4f})"
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary representation for export."""
+        return {
+            'sensitivity': float(self.sensitivity),
+            'spot_fx': float(self.spot_fx),
+            'currency': self.currency.name,
+            'domestic_currency': self.domestic_currency.name,
+            'foreign_currency': self.foreign_currency.name,
+            'percent_move': 1.0
+        }
+
+
 class Risk:
     """
     Container for multiple per-curve Delta and Gamma ladders.
@@ -846,6 +939,7 @@ class Risk:
     Args:
         ladders (Iterable[Union[Delta, Gamma]]): List of Delta or Gamma objects
         cross_gammas (Optional[Iterable[CrossGamma]]): List of CrossGamma objects
+        fx_delta (Optional[FXDelta]): FX sensitivity for cross-currency instruments
 
     Access patterns:
         1. Attribute: risk.GBP_OIS_SONIA.value
@@ -853,6 +947,7 @@ class Risk:
         3. Attribute: risk.GBP_OIS_SONIA.matrix (for Gamma)
         4. Callable: risk(CurveTypes.GBP_OIS_SONIA)
         5. Cross-gamma: risk.cross_gamma(CurveTypes.USD_OIS_SOFR, CurveTypes.USD_GBP_BASIS)
+        6. FX sensitivity: risk.fx_delta (for XCCY swaps)
 
     Example:
         >>> delta1 = Delta([10, -5], ["1Y", "5Y"], CurrencyTypes.GBP, CurveTypes.GBP_OIS_SONIA)
@@ -867,10 +962,12 @@ class Risk:
     def __init__(
         self,
         ladders: Iterable[Union[Delta, Gamma]],
-        cross_gammas: Optional[Iterable[CrossGamma]] = None
+        cross_gammas: Optional[Iterable[CrossGamma]] = None,
+        fx_delta: Optional[FXDelta] = None
     ):
         self._by_curve = {}  # type: Dict[str, Union[Delta, Gamma]]
         self._cross_gammas = {}  # type: Dict[Tuple[str, str], CrossGamma]
+        self._fx_delta = fx_delta  # type: Optional[FXDelta]
 
         for ladder in ladders:
             name = ladder.curve_type.name
@@ -933,6 +1030,57 @@ class Risk:
     def all_cross_gammas(self) -> Dict[Tuple[str, str], CrossGamma]:
         """Return all cross-gammas as a dictionary."""
         return self._cross_gammas.copy()
+
+    @property
+    def fx_delta(self) -> Optional[FXDelta]:
+        """
+        Return FX sensitivity (FX01) if computed for cross-currency instruments.
+
+        Returns:
+            FXDelta object containing spot FX sensitivity, or None if not applicable
+
+        Example:
+            >>> if risk.fx_delta:
+            >>>     print(f"FX01: {risk.fx_delta.value}")
+            >>>     print(f"Spot: {risk.fx_delta.spot_fx}")
+        """
+        return self._fx_delta
+
+    @property
+    def deltas(self) -> Dict[CurveTypes, Delta]:
+        """
+        Return dictionary of Delta objects keyed by curve type.
+
+        Returns:
+            Dictionary mapping CurveTypes to Delta objects
+
+        Example:
+            >>> for curve_type, delta in risk.deltas.items():
+            >>>     print(f"{curve_type.name}: {delta.value}")
+        """
+        return {
+            CurveTypes[name]: obj
+            for name, obj in self._by_curve.items()
+            if isinstance(obj, Delta)
+        }
+
+    @property
+    def gammas(self) -> Dict[CurveTypes, Gamma]:
+        """
+        Return dictionary of Gamma objects keyed by curve type.
+
+        Returns:
+            Dictionary mapping CurveTypes to Gamma objects
+
+        Example:
+            >>> for curve_type, gamma in risk.gammas.items():
+            >>>     print(f"{curve_type.name}: {gamma.value}")
+        """
+        return {
+            CurveTypes[name]: obj
+            for name, obj in self._by_curve.items()
+            if isinstance(obj, Gamma)
+        }
 
     def __repr__(self):
         parts = []
@@ -1134,12 +1282,14 @@ class AnalyticsResult:
         risk (Optional[Risk]): Delta risk ladders
         gamma (Optional[Gamma]): Gamma (second-order) sensitivities
         cashflows (Optional[Cashflows]): Cashflow breakdown
+        fx_delta (Optional[FXDelta]): FX sensitivity for cross-currency instruments
 
     Properties:
         value: Valuation object (present value)
         risk: Risk container with delta ladders
         gamma: Gamma matrix
         cashflows: Cashflows container with payment details
+        fx_delta: FX sensitivity (FX01) for XCCY instruments
 
     Example:
         >>> swap = OIS(value_dt, "10Y", 0.04)
@@ -1156,12 +1306,14 @@ class AnalyticsResult:
         risk: Optional[Risk] = None,
         gamma: Optional[Gamma] = None,
         cashflows: Optional[Cashflows] = None,
+        fx_delta: Optional[FXDelta] = None,
     ):
         # store inputs directly
         self._value = value
         self._risk  = risk
         self._gamma  = gamma
         self._cashflows = cashflows
+        self._fx_delta = fx_delta
 
     @property
     def value(self) -> Value:
@@ -1184,6 +1336,21 @@ class AnalyticsResult:
         """Return the Cashflows object."""
         return self._cashflows
 
+    @property
+    def fx_delta(self) -> Optional[FXDelta]:
+        """
+        Return FX sensitivity (FX01) for cross-currency instruments.
+
+        Returns:
+            FXDelta object containing spot FX sensitivity, or None if not applicable
+
+        Example:
+            >>> result = pos.compute([RequestTypes.VALUE, RequestTypes.FX01])
+            >>> if result.fx_delta:
+            >>>     print(f"FX01: {result.fx_delta.value}")
+        """
+        return self._fx_delta
+
     def __repr__(self):
         cls = self.__class__.__name__
         parts = []
@@ -1199,4 +1366,7 @@ class AnalyticsResult:
         # cashflows
         if self._cashflows is not None:
             parts.append(f"cashflows={self._cashflows!r}")
+        # fx_delta
+        if self._fx_delta is not None:
+            parts.append(f"fx_delta={self._fx_delta!r}")
         return f"{cls}({', '.join(parts)})"

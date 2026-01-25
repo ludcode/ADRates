@@ -72,6 +72,7 @@ class RequestTypes(Enum):
     GAMMA = 3
     SPEED = 4
     CASHFLOWS = 5
+    FX01 = 6
 
 class InterpTypes(Enum):
     FLAT_FWD_RATES = 1

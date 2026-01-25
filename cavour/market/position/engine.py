@@ -12,7 +12,7 @@ from cavour.utils.date import Date
 from cavour.utils.day_count import DayCountTypes
 from cavour.utils.error import LibError
 from cavour.market.curves.interpolator_ad import InterpolatorAd
-from cavour.requests.results import Valuation, Gamma, Delta, AnalyticsResult, Risk, CrossGamma, Cashflows, CashflowItem
+from cavour.requests.results import Valuation, Gamma, Delta, AnalyticsResult, Risk, CrossGamma, FXDelta, Cashflows, CashflowItem
 from cavour.utils.global_types import (SwapTypes,
                                    InstrumentTypes,
                                    RequestTypes,
@@ -381,6 +381,54 @@ class Engine:
             )
             value_batch = [float(pv) for pv in pv_array]
 
+        # Compute FX01 if requested (requires foreign leg PV)
+        fx_delta_batch = None
+        if RequestTypes.FX01 in reqs:
+            # Create vectorized function for foreign leg PV only
+            # Foreign leg uses XCCY curve for discounting and foreign OIS for forward rates
+            for_pv_batch_fn = vmap(
+                lambda for_pmt, for_start, for_end, for_alpha, for_spr, for_not,
+                       for_prin, for_sign, for_notex, for_eff, for_mat:
+                    self._float_leg_jax(
+                        dfs=xccy_dfs, times=xccy_times,
+                        disc_interp_type=xccy_curve._interp_type,
+                        idx_interp_type=foreign_model._interp_type,
+                        payment_times=for_pmt,
+                        start_times=for_start, end_times=for_end,
+                        pay_alphas=for_alpha, spreads=for_spr,
+                        notionals=for_not, principal=for_prin,
+                        leg_sign=for_sign, value_time=value_time,
+                        first_fixing_rate=0.0, override_first=False,
+                        idx_times=for_times, idx_dfs=for_dfs,
+                        notional_exchange=for_notex,
+                        notional_exchange_amount=for_not[0],
+                        effective_time=for_eff,
+                        maturity_time=for_mat
+                    ),
+                in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)  # All foreign leg params batched
+            )
+
+            # Compute foreign PV for each swap
+            for_pv_array = for_pv_batch_fn(
+                for_payment_times_batch, for_start_times_batch, for_end_times_batch,
+                for_alphas_batch, for_spreads_batch, for_notionals_batch,
+                for_principal_batch, for_leg_sign_batch, for_notional_exchange_batch,
+                for_effective_time_batch, for_maturity_time_batch
+            )
+
+            # Calculate FX01 for each swap: for_pv * spot_fx * 0.01
+            fx_delta_batch = []
+            for i, for_pv in enumerate(for_pv_array):
+                fx01_sensitivity = float(for_pv) * spot_fx * 0.01
+                fx_delta_obj = FXDelta(
+                    sensitivity=fx01_sensitivity,
+                    spot_fx=spot_fx,
+                    currency=derivatives[i]._domestic_currency,
+                    domestic_currency=derivatives[i]._domestic_currency,
+                    foreign_currency=derivatives[i]._foreign_currency
+                )
+                fx_delta_batch.append(fx_delta_obj)
+
         # Compute DELTA if requested
         delta_batch = None
         if RequestTypes.DELTA in reqs:
@@ -622,7 +670,8 @@ class Engine:
             value_obj = Valuation(amount=value_batch[i], currency=derivatives[i]._domestic_currency) if value_batch else None
             delta_obj = delta_batch[i] if delta_batch else None
             gamma_obj = gamma_batch[i] if gamma_batch else None
-            result = AnalyticsResult(value=value_obj, risk=delta_obj, gamma=gamma_obj)
+            fx_delta_obj = fx_delta_batch[i] if fx_delta_batch else None
+            result = AnalyticsResult(value=value_obj, risk=delta_obj, gamma=gamma_obj, fx_delta=fx_delta_obj)
             results.append(result)
 
         return results
@@ -1303,13 +1352,36 @@ class Engine:
                 "Only VALUE and DELTA are currently implemented."
             )
 
+        # FX01 calculation (FX sensitivity)
+        fx_delta = None
+        if RequestTypes.FX01 in reqs:
+            # For cross-currency collateral, PV in collateral currency is:
+            # PV_collateral = PV_swap / spot_fx
+            # The derivative with respect to spot_fx is:
+            # dPV/d(spot_fx) = -PV_swap / spot_fx^2
+            # For 1% move: FX01 = -PV_swap / spot_fx^2 * spot_fx * 0.01
+            #              = -PV_swap / spot_fx * 0.01
+            #              = -PV_collateral * 0.01
+            #
+            # Negative sign: when spot_fx increases (swap currency weakens),
+            # the collateral currency value decreases
+            fx01_sensitivity = -total_pv_collateral_ccy * 0.01
+
+            fx_delta = FXDelta(
+                sensitivity=fx01_sensitivity,
+                spot_fx=spot_fx,
+                currency=collateral_ccy,
+                domestic_currency=collateral_ccy,  # Collateral is the "domestic" for this calculation
+                foreign_currency=derivative._currency  # Swap currency is the "foreign"
+            )
+
         # Cashflows extraction (placeholder for future implementation)
         cashflows = None
         if RequestTypes.CASHFLOWS in reqs:
             # TODO: Extract cashflow data from fixed and floating legs
             cashflows = Cashflows([], derivative._currency)
 
-        return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=cashflows)
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=cashflows, fx_delta=fx_delta)
 
     def _compute_bond(self, derivative, reqs):
         """Compute analytics for bonds (VALUE, DELTA, GAMMA).
@@ -2291,8 +2363,9 @@ class Engine:
         dom_end_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
                                    for dt in derivative._domestic_leg._end_accrued_dts])
         dom_alphas = jnp.array(derivative._domestic_leg._year_fracs)
-        dom_spreads = jnp.full_like(dom_alphas, derivative._domestic_leg._spread)
-        dom_notionals = jnp.array(derivative._domestic_leg._notional_array or
+        # Fixed legs don't have _spread, use 0.0. Float legs have _spread.
+        dom_spreads = jnp.full_like(dom_alphas, getattr(derivative._domestic_leg, '_spread', 0.0))
+        dom_notionals = jnp.array(getattr(derivative._domestic_leg, '_notional_array', None) or
                                   [derivative._domestic_leg._notional] * len(dom_alphas))
         dom_principal = derivative._domestic_leg._principal
         dom_leg_sign = +1.0 if derivative._domestic_leg._leg_type == SwapTypes.RECEIVE else -1.0
@@ -2312,8 +2385,9 @@ class Engine:
         for_end_times = jnp.array([times_from_dates(dt, self.model.value_dt, for_dc_type)
                                    for dt in derivative._foreign_leg._end_accrued_dts])
         for_alphas = jnp.array(derivative._foreign_leg._year_fracs)
-        for_spreads = jnp.full_like(for_alphas, derivative._foreign_leg._spread)
-        for_notionals = jnp.array(derivative._foreign_leg._notional_array or
+        # Fixed legs don't have _spread, use 0.0. Float legs have _spread.
+        for_spreads = jnp.full_like(for_alphas, getattr(derivative._foreign_leg, '_spread', 0.0))
+        for_notionals = jnp.array(getattr(derivative._foreign_leg, '_notional_array', None) or
                                   [derivative._foreign_leg._notional] * len(for_alphas))
         for_principal = derivative._foreign_leg._principal
         for_leg_sign = +1.0 if derivative._foreign_leg._leg_type == SwapTypes.RECEIVE else -1.0
@@ -2348,7 +2422,7 @@ class Engine:
                 override_first=False,
                 idx_times=None,
                 idx_dfs=None,
-                notional_exchange=derivative._domestic_leg._notional_exchange,
+                notional_exchange=getattr(derivative._domestic_leg, '_notional_exchange', True),
                 notional_exchange_amount=derivative._domestic_leg._notional,
                 effective_time=dom_effective_time,
                 maturity_time=dom_maturity_time
@@ -2373,7 +2447,7 @@ class Engine:
                 override_first=False,
                 idx_times=for_times,  # Foreign OIS for forward rates
                 idx_dfs=for_dfs,
-                notional_exchange=derivative._foreign_leg._notional_exchange,
+                notional_exchange=getattr(derivative._foreign_leg, '_notional_exchange', True),
                 notional_exchange_amount=derivative._foreign_leg._notional,
                 effective_time=for_effective_time,
                 maturity_time=for_maturity_time
@@ -2402,7 +2476,7 @@ class Engine:
                 notionals=dom_notionals, principal=dom_principal,
                 leg_sign=dom_leg_sign, value_time=value_time,
                 first_fixing_rate=0.0, override_first=False,
-                notional_exchange=derivative._domestic_leg._notional_exchange,
+                notional_exchange=getattr(derivative._domestic_leg, '_notional_exchange', True),
                 notional_exchange_amount=derivative._domestic_leg._notional,
                 effective_time=dom_effective_time,
                 maturity_time=dom_maturity_time
@@ -2421,7 +2495,7 @@ class Engine:
                 leg_sign=for_leg_sign, value_time=value_time,
                 first_fixing_rate=0.0, override_first=False,
                 idx_times=for_times, idx_dfs=for_ois_dfs_var,  # Foreign OIS DFs (VARIABLE)
-                notional_exchange=derivative._foreign_leg._notional_exchange,
+                notional_exchange=getattr(derivative._foreign_leg, '_notional_exchange', True),
                 notional_exchange_amount=derivative._foreign_leg._notional,
                 effective_time=for_effective_time,
                 maturity_time=for_maturity_time
@@ -2440,7 +2514,7 @@ class Engine:
                 leg_sign=for_leg_sign, value_time=value_time,
                 first_fixing_rate=0.0, override_first=False,
                 idx_times=for_times, idx_dfs=for_dfs,  # Foreign OIS DFs (FIXED)
-                notional_exchange=derivative._foreign_leg._notional_exchange,
+                notional_exchange=getattr(derivative._foreign_leg, '_notional_exchange', True),
                 notional_exchange_amount=derivative._foreign_leg._notional,
                 effective_time=for_effective_time,
                 maturity_time=for_maturity_time
@@ -2884,6 +2958,26 @@ class Engine:
             else:
                 gamma = Risk([gamma_domestic, gamma_foreign], cross_gammas=cross_gammas_list)
 
+        # FX01 calculation (FX sensitivity)
+        fx_delta = None
+        if RequestTypes.FX01 in reqs:
+            # FX01 measures PV sensitivity to 1% move in spot FX
+            # Since PV = PV_domestic + spot_fx * PV_foreign, the derivative is:
+            # dPV/d(spot_fx) = PV_foreign
+            # FX01 (for 1% move) = PV_foreign * spot_fx * 0.01
+            #
+            # Note: for_pv_scalar is already in foreign currency (GBP for USD/GBP swap)
+            # Multiply by spot_fx to get domestic currency value, then by 0.01 for 1% sensitivity
+            fx01_sensitivity = for_pv_scalar * spot_fx * 0.01
+
+            fx_delta = FXDelta(
+                sensitivity=fx01_sensitivity,
+                spot_fx=spot_fx,
+                currency=derivative._domestic_currency,
+                domestic_currency=derivative._domestic_currency,
+                foreign_currency=derivative._foreign_currency
+            )
+
         # Cashflows extraction
         cashflows = None
         if RequestTypes.CASHFLOWS in reqs:
@@ -2903,7 +2997,7 @@ class Engine:
 
             cashflows = Cashflows(all_cashflows, risk_ccy)
 
-        return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=cashflows)
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=cashflows, fx_delta=fx_delta)
 
     def _compute_xccy_old(self, derivative, reqs):
         """Old array-based implementation - kept for DELTA/GAMMA future work."""
@@ -2958,7 +3052,7 @@ class Engine:
                 domestic_analytics["value"] = Valuation(amount=domestic_value, currency=derivative._domestic_currency)
         else:
             # Floating leg: use XCCY floating leg analytics (handles notional exchanges)
-            if derivative._domestic_leg._notional_exchange:
+            if getattr(derivative._domestic_leg, '_notional_exchange', True):
                 domestic_analytics = self._xccy_float_leg_analytics(
                     domestic_model.swap_rates,
                     domestic_model.swap_times,
@@ -3017,7 +3111,7 @@ class Engine:
         else:
             # Floating leg: use XCCY curve for discounting, foreign curve for forward rates
             # The foreign leg coupons are projected using foreign OIS curve, but discounted using XCCY curve
-            if derivative._foreign_leg._notional_exchange:
+            if getattr(derivative._foreign_leg, '_notional_exchange', True):
                 foreign_analytics = self._xccy_float_leg_analytics(
                     foreign_model.swap_rates,
                     foreign_model.swap_times,
@@ -3342,8 +3436,15 @@ class Engine:
         all_maturities = jnp.array(points_data['maturities'])
         return all_maturities, all_dfs
 
-    def _cached_curve(self, key, swap_rates, swap_times, year_fracs, interp_type):
-        """Bootstrap the curve once and cache DFS, Jacobian and Hessian."""
+    def _cached_curve(self, key, swap_rates, swap_times, year_fracs, interp_type, compute_gamma=True):
+        """
+        Bootstrap the curve once and cache DFS, Jacobian and optionally Hessian.
+
+        Args:
+            compute_gamma: If True, compute expensive Hessian for GAMMA calculations.
+                          If False, skip Hessian (saves ~4-5s for large curves).
+                          Default True for backward compatibility.
+        """
         cache = self._curve_cache.get(key)
         if cache is not None:
             return cache
@@ -3369,7 +3470,13 @@ class Engine:
             return dfs_out
 
         jac_original = jacrev(build_dfs_original)(rates)
-        hess_original = hessian(build_dfs_original)(rates)
+
+        # Hessian computation is expensive (~4-5s for large curves)
+        # Only compute if GAMMA will be requested
+        if compute_gamma:
+            hess_original = hessian(build_dfs_original)(rates)
+        else:
+            hess_original = None
 
         # If we prepended time=0, add a row of zeros to Jacobian and Hessian
         # because DF(t=0) = 1.0 is constant (zero gradient w.r.t. all rates)
@@ -3378,9 +3485,12 @@ class Engine:
             zero_row = jnp.zeros((1, n_rates))
             jac = jnp.concatenate([zero_row, jac_original], axis=0)
 
-            # For Hessian: prepend zeros for the time=0 point
-            zero_matrix = jnp.zeros((1, n_rates, n_rates))
-            hess = jnp.concatenate([zero_matrix, hess_original], axis=0)
+            # For Hessian: prepend zeros for the time=0 point (only if computed)
+            if hess_original is not None:
+                zero_matrix = jnp.zeros((1, n_rates, n_rates))
+                hess = jnp.concatenate([zero_matrix, hess_original], axis=0)
+            else:
+                hess = None
         else:
             jac = jac_original
             hess = hess_original

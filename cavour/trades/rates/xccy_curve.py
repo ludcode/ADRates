@@ -729,6 +729,9 @@ class XccyCurve(DiscountCurve):
         """
         all_points = []
 
+        # Cache domestic leg PVs to avoid redundant computation
+        pv_domestic_cache = {}
+
         # For each basis swap, extract ALL payment data from BOTH legs
         for swap_idx, swap in enumerate(self._used_swaps):
             basis_spread = swap._foreign_spread
@@ -743,6 +746,9 @@ class XccyCurve(DiscountCurve):
                 index_curve=self._domestic_curve,
                 first_fixing_rate=None
             )
+
+            # Cache domestic PV to avoid redundant computation later
+            pv_domestic_cache[swap_idx] = pv_domestic
 
             # Value foreign leg to populate cashflows
             # Use foreign OIS curve for projection, XCCY curve will be bootstrapped
@@ -879,19 +885,9 @@ class XccyCurve(DiscountCurve):
         xccy_node_mask_array = jnp.array(xccy_node_mask)
 
         # Pre-computed domestic PV for each swap (constant throughout)
-        # Map each point's swap_idx to the correct domestic PV
-        pv_domestic_by_swap_dict = {}
-        for i in range(n_swaps):
-            pv_dom = self._used_swaps[i]._domestic_leg.value(
-                value_dt=self._value_dt,
-                discount_curve=self._domestic_curve,
-                index_curve=self._domestic_curve,
-                first_fixing_rate=None
-            )
-            pv_domestic_by_swap_dict[i] = pv_dom
-
+        # Use cached values from earlier computation to avoid redundant leg valuations
         # Create array indexed by swap number
-        pv_domestic_by_swap = jnp.array([pv_domestic_by_swap_dict[i] for i in range(n_swaps)])
+        pv_domestic_by_swap = jnp.array([pv_domestic_cache[i] for i in range(n_swaps)])
 
         # Pre-compute mask matrix for sequential accumulation
         # This avoids swap-indexed state (which causes circular gradient dependencies in JAX)
