@@ -628,18 +628,23 @@ class ScenarioResult:
     """
     Result for a single curve scenario validation.
 
-    Represents the outcome of validating deltas under one specific shock scenario
-    (e.g., slope, skew, butterfly).
+    Represents the outcome of validating deltas (and optionally gammas) under
+    one specific shock scenario (e.g., slope, skew, butterfly).
 
     Attributes:
         name: Scenario name (e.g., "slope_100bp", "skew_neg50bp")
         shock_dict: Dictionary mapping tenor -> shock in basis points
         pv_base: Base case PV (unshocked)
         pv_shocked: PV after applying scenario shocks (full revaluation)
-        pv_delta_approx: PV estimated via delta approximation
-        error_abs: Absolute error |PV_shocked - PV_delta_approx|
-        error_pct: Relative error (percentage)
-        passed: Whether error is within tolerance
+        pv_delta_approx: PV estimated via delta-only approximation
+        error_abs: Absolute error for delta-only |PV_shocked - PV_delta_approx|
+        error_pct: Relative error for delta-only (percentage)
+        passed: Whether delta-only error is within tolerance
+        pv_delta_gamma_approx: PV estimated via delta+gamma approximation (optional)
+        error_delta_gamma_abs: Absolute error for delta+gamma (optional)
+        error_delta_gamma_pct: Relative error for delta+gamma (optional)
+        gamma_improvement_factor: error_delta / error_delta_gamma (optional)
+        passed_delta_gamma: Whether delta+gamma error is within tolerance (optional)
     """
     name: str
     shock_dict: Dict[str, float]
@@ -649,6 +654,12 @@ class ScenarioResult:
     error_abs: float
     error_pct: float
     passed: bool
+    # Delta+Gamma fields (optional - only populated if gamma available)
+    pv_delta_gamma_approx: Optional[float] = None
+    error_delta_gamma_abs: Optional[float] = None
+    error_delta_gamma_pct: Optional[float] = None
+    gamma_improvement_factor: Optional[float] = None
+    passed_delta_gamma: Optional[bool] = None
 
 
 @dataclass
@@ -672,7 +683,7 @@ class ScenarioValidationReport:
     all_passed: bool
 
     def to_dataframe(self) -> pd.DataFrame:
-        """Export all scenario results to pandas DataFrame."""
+        """Export all scenario results to pandas DataFrame (delta-only)."""
         df = pd.DataFrame([
             {
                 'Scenario': s.name,
@@ -687,24 +698,70 @@ class ScenarioValidationReport:
         ])
         return df
 
+    def to_dataframe_comparison(self) -> pd.DataFrame:
+        """
+        Export comparison of delta-only vs delta+gamma to pandas DataFrame.
+
+        Returns:
+            DataFrame with both approximations and improvement metrics
+        """
+        rows = []
+        for s in self.scenarios:
+            row = {
+                'Scenario': s.name,
+                'PV_Shocked': f"{s.pv_shocked:,.0f}",
+                'Delta_Error_%': f"{s.error_pct * 100:.2f}",
+                'Delta_Pass': s.passed
+            }
+            if s.pv_delta_gamma_approx is not None:
+                row['DeltaGamma_Error_%'] = f"{s.error_delta_gamma_pct * 100:.4f}"
+                row['Improvement'] = f"{s.gamma_improvement_factor:.1f}x"
+                row['DG_Pass'] = s.passed_delta_gamma
+            rows.append(row)
+
+        return pd.DataFrame(rows)
+
     def __str__(self) -> str:
         """Pretty-print validation report."""
-        header = f"\n{'='*70}\n"
+        # Check if gamma was used
+        has_gamma = any(s.pv_delta_gamma_approx is not None for s in self.scenarios)
+
+        header = f"\n{'='*90}\n" if has_gamma else f"\n{'='*70}\n"
         header += f"CURVE SCENARIO VALIDATION: {self.curve_type.name}\n"
-        header += f"{'='*70}\n"
+        header += f"{'='*90}\n" if has_gamma else f"{'='*70}\n"
 
         summary = f"Number of scenarios: {len(self.scenarios)}\n"
+        summary += f"Approximation: {'Delta + Gamma' if has_gamma else 'Delta Only'}\n"
         summary += f"Tolerance: {self.tolerance*100:.2f}%\n"
-        summary += f"Status: {'ALL PASSED' if self.all_passed else 'SOME FAILED'}\n\n"
 
-        table = self.to_dataframe().to_string(index=False)
+        if has_gamma:
+            all_passed_gamma = all(s.passed_delta_gamma for s in self.scenarios if s.passed_delta_gamma is not None)
+            summary += f"Status (Delta-only): {'ALL PASSED' if self.all_passed else 'SOME FAILED'}\n"
+            summary += f"Status (Delta+Gamma): {'ALL PASSED' if all_passed_gamma else 'SOME FAILED'}\n\n"
+        else:
+            summary += f"Status: {'ALL PASSED' if self.all_passed else 'SOME FAILED'}\n\n"
+
+        # Table
+        if has_gamma:
+            table = self.to_dataframe_comparison().to_string(index=False)
+        else:
+            table = self.to_dataframe().to_string(index=False)
 
         # Summary stats
-        errors = [s.error_pct for s in self.scenarios]
         stats = f"\n\nSummary Statistics:\n"
-        stats += f"  Max error:  {max(errors)*100:.4f}%\n"
-        stats += f"  Mean error: {np.mean(errors)*100:.4f}%\n"
-        stats += f"  Min error:  {min(errors)*100:.4f}%\n"
+        if has_gamma:
+            errors_delta = [s.error_pct for s in self.scenarios]
+            errors_gamma = [s.error_delta_gamma_pct for s in self.scenarios if s.error_delta_gamma_pct is not None]
+            improvements = [s.gamma_improvement_factor for s in self.scenarios if s.gamma_improvement_factor is not None]
+
+            stats += f"  Delta-only errors:  Max={max(errors_delta)*100:.2f}%  Mean={np.mean(errors_delta)*100:.2f}%\n"
+            stats += f"  Delta+Gamma errors: Max={max(errors_gamma)*100:.4f}%  Mean={np.mean(errors_gamma)*100:.4f}%\n"
+            stats += f"  Gamma improvement:  Max={max(improvements):.1f}x  Mean={np.mean(improvements):.1f}x\n"
+        else:
+            errors = [s.error_pct for s in self.scenarios]
+            stats += f"  Max error:  {max(errors)*100:.4f}%\n"
+            stats += f"  Mean error: {np.mean(errors)*100:.4f}%\n"
+            stats += f"  Min error:  {min(errors)*100:.4f}%\n"
 
         return header + summary + table + stats
 
@@ -1109,8 +1166,8 @@ class GreekValidator:
         Returns:
             CrossGammaValidationReport with detailed comparison
         """
-        # Get AD cross-gamma
-        ad_cross_gamma = ad_result.risk.cross_gamma(curve_type_1, curve_type_2)
+        # Get AD cross-gamma (cross-gammas are stored in gamma field, not risk)
+        ad_cross_gamma = ad_result.gamma.cross_gamma(curve_type_1, curve_type_2)
         if ad_cross_gamma is None:
             raise ValueError(
                 f"No cross-gamma found for {curve_type_1.name} vs {curve_type_2.name}. "
@@ -1127,7 +1184,7 @@ class GreekValidator:
         bump_decimal = bump_bp / 100.0
 
         # Step 1: Compute base PV (PV_00)
-        pv_00 = self.instrument.position(self.model).compute([RequestTypes.VALUE]).value.amount
+        pv_00 = self.engine.compute(self.derivative, [RequestTypes.VALUE]).value.amount
 
         # Step 2: Compute single-bumped PVs for curve1 (PV_10 for each tenor)
         pv_10_list = []
@@ -1137,7 +1194,7 @@ class GreekValidator:
                 tenor_index=i,
                 bump_amount=bump_decimal
             )
-            pv_10 = self.instrument.position(model_10).compute([RequestTypes.VALUE]).value.amount
+            pv_10 = Engine(model_10).compute(self.derivative, [RequestTypes.VALUE]).value.amount
             pv_10_list.append(pv_10)
 
         # Step 3: Compute single-bumped PVs for curve2 (PV_01 for each tenor)
@@ -1148,7 +1205,7 @@ class GreekValidator:
                 tenor_index=j,
                 bump_amount=bump_decimal
             )
-            pv_01 = self.instrument.position(model_01).compute([RequestTypes.VALUE]).value.amount
+            pv_01 = Engine(model_01).compute(self.derivative, [RequestTypes.VALUE]).value.amount
             pv_01_list.append(pv_01)
 
         # Step 4: Compute double-bumped PVs (PV_11 for each pair [i, j])
@@ -1167,7 +1224,7 @@ class GreekValidator:
                     tenor_index_2=j,
                     bump_amount_2=bump_decimal
                 )
-                pv_11 = self.instrument.position(model_11).compute([RequestTypes.VALUE]).value.amount
+                pv_11 = Engine(model_11).compute(self.derivative, [RequestTypes.VALUE]).value.amount
 
                 # Compute cross-gamma via double finite difference
                 pv_10 = pv_10_list[i]
@@ -1483,24 +1540,26 @@ class GreekValidator:
         ad_result: AnalyticsResult,
         curve_type: Optional[CurveTypes] = None,
         scenarios: Optional[List[Dict[str, Any]]] = None,
-        tolerance: float = 0.05
+        tolerance: float = 0.05,
+        use_gamma: bool = True
     ) -> ScenarioValidationReport:
         """
-        Validate deltas under slope, skew, and butterfly scenarios.
+        Validate deltas (and optionally gammas) under slope, skew, and butterfly scenarios.
 
-        Tests how well individual tenor deltas aggregate to capture P&L changes
+        Tests how well individual tenor deltas (and gammas) aggregate to capture P&L changes
         under non-uniform curve shocks. Each scenario applies a different shock
         pattern (steepening, belly-up, butterfly, etc.) to validate that Greeks
         correctly handle complex curve movements.
 
         Args:
-            ad_result: AnalyticsResult containing AD deltas
+            ad_result: AnalyticsResult containing AD deltas (and optionally gammas)
             curve_type: Which curve to validate (if None, uses first curve)
             scenarios: List of scenario definitions. Each dict should have:
                 - 'type': 'slope', 'skew', or 'butterfly'
                 - 'shock_bp': shock magnitude in basis points
                 If None, uses default scenarios
             tolerance: Relative error tolerance (default 5%)
+            use_gamma: If True and gamma available, compute delta+gamma approximation (default True)
 
         Returns:
             ScenarioValidationReport with results for all scenarios
@@ -1544,10 +1603,31 @@ class GreekValidator:
 
         # Extract deltas
         delta_dict = self._extract_delta_ladder_as_dict(delta_obj)
+        delta_array = np.array([delta_dict[t] for t in delta_tenors])
 
         # Verify same length
         if len(curve_tenors) != len(delta_tenors):
             raise ValueError(f"Curve has {len(curve_tenors)} tenors but delta has {len(delta_tenors)} tenors")
+
+        # Extract gamma matrix if requested and available
+        gamma_matrix = None
+        if use_gamma and ad_result.gamma is not None:
+            try:
+                if isinstance(ad_result.gamma, Gamma):
+                    gamma_obj = ad_result.gamma
+                elif isinstance(ad_result.risk, Risk):
+                    gamma_obj = ad_result.gamma(curve_type)
+                else:
+                    gamma_obj = None
+
+                if gamma_obj is not None and hasattr(gamma_obj, 'risk_ladder'):
+                    gamma_matrix = np.array(gamma_obj.risk_ladder)
+                    print(f"  Using delta+gamma approximation (gamma matrix: {gamma_matrix.shape})")
+                else:
+                    print(f"  Gamma not available, using delta-only approximation")
+            except Exception as e:
+                print(f"  Warning: Could not extract gamma: {e}. Using delta-only approximation")
+                gamma_matrix = None
 
         # Define default scenarios if none provided
         if scenarios is None:
@@ -1589,10 +1669,40 @@ class GreekValidator:
                 delta_tenor = delta_tenors[i]
                 pv_delta_approx += delta_dict[delta_tenor] * shock_dict[curve_tenor]
 
-            # Compute errors
+            # Compute errors for delta-only
             error_abs = abs(pv_shocked - pv_delta_approx)
             error_pct = error_abs / abs(pv_shocked) if abs(pv_shocked) > 1e-10 else error_abs
             passed = error_pct < tolerance
+
+            # Compute delta+gamma approximation if gamma available
+            pv_delta_gamma_approx = None
+            error_delta_gamma_abs = None
+            error_delta_gamma_pct = None
+            gamma_improvement_factor = None
+            passed_delta_gamma = None
+
+            if gamma_matrix is not None:
+                # Build shock vector (aligned with delta tenors)
+                shock_vector = np.array([shock_dict[curve_tenors[i]] for i in range(len(curve_tenors))])
+
+                # Compute delta term: Σᵢ(Δᵢ × drᵢ)
+                delta_term = np.dot(delta_array, shock_vector)
+
+                # Compute gamma term: 0.5 × dR^T × Γ × dR
+                gamma_term = 0.5 * np.dot(shock_vector, np.dot(gamma_matrix, shock_vector))
+
+                # Total delta+gamma approximation
+                pv_delta_gamma_approx = pv_base + delta_term + gamma_term
+
+                # Compute errors for delta+gamma
+                error_delta_gamma_abs = abs(pv_shocked - pv_delta_gamma_approx)
+                error_delta_gamma_pct = error_delta_gamma_abs / abs(pv_shocked) if abs(pv_shocked) > 1e-10 else error_delta_gamma_abs
+
+                # Improvement factor
+                gamma_improvement_factor = error_abs / error_delta_gamma_abs if error_delta_gamma_abs > 1e-10 else np.inf
+
+                # Pass/fail for delta+gamma
+                passed_delta_gamma = error_delta_gamma_pct < tolerance
 
             # Create scenario result
             scenario_result = ScenarioResult(
@@ -1603,7 +1713,12 @@ class GreekValidator:
                 pv_delta_approx=pv_delta_approx,
                 error_abs=error_abs,
                 error_pct=error_pct,
-                passed=passed
+                passed=passed,
+                pv_delta_gamma_approx=pv_delta_gamma_approx,
+                error_delta_gamma_abs=error_delta_gamma_abs,
+                error_delta_gamma_pct=error_delta_gamma_pct,
+                gamma_improvement_factor=gamma_improvement_factor,
+                passed_delta_gamma=passed_delta_gamma
             )
             scenario_results.append(scenario_result)
 
@@ -1907,13 +2022,27 @@ class GreekValidator:
             raise ValueError(f"No stored parameters found for curve '{curve_name}'")
 
         params = self.model._curve_params_dict[curve_name].copy()
-        base_px = params["px_list"].copy()
-        tenors = params["tenor_list"]
 
-        # Bump the specific tenor (px_list is in percentage points)
-        # bump_amount is already in percentage points (e.g., 0.01 for 1bp)
-        bumped_px = base_px.copy()
-        bumped_px[tenor_index] += bump_amount
+        # Detect curve type and bump appropriately
+        is_xccy_curve = "basis_spreads" in params
+
+        if is_xccy_curve:
+            # XCCY curve: bump basis_spreads
+            base_spreads = params["basis_spreads"].copy()
+            tenors = params["tenor_list"]
+            bumped_spreads = base_spreads.copy()
+            bumped_spreads[tenor_index] += bump_amount
+            # We'll use these later in Phase 2
+            bumped_values = bumped_spreads
+        else:
+            # OIS curve: bump px_list
+            base_px = params["px_list"].copy()
+            tenors = params["tenor_list"]
+            # Bump the specific tenor (px_list is in percentage points)
+            # bump_amount is already in percentage points (e.g., 0.01 for 1bp)
+            bumped_px = base_px.copy()
+            bumped_px[tenor_index] += bump_amount
+            bumped_values = bumped_px
 
         # Create new model (start fresh to avoid mutation)
         new_model = Model(value_dt=self.model.value_dt)
@@ -1925,7 +2054,7 @@ class GreekValidator:
         # Phase 1: Rebuild all OIS curves first (with bumps applied)
         # Phase 2: Rebuild XCCY curves (which depend on OIS curves)
 
-        # Phase 1: Rebuild OIS curves
+        # Phase 1: Rebuild OIS curves (non-XCCY curves)
         for curve_name_iter in self.model._curves_dict.keys():
             if curve_name_iter not in self.model._curve_params_dict:
                 continue  # Skip curves without stored params
@@ -1938,10 +2067,10 @@ class GreekValidator:
                 continue  # Skip XCCY curves in Phase 1
 
             # This is an OIS curve - rebuild it
-            if curve_name_iter == curve_name:
-                # This is the curve being bumped
+            if curve_name_iter == curve_name and not is_xccy_curve:
+                # This is the OIS curve being bumped
                 params_bumped = params.copy()
-                params_bumped["px_list"] = bumped_px
+                params_bumped["px_list"] = bumped_values
                 new_model.build_curve(name=curve_name_iter, **params_bumped)
             else:
                 # Other OIS curve - copy unchanged
@@ -1957,8 +2086,14 @@ class GreekValidator:
             # Check if this is an XCCY curve
             if "domestic_curve_name" in params_iter:
                 # This is an XCCY curve - rebuild with build_xccy_curve()
-                # This automatically picks up the updated OIS curves
-                new_model.build_xccy_curve(name=curve_name_iter, **params_iter)
+                if curve_name_iter == curve_name and is_xccy_curve:
+                    # This is the XCCY curve being bumped
+                    params_bumped = params.copy()
+                    params_bumped["basis_spreads"] = bumped_values
+                    new_model.build_xccy_curve(name=curve_name_iter, **params_bumped)
+                else:
+                    # Other XCCY curve - copy unchanged (but picks up any bumped OIS curves)
+                    new_model.build_xccy_curve(name=curve_name_iter, **params_iter)
 
         return new_model
 
@@ -1997,12 +2132,25 @@ class GreekValidator:
         params_1 = self.model._curve_params_dict[curve_name_1].copy()
         params_2 = self.model._curve_params_dict[curve_name_2].copy()
 
-        # Bump the specific tenors
-        bumped_px_1 = params_1["px_list"].copy()
-        bumped_px_1[tenor_index_1] += bump_amount_1
+        # Detect curve types and bump appropriately
+        is_xccy_1 = "basis_spreads" in params_1
+        is_xccy_2 = "basis_spreads" in params_2
 
-        bumped_px_2 = params_2["px_list"].copy()
-        bumped_px_2[tenor_index_2] += bump_amount_2
+        # Bump curve 1
+        if is_xccy_1:
+            bumped_values_1 = params_1["basis_spreads"].copy()
+            bumped_values_1[tenor_index_1] += bump_amount_1
+        else:
+            bumped_values_1 = params_1["px_list"].copy()
+            bumped_values_1[tenor_index_1] += bump_amount_1
+
+        # Bump curve 2
+        if is_xccy_2:
+            bumped_values_2 = params_2["basis_spreads"].copy()
+            bumped_values_2[tenor_index_2] += bump_amount_2
+        else:
+            bumped_values_2 = params_2["px_list"].copy()
+            bumped_values_2[tenor_index_2] += bump_amount_2
 
         # Create new model
         new_model = Model(value_dt=self.model.value_dt)
@@ -2024,15 +2172,15 @@ class GreekValidator:
                 continue  # Skip XCCY curves in Phase 1
 
             # This is an OIS curve - rebuild it
-            if curve_name_iter == curve_name_1:
-                # This is curve 1 being bumped
+            if curve_name_iter == curve_name_1 and not is_xccy_1:
+                # This is curve 1 being bumped (OIS curve)
                 params_bumped = params_1.copy()
-                params_bumped["px_list"] = bumped_px_1
+                params_bumped["px_list"] = bumped_values_1
                 new_model.build_curve(name=curve_name_iter, **params_bumped)
-            elif curve_name_iter == curve_name_2:
-                # This is curve 2 being bumped (if it's also an OIS curve)
+            elif curve_name_iter == curve_name_2 and not is_xccy_2:
+                # This is curve 2 being bumped (OIS curve)
                 params_bumped = params_2.copy()
-                params_bumped["px_list"] = bumped_px_2
+                params_bumped["px_list"] = bumped_values_2
                 new_model.build_curve(name=curve_name_iter, **params_bumped)
             else:
                 # Other OIS curve - copy unchanged
@@ -2048,10 +2196,15 @@ class GreekValidator:
             # Check if this is an XCCY curve
             if "domestic_curve_name" in params_iter:
                 # This is an XCCY curve - rebuild with build_xccy_curve()
-                if curve_name_iter == curve_name_2:
-                    # This is curve 2 being bumped (if it's an XCCY curve)
+                if curve_name_iter == curve_name_1 and is_xccy_1:
+                    # This is curve 1 being bumped (XCCY curve)
+                    params_bumped = params_1.copy()
+                    params_bumped["basis_spreads"] = bumped_values_1
+                    new_model.build_xccy_curve(name=curve_name_iter, **params_bumped)
+                elif curve_name_iter == curve_name_2 and is_xccy_2:
+                    # This is curve 2 being bumped (XCCY curve)
                     params_bumped = params_2.copy()
-                    params_bumped["px_list"] = bumped_px_2
+                    params_bumped["basis_spreads"] = bumped_values_2
                     new_model.build_xccy_curve(name=curve_name_iter, **params_bumped)
                 else:
                     # Other XCCY curve - rebuild with updated OIS curves

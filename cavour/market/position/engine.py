@@ -2313,7 +2313,7 @@ class Engine:
         # Get XCCY curve and spot FX
         foreign_code = derivative._foreign_currency.name
         domestic_code = derivative._domestic_currency.name
-        xccy_curve_name = f"{foreign_code}_{domestic_code}_BASIS"
+        xccy_curve_name = f"{domestic_code}_{foreign_code}_BASIS"  # Match CurveTypes enum pattern
 
         try:
             xccy_curve = getattr(self.model.curves, xccy_curve_name)
@@ -2355,42 +2355,80 @@ class Engine:
         dc_type = derivative._domestic_leg._dc_type
         value_time = times_from_dates(self.model.value_dt, self.model.value_dt, dc_type)
 
-        # Domestic leg parameters
-        dom_payment_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
-                                       for dt in derivative._domestic_leg._payment_dts])
-        dom_start_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
-                                     for dt in derivative._domestic_leg._start_accrued_dts])
-        dom_end_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
-                                   for dt in derivative._domestic_leg._end_accrued_dts])
-        dom_alphas = jnp.array(derivative._domestic_leg._year_fracs)
-        # Fixed legs don't have _spread, use 0.0. Float legs have _spread.
-        dom_spreads = jnp.full_like(dom_alphas, getattr(derivative._domestic_leg, '_spread', 0.0))
-        dom_notionals = jnp.array(getattr(derivative._domestic_leg, '_notional_array', None) or
-                                  [derivative._domestic_leg._notional] * len(dom_alphas))
-        dom_principal = derivative._domestic_leg._principal
-        dom_leg_sign = +1.0 if derivative._domestic_leg._leg_type == SwapTypes.RECEIVE else -1.0
+        # Detect leg types to route appropriately (following VALUE section pattern)
+        from cavour.trades.rates.swap_fixed_leg import SwapFixedLeg
+        is_domestic_fixed = isinstance(derivative._domestic_leg, SwapFixedLeg)
+        is_foreign_fixed = isinstance(derivative._foreign_leg, SwapFixedLeg)
 
-        # Foreign leg parameters
-        # For forward rates: use foreign leg's day count (ACT_360) to match foreign OIS curve
-        # For discounting: use XCCY curve's day count (ACT_365F) for proper interpolation
-        for_dc_type = derivative._foreign_leg._dc_type  # ACT_360 for forward rates
+        # Domestic leg parameters (conditional based on leg type)
+        if is_domestic_fixed:
+            # Fixed leg: extract predetermined payments
+            dom_payment_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                           for dt in derivative._domestic_leg._payment_dts])
+            dom_payments = jnp.array(derivative._domestic_leg._payments)
+            dom_principal = derivative._domestic_leg._principal
+            dom_notional = derivative._domestic_leg._notional
+            dom_leg_sign = +1.0 if derivative._domestic_leg._leg_type == SwapTypes.RECEIVE else -1.0
+
+            # Fixed legs always have notional exchanges in XCCY
+            dom_notional_exchange = True
+            dom_notional_exchange_amount = derivative._domestic_leg._notional
+        else:
+            # Floating leg: extract forward rate parameters
+            dom_payment_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                           for dt in derivative._domestic_leg._payment_dts])
+            dom_start_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                         for dt in derivative._domestic_leg._start_accrued_dts])
+            dom_end_times = jnp.array([times_from_dates(dt, self.model.value_dt, dc_type)
+                                       for dt in derivative._domestic_leg._end_accrued_dts])
+            dom_alphas = jnp.array(derivative._domestic_leg._year_fracs)
+            dom_spreads = jnp.full_like(dom_alphas, derivative._domestic_leg._spread)
+            dom_notionals = jnp.array(getattr(derivative._domestic_leg, '_notional_array', None) or
+                                      [derivative._domestic_leg._notional] * len(dom_alphas))
+            dom_principal = derivative._domestic_leg._principal
+            dom_leg_sign = +1.0 if derivative._domestic_leg._leg_type == SwapTypes.RECEIVE else -1.0
+
+            dom_notional_exchange = getattr(derivative._domestic_leg, '_notional_exchange', True)
+            dom_notional_exchange_amount = derivative._domestic_leg._notional
+
+        # Foreign leg parameters (conditional based on leg type)
+        # For discounting: ALWAYS use XCCY curve's day count (ACT_365F)
         xccy_dc_type = xccy_curve._dc_type  # ACT_365F for discounting
 
-        # Payment times for discounting (must match XCCY curve times)
-        for_payment_times = jnp.array([times_from_dates(dt, self.model.value_dt, xccy_dc_type)
-                                       for dt in derivative._foreign_leg._payment_dts])
-        # Start/end times for forward rates (must match foreign OIS curve times)
-        for_start_times = jnp.array([times_from_dates(dt, self.model.value_dt, for_dc_type)
-                                     for dt in derivative._foreign_leg._start_accrued_dts])
-        for_end_times = jnp.array([times_from_dates(dt, self.model.value_dt, for_dc_type)
-                                   for dt in derivative._foreign_leg._end_accrued_dts])
-        for_alphas = jnp.array(derivative._foreign_leg._year_fracs)
-        # Fixed legs don't have _spread, use 0.0. Float legs have _spread.
-        for_spreads = jnp.full_like(for_alphas, getattr(derivative._foreign_leg, '_spread', 0.0))
-        for_notionals = jnp.array(getattr(derivative._foreign_leg, '_notional_array', None) or
-                                  [derivative._foreign_leg._notional] * len(for_alphas))
-        for_principal = derivative._foreign_leg._principal
-        for_leg_sign = +1.0 if derivative._foreign_leg._leg_type == SwapTypes.RECEIVE else -1.0
+        if is_foreign_fixed:
+            # Fixed leg: extract predetermined payments (only need discounting, no forward rates)
+            for_payment_times = jnp.array([times_from_dates(dt, self.model.value_dt, xccy_dc_type)
+                                           for dt in derivative._foreign_leg._payment_dts])
+            for_payments = jnp.array(derivative._foreign_leg._payments)
+            for_principal = derivative._foreign_leg._principal
+            for_notional = derivative._foreign_leg._notional
+            for_leg_sign = +1.0 if derivative._foreign_leg._leg_type == SwapTypes.RECEIVE else -1.0
+
+            # Fixed legs always have notional exchanges in XCCY
+            for_notional_exchange = True
+            for_notional_exchange_amount = derivative._foreign_leg._notional
+        else:
+            # Floating leg: extract forward rate parameters
+            # For forward rates: use foreign leg's day count (ACT_360) to match foreign OIS curve
+            for_dc_type = derivative._foreign_leg._dc_type  # ACT_360 for forward rates
+
+            # Payment times for discounting (must match XCCY curve times)
+            for_payment_times = jnp.array([times_from_dates(dt, self.model.value_dt, xccy_dc_type)
+                                           for dt in derivative._foreign_leg._payment_dts])
+            # Start/end times for forward rates (must match foreign OIS curve times)
+            for_start_times = jnp.array([times_from_dates(dt, self.model.value_dt, for_dc_type)
+                                         for dt in derivative._foreign_leg._start_accrued_dts])
+            for_end_times = jnp.array([times_from_dates(dt, self.model.value_dt, for_dc_type)
+                                       for dt in derivative._foreign_leg._end_accrued_dts])
+            for_alphas = jnp.array(derivative._foreign_leg._year_fracs)
+            for_spreads = jnp.full_like(for_alphas, derivative._foreign_leg._spread)
+            for_notionals = jnp.array(getattr(derivative._foreign_leg, '_notional_array', None) or
+                                      [derivative._foreign_leg._notional] * len(for_alphas))
+            for_principal = derivative._foreign_leg._principal
+            for_leg_sign = +1.0 if derivative._foreign_leg._leg_type == SwapTypes.RECEIVE else -1.0
+
+            for_notional_exchange = getattr(derivative._foreign_leg, '_notional_exchange', True)
+            for_notional_exchange_amount = derivative._foreign_leg._notional
 
         # Compute effective and maturity times for notional exchanges
         # Use discount curve's day count for discounting times
@@ -2403,55 +2441,91 @@ class Engine:
         # Compute VALUE using JAX
         value = None
         if RequestTypes.VALUE in reqs:
-            # Domestic leg PV (single curve)
-            dom_pv = self._float_leg_jax(
-                dfs=dom_dfs,
-                times=dom_times,
-                disc_interp_type=domestic_model._interp_type,
-                idx_interp_type=domestic_model._interp_type,
-                payment_times=dom_payment_times,
-                start_times=dom_start_times,
-                end_times=dom_end_times,
-                pay_alphas=dom_alphas,
-                spreads=dom_spreads,
-                notionals=dom_notionals,
-                principal=dom_principal,
-                leg_sign=dom_leg_sign,
-                value_time=value_time,
-                first_fixing_rate=0.0,
-                override_first=False,
-                idx_times=None,
-                idx_dfs=None,
-                notional_exchange=getattr(derivative._domestic_leg, '_notional_exchange', True),
-                notional_exchange_amount=derivative._domestic_leg._notional,
-                effective_time=dom_effective_time,
-                maturity_time=dom_maturity_time
-            )
+            # Domestic leg PV (conditional based on leg type)
+            if is_domestic_fixed:
+                # Fixed leg: predetermined payments
+                dom_pv = self._fixed_leg_jax(
+                    dfs=dom_dfs,
+                    times=dom_times,
+                    disc_interp_type=domestic_model._interp_type,
+                    payment_times=dom_payment_times,
+                    payments=dom_payments,
+                    principal=dom_principal,
+                    leg_sign=dom_leg_sign,
+                    value_time=value_time,
+                    notional_exchange=dom_notional_exchange,
+                    notional_exchange_amount=dom_notional_exchange_amount,
+                    effective_time=dom_effective_time,
+                    maturity_time=dom_maturity_time
+                )
+            else:
+                # Floating leg: forward rate projection
+                dom_pv = self._float_leg_jax(
+                    dfs=dom_dfs,
+                    times=dom_times,
+                    disc_interp_type=domestic_model._interp_type,
+                    idx_interp_type=domestic_model._interp_type,
+                    payment_times=dom_payment_times,
+                    start_times=dom_start_times,
+                    end_times=dom_end_times,
+                    pay_alphas=dom_alphas,
+                    spreads=dom_spreads,
+                    notionals=dom_notionals,
+                    principal=dom_principal,
+                    leg_sign=dom_leg_sign,
+                    value_time=value_time,
+                    first_fixing_rate=0.0,
+                    override_first=False,
+                    idx_times=None,
+                    idx_dfs=None,
+                    notional_exchange=dom_notional_exchange,
+                    notional_exchange_amount=dom_notional_exchange_amount,
+                    effective_time=dom_effective_time,
+                    maturity_time=dom_maturity_time
+                )
 
-            # Foreign leg PV (dual curve: XCCY for discount, foreign OIS for index)
-            for_pv = self._float_leg_jax(
-                dfs=xccy_dfs,  # XCCY curve for discounting
-                times=xccy_times,
-                disc_interp_type=xccy_curve._interp_type,
-                idx_interp_type=foreign_model._interp_type,
-                payment_times=for_payment_times,
-                start_times=for_start_times,
-                end_times=for_end_times,
-                pay_alphas=for_alphas,
-                spreads=for_spreads,
-                notionals=for_notionals,
-                principal=for_principal,
-                leg_sign=for_leg_sign,
-                value_time=value_time,
-                first_fixing_rate=0.0,
-                override_first=False,
-                idx_times=for_times,  # Foreign OIS for forward rates
-                idx_dfs=for_dfs,
-                notional_exchange=getattr(derivative._foreign_leg, '_notional_exchange', True),
-                notional_exchange_amount=derivative._foreign_leg._notional,
-                effective_time=for_effective_time,
-                maturity_time=for_maturity_time
-            )
+            # Foreign leg PV (conditional based on leg type)
+            if is_foreign_fixed:
+                # Fixed leg: predetermined payments, XCCY discounting only
+                for_pv = self._fixed_leg_jax(
+                    dfs=xccy_dfs,
+                    times=xccy_times,
+                    disc_interp_type=xccy_curve._interp_type,
+                    payment_times=for_payment_times,
+                    payments=for_payments,
+                    principal=for_principal,
+                    leg_sign=for_leg_sign,
+                    value_time=value_time,
+                    notional_exchange=for_notional_exchange,
+                    notional_exchange_amount=for_notional_exchange_amount,
+                    effective_time=for_effective_time,
+                    maturity_time=for_maturity_time
+                )
+            else:
+                # Floating leg: dual curve (XCCY for discount, foreign OIS for index)
+                for_pv = self._float_leg_jax(
+                    dfs=xccy_dfs,  # XCCY curve for discounting
+                    times=xccy_times,
+                    disc_interp_type=xccy_curve._interp_type,
+                    idx_interp_type=foreign_model._interp_type,
+                    payment_times=for_payment_times,
+                    start_times=for_start_times,
+                    end_times=for_end_times,
+                    pay_alphas=for_alphas,
+                    spreads=for_spreads,
+                    notionals=for_notionals,
+                    principal=for_principal,
+                    leg_sign=for_leg_sign,
+                    value_time=value_time,
+                    first_fixing_rate=0.0,
+                    override_first=False,
+                    idx_times=for_times,  # Foreign OIS for forward rates
+                    idx_dfs=for_dfs,
+                    notional_exchange=for_notional_exchange,
+                    notional_exchange_amount=for_notional_exchange_amount,
+                    effective_time=for_effective_time,
+                    maturity_time=for_maturity_time
+                )
 
             # Convert to scalars and compute total PV
             # spot_fx is USD/GBP (domestic/foreign)
@@ -2465,60 +2539,116 @@ class Engine:
         # These functions compute PV as a function of different curve variables
 
         # Domestic leg PV as function of domestic DFs
-        def pv_dom_fn(dom_dfs_var):
-            return self._float_leg_jax(
-                dfs=dom_dfs_var, times=dom_times,
-                disc_interp_type=domestic_model._interp_type,
-                idx_interp_type=domestic_model._interp_type,
-                payment_times=dom_payment_times,
-                start_times=dom_start_times, end_times=dom_end_times,
-                pay_alphas=dom_alphas, spreads=dom_spreads,
-                notionals=dom_notionals, principal=dom_principal,
-                leg_sign=dom_leg_sign, value_time=value_time,
-                first_fixing_rate=0.0, override_first=False,
-                notional_exchange=getattr(derivative._domestic_leg, '_notional_exchange', True),
-                notional_exchange_amount=derivative._domestic_leg._notional,
-                effective_time=dom_effective_time,
-                maturity_time=dom_maturity_time
-            )
+        if is_domestic_fixed:
+            # Fixed leg: predetermined payments, only discounting varies with DFs
+            def pv_dom_fn(dom_dfs_var):
+                return self._fixed_leg_jax(
+                    dfs=dom_dfs_var, times=dom_times,
+                    disc_interp_type=domestic_model._interp_type,
+                    payment_times=dom_payment_times,
+                    payments=dom_payments,
+                    principal=dom_principal,
+                    leg_sign=dom_leg_sign,
+                    value_time=value_time,
+                    notional_exchange=dom_notional_exchange,
+                    notional_exchange_amount=dom_notional_exchange_amount,
+                    effective_time=dom_effective_time,
+                    maturity_time=dom_maturity_time
+                )
+        else:
+            # Floating leg: forward rates and discounting vary with DFs
+            def pv_dom_fn(dom_dfs_var):
+                return self._float_leg_jax(
+                    dfs=dom_dfs_var, times=dom_times,
+                    disc_interp_type=domestic_model._interp_type,
+                    idx_interp_type=domestic_model._interp_type,
+                    payment_times=dom_payment_times,
+                    start_times=dom_start_times, end_times=dom_end_times,
+                    pay_alphas=dom_alphas, spreads=dom_spreads,
+                    notionals=dom_notionals, principal=dom_principal,
+                    leg_sign=dom_leg_sign, value_time=value_time,
+                    first_fixing_rate=0.0, override_first=False,
+                    notional_exchange=dom_notional_exchange,
+                    notional_exchange_amount=dom_notional_exchange_amount,
+                    effective_time=dom_effective_time,
+                    maturity_time=dom_maturity_time
+                )
 
         # Foreign leg PV as function of foreign OIS DFs (for direct forward rate effect)
-        def pv_for_fn(for_ois_dfs_var):
-            return self._float_leg_jax(
-                dfs=xccy_dfs, times=xccy_times,  # XCCY curve for discounting (FIXED)
-                disc_interp_type=xccy_curve._interp_type,
-                idx_interp_type=foreign_model._interp_type,
-                payment_times=for_payment_times,
-                start_times=for_start_times, end_times=for_end_times,
-                pay_alphas=for_alphas, spreads=for_spreads,
-                notionals=for_notionals, principal=for_principal,
-                leg_sign=for_leg_sign, value_time=value_time,
-                first_fixing_rate=0.0, override_first=False,
-                idx_times=for_times, idx_dfs=for_ois_dfs_var,  # Foreign OIS DFs (VARIABLE)
-                notional_exchange=getattr(derivative._foreign_leg, '_notional_exchange', True),
-                notional_exchange_amount=derivative._foreign_leg._notional,
-                effective_time=for_effective_time,
-                maturity_time=for_maturity_time
-            )
+        if is_foreign_fixed:
+            # Fixed leg: NO dependency on foreign OIS DFs (no forward rates)
+            # Return constant PV (gradient will be zero) to maintain consistency
+            def pv_for_fn(for_ois_dfs_var):
+                # Fixed payments discounted at XCCY curve (independent of for_ois_dfs_var)
+                return self._fixed_leg_jax(
+                    dfs=xccy_dfs, times=xccy_times,  # XCCY curve for discounting (FIXED)
+                    disc_interp_type=xccy_curve._interp_type,
+                    payment_times=for_payment_times,
+                    payments=for_payments,
+                    principal=for_principal,
+                    leg_sign=for_leg_sign,
+                    value_time=value_time,
+                    notional_exchange=for_notional_exchange,
+                    notional_exchange_amount=for_notional_exchange_amount,
+                    effective_time=for_effective_time,
+                    maturity_time=for_maturity_time
+                )
+        else:
+            # Floating leg: forward rates depend on foreign OIS DFs
+            def pv_for_fn(for_ois_dfs_var):
+                return self._float_leg_jax(
+                    dfs=xccy_dfs, times=xccy_times,  # XCCY curve for discounting (FIXED)
+                    disc_interp_type=xccy_curve._interp_type,
+                    idx_interp_type=foreign_model._interp_type,
+                    payment_times=for_payment_times,
+                    start_times=for_start_times, end_times=for_end_times,
+                    pay_alphas=for_alphas, spreads=for_spreads,
+                    notionals=for_notionals, principal=for_principal,
+                    leg_sign=for_leg_sign, value_time=value_time,
+                    first_fixing_rate=0.0, override_first=False,
+                    idx_times=for_times, idx_dfs=for_ois_dfs_var,  # Foreign OIS DFs (VARIABLE)
+                    notional_exchange=for_notional_exchange,
+                    notional_exchange_amount=for_notional_exchange_amount,
+                    effective_time=for_effective_time,
+                    maturity_time=for_maturity_time
+                )
 
         # Foreign leg PV as function of XCCY DFs (for basis delta and cross-gamma)
-        def pv_xccy_fn(xccy_dfs_var):
-            return self._float_leg_jax(
-                dfs=xccy_dfs_var, times=xccy_times,  # XCCY curve for discounting (VARIABLE)
-                disc_interp_type=xccy_curve._interp_type,
-                idx_interp_type=foreign_model._interp_type,
-                payment_times=for_payment_times,
-                start_times=for_start_times, end_times=for_end_times,
-                pay_alphas=for_alphas, spreads=for_spreads,
-                notionals=for_notionals, principal=for_principal,
-                leg_sign=for_leg_sign, value_time=value_time,
-                first_fixing_rate=0.0, override_first=False,
-                idx_times=for_times, idx_dfs=for_dfs,  # Foreign OIS DFs (FIXED)
-                notional_exchange=getattr(derivative._foreign_leg, '_notional_exchange', True),
-                notional_exchange_amount=derivative._foreign_leg._notional,
-                effective_time=for_effective_time,
-                maturity_time=for_maturity_time
-            )
+        if is_foreign_fixed:
+            # Fixed leg: discounting depends on XCCY DFs (basis spread sensitivity)
+            def pv_xccy_fn(xccy_dfs_var):
+                return self._fixed_leg_jax(
+                    dfs=xccy_dfs_var, times=xccy_times,  # XCCY curve for discounting (VARIABLE)
+                    disc_interp_type=xccy_curve._interp_type,
+                    payment_times=for_payment_times,
+                    payments=for_payments,
+                    principal=for_principal,
+                    leg_sign=for_leg_sign,
+                    value_time=value_time,
+                    notional_exchange=for_notional_exchange,
+                    notional_exchange_amount=for_notional_exchange_amount,
+                    effective_time=for_effective_time,
+                    maturity_time=for_maturity_time
+                )
+        else:
+            # Floating leg: discounting and forward rates both depend on curves
+            def pv_xccy_fn(xccy_dfs_var):
+                return self._float_leg_jax(
+                    dfs=xccy_dfs_var, times=xccy_times,  # XCCY curve for discounting (VARIABLE)
+                    disc_interp_type=xccy_curve._interp_type,
+                    idx_interp_type=foreign_model._interp_type,
+                    payment_times=for_payment_times,
+                    start_times=for_start_times, end_times=for_end_times,
+                    pay_alphas=for_alphas, spreads=for_spreads,
+                    notionals=for_notionals, principal=for_principal,
+                    leg_sign=for_leg_sign, value_time=value_time,
+                    first_fixing_rate=0.0, override_first=False,
+                    idx_times=for_times, idx_dfs=for_dfs,  # Foreign OIS DFs (FIXED)
+                    notional_exchange=for_notional_exchange,
+                    notional_exchange_amount=for_notional_exchange_amount,
+                    effective_time=for_effective_time,
+                    maturity_time=for_maturity_time
+                )
 
         # Wrapper functions for "original" DFs (excluding prepended t≈0)
         # IMPORTANT: DF(t≈0) = 1.0 is a boundary condition, NOT a curve parameter.
@@ -3008,7 +3138,7 @@ class Engine:
         # Get XCCY curve and spot FX
         foreign_code = derivative._foreign_currency.name
         domestic_code = derivative._domestic_currency.name
-        xccy_curve_name = f"{foreign_code}_{domestic_code}_BASIS"
+        xccy_curve_name = f"{domestic_code}_{foreign_code}_BASIS"  # Match CurveTypes enum pattern
 
         try:
             xccy_curve = getattr(self.model.curves, xccy_curve_name)
@@ -3539,7 +3669,99 @@ class Engine:
         # sum them up:
         leg_pv = jnp.sum(pv_coupons, axis=-1) + pv_prin          # [...]
         return leg_sign * leg_pv
-    
+
+    def _fixed_leg_jax(self,
+                       dfs,                          # Discount factors [N]
+                       times,                        # Times [N]
+                       disc_interp_type,             # Interpolation type
+                       payment_times,                # [M] - payment dates
+                       payments,                     # [M] - fixed payment amounts
+                       principal: float,             # scalar - principal payment
+                       leg_sign: float,              # +1 or -1
+                       value_time: float,            # scalar - valuation time
+                       notional_exchange=False,      # bool - enable notional exchanges
+                       notional_exchange_amount=0.0, # scalar - notional amount
+                       effective_time=0.0,           # scalar - effective date time
+                       maturity_time=0.0             # scalar - maturity date time
+                       ):
+        """
+        JAX-compatible fixed leg pricing with optional notional exchanges for XCCY swaps.
+
+        Similar to _price_fixed_leg_jax() but with XCCY notional exchange support.
+        Used for AD-based GAMMA computation in _compute_xccy().
+
+        Args:
+            dfs: Discount factors array
+            times: Time grid for interpolation
+            disc_interp_type: Interpolation method
+            payment_times: Payment date times [M]
+            payments: Fixed payment amounts [M]
+            principal: Principal payment (typically 0 for swaps)
+            leg_sign: +1 for receive, -1 for pay
+            value_time: Valuation date time
+            notional_exchange: Enable XCCY notional exchanges
+            notional_exchange_amount: Notional amount for exchanges
+            effective_time: Effective date time (for initial exchange)
+            maturity_time: Maturity date time (for final exchange)
+
+        Returns:
+            Scalar PV of fixed leg with notional exchanges
+
+        Mathematical formula:
+            PV = sign × [Σ(payment_i × DF(t_i)) + principal × DF(t_final)
+                        - notional × DF(t_eff) + notional × DF(t_mat)]
+        """
+        from cavour.market.curves.interpolator_ad import InterpolatorAd
+
+        interp = InterpolatorAd(disc_interp_type)
+
+        # Discount factor at valuation date
+        df_val = jnp.atleast_1d(interp.simple_interpolate(value_time, times, dfs, disc_interp_type.value))
+
+        # Discount factors at payment dates
+        df_pmts = jnp.atleast_1d(interp.simple_interpolate(payment_times, times, dfs, disc_interp_type.value))
+
+        # Mask for future payments
+        mask = payment_times > value_time  # [M]
+        mask = jnp.broadcast_to(mask, df_pmts.shape)
+
+        # Relative discount factors
+        df_rel = df_pmts / df_val[..., None]  # [..., M]
+
+        # PV of fixed coupons
+        pv_coupons = jnp.where(mask, payments * df_rel, 0.0)  # [..., M]
+
+        # PV of principal (typically 0 for swaps)
+        final_mask = mask[..., -1]
+        final_df_rel = df_rel[..., -1]
+        pv_prin = jnp.where(final_mask, principal * final_df_rel, 0.0)
+
+        # Notional exchanges (for XCCY swaps)
+        # Start exchange: -notional at effective_dt (outflow)
+        df_effective = jnp.atleast_1d(interp.simple_interpolate(effective_time, times, dfs, disc_interp_type.value))
+        df_effective_rel = df_effective / df_val
+        pv_start_exchange = jnp.where(effective_time >= value_time,
+                                      -notional_exchange_amount * df_effective_rel,
+                                      0.0)
+
+        # End exchange: +notional at maturity_dt (inflow)
+        df_maturity = jnp.atleast_1d(interp.simple_interpolate(maturity_time, times, dfs, disc_interp_type.value))
+        df_maturity_rel = df_maturity / df_val
+        pv_end_exchange = jnp.where(maturity_time >= value_time,
+                                    notional_exchange_amount * df_maturity_rel,
+                                    0.0)
+
+        # Multiply by boolean flag (True→1.0, False→0.0 in JAX)
+        # Convert boolean to float explicitly
+        notional_exchange_float = jnp.where(notional_exchange, 1.0, 0.0)
+        pv_notional_exchange = jnp.squeeze(pv_start_exchange + pv_end_exchange) * notional_exchange_float
+
+        # Total PV
+        pv_coupons_sum = jnp.sum(pv_coupons, axis=-1)
+        leg_pv = pv_coupons_sum + pv_prin + pv_notional_exchange
+
+        return leg_sign * leg_pv
+
     def value_fixed_leg(self,
                         swap_rates,
                         swap_times,
