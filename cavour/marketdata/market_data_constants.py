@@ -234,3 +234,151 @@ FX_MARKET_DATA = {
         "ticker": "USDRON Curncy"
     }
 }
+
+###############################################################################
+# STIR Futures Market Data
+###############################################################################
+
+# Futures month codes (CME standard)
+# Used for constructing futures tickers (e.g., H=March, M=June, U=September, Z=December)
+FUTURES_MONTH_CODES = {
+    1: 'F',   # January
+    2: 'G',   # February
+    3: 'H',   # March (IMM)
+    4: 'J',   # April
+    5: 'K',   # May
+    6: 'M',   # June (IMM)
+    7: 'N',   # July
+    8: 'Q',   # August
+    9: 'U',   # September (IMM)
+    10: 'V',  # October
+    11: 'X',  # November
+    12: 'Z'   # December (IMM)
+}
+
+# IMM months only (quarterly contracts, most liquid)
+IMM_MONTH_CODES = {3: 'H', 6: 'M', 9: 'U', 12: 'Z'}
+
+# Futures ticker roots by currency (Bloomberg convention)
+FUTURES_TICKER_ROOTS = {
+    "USD": "SFR",   # CME SOFR 3-Month Futures
+    "GBP": "FS",    # ICE SONIA 3-Month Futures (Short Sterling replacement)
+    "EUR": "FES"    # Eurex Three-Month ESTR Futures
+}
+
+# Reverse mapping for parsing tickers
+TICKER_ROOT_TO_CURRENCY = {v: k for k, v in FUTURES_TICKER_ROOTS.items()}
+
+
+def construct_futures_ticker(currency: str, month: int, year: int) -> str:
+    """
+    Construct Bloomberg STIR futures ticker.
+
+    Args:
+        currency: Currency code string ("USD", "GBP", "EUR")
+        month: Month number (1-12)
+        year: 4-digit year (e.g., 2024)
+
+    Returns:
+        Bloomberg ticker string (e.g., "SFRH24 Comdty")
+
+    Examples:
+        >>> construct_futures_ticker("USD", 3, 2024)
+        'SFRH24 Comdty'  # SOFR March 2024
+
+        >>> construct_futures_ticker("GBP", 6, 2024)
+        'FSM24 Comdty'  # SONIA June 2024
+
+        >>> construct_futures_ticker("EUR", 9, 2024)
+        'FESU24 Comdty'  # ESTR September 2024
+
+    Raises:
+        ValueError: If currency not supported or month invalid
+    """
+    if currency not in FUTURES_TICKER_ROOTS:
+        raise ValueError(
+            f"Currency {currency} not supported for futures. "
+            f"Supported: {list(FUTURES_TICKER_ROOTS.keys())}"
+        )
+
+    if month not in FUTURES_MONTH_CODES:
+        raise ValueError(f"Month must be 1-12, got {month}")
+
+    # Get ticker root for currency
+    ticker_root = FUTURES_TICKER_ROOTS[currency]
+
+    # Get month code
+    month_code = FUTURES_MONTH_CODES[month]
+
+    # Format year as 2 digits
+    year_2digit = year % 100
+
+    # Construct ticker: ROOT + MONTH_CODE + YEAR + " Comdty"
+    ticker = f"{ticker_root}{month_code}{year_2digit:02d} Comdty"
+
+    return ticker
+
+
+def construct_futures_ticker_from_date(currency: str, date) -> str:
+    """
+    Construct futures ticker from a Date object.
+
+    Args:
+        currency: Currency code string ("USD", "GBP", "EUR")
+        date: Date object for the futures expiry
+
+    Returns:
+        Bloomberg ticker string (e.g., "SFRH24 Comdty")
+
+    Example:
+        >>> from cavour.utils.date import Date
+        >>> expiry = Date(20, 3, 2024)  # March 20, 2024 (IMM date)
+        >>> construct_futures_ticker_from_date("USD", expiry)
+        'SFRH24 Comdty'
+    """
+    return construct_futures_ticker(currency, date._m, date._y)
+
+
+# Example quarterly IMM futures strips (for reference)
+# These would typically be fetched dynamically from Bloomberg
+FUTURES_EXAMPLES = {
+    "USD_SOFR_IMM": {
+        "description": "CME SOFR 3-Month Futures (IMM quarterly)",
+        "exchange": "CME",
+        "contract_size": 1_000_000,  # $1M
+        "day_count": "ACT/360",
+        "tick_size": 0.0025,  # 0.25 bps = $6.25 per contract
+        "example_tickers": [
+            "SFRH24 Comdty",  # March 2024
+            "SFRM24 Comdty",  # June 2024
+            "SFRU24 Comdty",  # September 2024
+            "SFRZ24 Comdty",  # December 2024
+        ]
+    },
+    "GBP_SONIA_IMM": {
+        "description": "ICE SONIA 3-Month Futures (IMM quarterly)",
+        "exchange": "ICE",
+        "contract_size": 1_000_000,  # £1M
+        "day_count": "ACT/365",
+        "tick_size": 0.0025,  # 0.25 bps
+        "example_tickers": [
+            "FSH24 Comdty",  # March 2024
+            "FSM24 Comdty",  # June 2024
+            "FSU24 Comdty",  # September 2024
+            "FSZ24 Comdty",  # December 2024
+        ]
+    },
+    "EUR_ESTR_IMM": {
+        "description": "Eurex Three-Month ESTR Futures (IMM quarterly)",
+        "exchange": "Eurex",
+        "contract_size": 1_000_000,  # €1M
+        "day_count": "ACT/360",
+        "tick_size": 0.0025,  # 0.25 bps
+        "example_tickers": [
+            "FESH24 Comdty",  # March 2024
+            "FESM24 Comdty",  # June 2024
+            "FESU24 Comdty",  # September 2024
+            "FESZ24 Comdty",  # December 2024
+        ]
+    }
+}

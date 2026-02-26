@@ -41,7 +41,7 @@ Example:
     >>> # Build curve with interpolation
     >>> curve = OISCurve(
     ...     value_dt=value_dt,
-    ...     ois_swaps=swaps,
+    ...     instruments=swaps,
     ...     interp_type=InterpTypes.LINEAR_ZERO_RATES
     ... )
 """
@@ -65,6 +65,9 @@ class InstrumentTypes(Enum):
     FRN = 8
     YOY_INFLATION_SWAP = 9
     SWAP_YOY_INFLATION_LEG = 10
+    CASH_DEPOSIT = 11
+    FRA = 12
+    STIR_FUTURE = 13
 
 class RequestTypes(Enum):
     VALUE = 1
@@ -73,6 +76,19 @@ class RequestTypes(Enum):
     SPEED = 4
     CASHFLOWS = 5
     FX01 = 6
+
+class FutureContractTypes(Enum):
+    """Contract types for STIR (Short-Term Interest Rate) futures.
+
+    - IMM: Quarterly IMM dates (3rd Wednesday of Mar/Jun/Sep/Dec)
+    - SERIAL_MONTHLY: Monthly contracts (all months, not just IMM quarters)
+    - FOMC: FOMC meeting-dated futures (USD only, tied to Fed policy meetings)
+    - BOE: BOE MPC meeting-dated futures (GBP only, tied to Bank of England meetings)
+    """
+    IMM = 1
+    SERIAL_MONTHLY = 2
+    FOMC = 3
+    BOE = 4
 
 class InterpTypes(Enum):
     FLAT_FWD_RATES = 1

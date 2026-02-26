@@ -121,6 +121,14 @@ class Engine:
         if derivative.derivative_type == InstrumentTypes.YOY_INFLATION_SWAP:
             return self._compute_yoy_iis(derivative, reqs)
 
+        # Route Cash Deposits to deposit handler
+        if derivative.derivative_type == InstrumentTypes.CASH_DEPOSIT:
+            return self._compute_deposit(derivative, reqs, collateral_type)
+
+        # Route FRAs to FRA handler
+        if derivative.derivative_type == InstrumentTypes.FRA:
+            return self._compute_fra(derivative, reqs, collateral_type)
+
         raise LibError(f"{derivative.derivative_type} not yet implemented")
 
 
@@ -913,9 +921,10 @@ class Engine:
             swap_rates_jax = jnp.array(ois_model.swap_rates)
             swap_times_list = ois_model.swap_times
             year_fracs_list = ois_model.year_fracs
+            start_times_list = ois_model.start_times  # NEW: For forward-starting instruments
 
             def build_dfs_original(r):
-                _, dfs_out = self.build_curve_ad(r, swap_times_list, year_fracs_list)
+                _, dfs_out = self.build_curve_ad(r, swap_times_list, year_fracs_list, start_times_list)
                 return dfs_out
 
             hess_full = hessian(build_dfs_original)(swap_rates_jax)
@@ -1106,7 +1115,8 @@ class Engine:
             ois_model.swap_rates,
             ois_model.swap_times,
             ois_model.year_fracs,
-            ois_model._interp_type
+            ois_model._interp_type,
+            ois_model.start_times  # NEW: For forward-starting instruments
         )
         ois_times = ois_cache["times"]
         ois_dfs = ois_cache["dfs"]
@@ -3387,7 +3397,8 @@ class Engine:
 
     def _preprocess_curve_points(self,
                                   swap_rates: list[float],
-                                  year_fracs: list[list[float]]) -> dict:
+                                  year_fracs: list[list[float]],
+                                  start_times: list[list[float]] = None) -> dict:
         """
         Pre-process curve points using Python operations (NOT JIT-compiled).
 
@@ -3401,6 +3412,8 @@ class Engine:
         Args:
             swap_rates: Par swap rates for each maturity
             year_fracs: Year fractions for each swap's cashflows
+            start_times: Start times for forward-starting instruments (optional).
+                For spot-starting instruments, use 0.0. Defaults to None (all spot-starting).
 
         Returns:
             dict with JAX-ready arrays:
@@ -3408,7 +3421,11 @@ class Engine:
                 - 'accs': Year fraction accumulations
                 - 'prev_idxs': Index of previous point for each point
                 - 'maturities': Exact maturity for each point
+                - 'start_mats': Start maturities for forward-starting instruments (NEW)
         """
+        # Default to all spot-starting if start_times not provided
+        if start_times is None:
+            start_times = [[0.0] * len(fracs) for fracs in year_fracs]
         # 1) Add t=0, df=1.0 point
         points = [{
             'maturity': 0.0,
@@ -3418,31 +3435,42 @@ class Engine:
             'prev_key': None,
             'rate': swap_rates[0],
             'is_final': False,
-            'swap_idx': -1
+            'swap_idx': -1,
+            'start_mat': 0.0  # NEW: t=0 point is spot-starting
         }]
 
         # 2) Pre-expand ALL intermediate points with DEDUPLICATION
         # Uses Python set - fast for deduplication, but not JIT-compatible
         seen_keys = set([0.0])
 
-        for i, (rate, fracs) in enumerate(zip(swap_rates, year_fracs)):
-            cumsum = 0.0
-            for j, frac in enumerate(fracs):
+        for i, (rate, fracs, starts) in enumerate(zip(swap_rates, year_fracs, start_times)):
+            cumsum = 0.0  # Always start from 0 for consistency
+
+            for j, (frac, start) in enumerate(zip(fracs, starts)):
+                # For forward-starting instruments, reset cumsum to start time for first cashflow
+                if j == 0 and start > 1e-6:
+                    cumsum = start
+
                 prev_cum = cumsum
                 cumsum += frac
                 key = round(cumsum, 2)
 
                 # DEDUPLICATION: "first occurrence wins"
                 if key not in seen_keys:
+                    # For forward-starting, first cashflow has no previous cashflow in the swap
+                    # so prev_key should be None (bootstrap will use forward formula instead)
+                    prev_key_val = None if j == 0 else round(prev_cum, 2)
+
                     points.append({
                         'maturity': cumsum,
                         'maturity_key': key,
                         'acc': frac,
                         'prev_mat': prev_cum,
-                        'prev_key': round(prev_cum, 2) if j > 0 else None,
+                        'prev_key': prev_key_val,
                         'rate': rate,
                         'is_final': (j == len(fracs) - 1),
-                        'swap_idx': i
+                        'swap_idx': i,
+                        'start_mat': start  # When forward period begins (0.0 for spot-starting)
                     })
                     seen_keys.add(key)
 
@@ -3469,14 +3497,17 @@ class Engine:
             'rates': [p['rate'] for p in sorted_points],
             'accs': [p['acc'] for p in sorted_points],
             'prev_idxs': [p['prev_idx'] for p in sorted_points],
-            'maturities': [p['maturity'] for p in sorted_points]
+            'maturities': [p['maturity'] for p in sorted_points],
+            'start_mats': [p['start_mat'] for p in sorted_points]  # NEW: For forward-starting instruments
         }
 
     @partial(jit, static_argnums=(0,))
     def _jit_bootstrap(self,
                       rates: jnp.ndarray,
                       accs: jnp.ndarray,
-                      prev_idxs: jnp.ndarray) -> jnp.ndarray:
+                      prev_idxs: jnp.ndarray,
+                      start_mats: jnp.ndarray,
+                      maturities: jnp.ndarray) -> jnp.ndarray:
         """
         JIT-compiled bootstrap computation (PURE JAX, no Python control flow).
 
@@ -3484,41 +3515,101 @@ class Engine:
         All control flow and data structures have been pre-computed by
         _preprocess_curve_points().
 
+        Supports BOTH spot-starting and forward-starting instruments:
+        - Spot-starting (start_mat = 0): Uses standard bootstrap formula
+        - Forward-starting (start_mat > 0): Interpolates DF at start_mat, then applies forward formula
+
         Args:
             rates: Swap rates for each point
             accs: Year fraction for each point
             prev_idxs: Index of previous point for dependency (-1 for t=0)
+            start_mats: Start maturity for forward-starting instruments (0.0 for spot-starting)
+            maturities: Exact maturity time for each point (for interpolation)
 
         Returns:
             all_dfs: Discount factors for all points
         """
         n_points = len(rates)
 
-        def step(pv01_arr, inputs):
-            i, rate, acc, prev_idx = inputs
+        def step(state, inputs):
+            pv01_arr, dfs_arr = state
+            i, rate, acc, prev_idx, start_mat, mat = inputs
+
+            # Check if this is an interpolation-only point (dummy point for forward-starting)
+            # These have rate=0 and acc=0 as markers
+            is_interp_point = (jnp.abs(rate) < 1e-10) & (jnp.abs(acc) < 1e-10)
+
+            # Mask valid points (0 to i-1) for interpolation
+            valid_mask = jnp.arange(n_points) < i
+            masked_mats = jnp.where(valid_mask, maturities, 1e10)
+            masked_dfs = jnp.where(valid_mask, dfs_arr, 1.0)  # Use 1.0 for invalid to avoid log(0)
+
+            # For interpolation-only points, just interpolate from existing DFs
+            df_interp = jnp.interp(mat, masked_mats, masked_dfs, left=1.0, right=dfs_arr[i-1])
+
+            # Compute DF for calibration points
             prev_pv01 = jnp.where(prev_idx < 0, 0.0, pv01_arr[prev_idx])
 
-            df_i = jnp.where(
+            # SPOT-STARTING formula (standard multi-cashflow bootstrap)
+            df_spot = jnp.where(
                 prev_idx < 0,
                 1.0 / (1.0 + rate * acc),
                 (1.0 - rate * prev_pv01) / (1.0 + rate * acc)
             )
 
-            pv01_i = prev_pv01 + acc * df_i
+            # FORWARD-STARTING formula: DF(end) = DF(start) / (1 + rate × acc)
+            # Use LINEAR_ZERO_RATES interpolation to match curve behavior
+            # 1. Compute zero rates from existing DFs (invalid points masked to DF=1.0 → zero_rate=0)
+            zero_rates = -jnp.log(masked_dfs) / jnp.maximum(masked_mats, 1e-15)
+
+            # 2. Get last valid zero rate for extrapolation
+            last_valid_zero_rate = -jnp.log(dfs_arr[i-1]) / jnp.maximum(maturities[i-1], 1e-15)
+
+            # 3. Interpolate zero rate at start_mat (with flat extrapolation of zero rate)
+            zero_rate_start = jnp.interp(start_mat, masked_mats, zero_rates, left=0.0, right=last_valid_zero_rate)
+
+            # 4. Convert back to DF
+            df_start = jnp.exp(-zero_rate_start * start_mat)
+            df_forward = df_start / (1.0 + rate * acc)
+
+            # Choose formula: interpolation, forward, or spot
+            is_forward = start_mat > 1e-6
+            df_calibrated = jnp.where(is_forward, df_forward, df_spot)
+            df_i = jnp.where(is_interp_point, df_interp, df_calibrated)
+
+            # Update PV01 (only for calibration points, not interpolation points)
+            # For forward-starting instruments, interpolate PV01 at start_mat to get cumulative PV01
+            pv01_start = jnp.interp(start_mat, masked_mats, pv01_arr, left=0.0, right=pv01_arr[i-1])
+            pv01_forward = pv01_start + acc * df_i
+
+            # Choose PV01 formula: spot (uses prev_pv01) or forward (uses pv01_start)
+            pv01_calibrated = jnp.where(is_forward, pv01_forward, prev_pv01 + acc * df_i)
+            pv01_i = jnp.where(is_interp_point, prev_pv01, pv01_calibrated)
+
+            # Update state arrays
             new_pv01 = pv01_arr.at[i].set(pv01_i)
-            return new_pv01, df_i
+            new_dfs = dfs_arr.at[i].set(df_i)
+
+            return (new_pv01, new_dfs), df_i
+
+        # Initialize: t=0 has DF=1.0
+        init_pv01 = jnp.zeros(n_points)
+        init_dfs = jnp.zeros(n_points)
+        init_dfs = init_dfs.at[0].set(1.0)
 
         # Run the scan (this gets JIT-compiled for 2-3x speedup)
-        init_pv01 = jnp.zeros(n_points)
         idxs = jnp.arange(n_points)
-        _, all_dfs = lax.scan(step, init_pv01, (idxs, rates, accs, prev_idxs))
+        scan_inputs = (idxs, rates, accs, prev_idxs, start_mats, maturities)
+        (_, final_dfs), all_dfs = lax.scan(step, (init_pv01, init_dfs), scan_inputs)
 
+        # Return DFs from scan outputs (each step returns df_i)
         return all_dfs
 
     def build_curve_ad(self,
                     swap_rates: list[float],
                     swap_times: list[float],
-                    year_fracs: list[list[float]]
+                    year_fracs: list[list[float]],
+                    start_times: list[list[float]] = None
                     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """
         Bootstraps an OIS curve via par-swap rates using JAX-compatible operations.
@@ -3534,6 +3625,9 @@ class Engine:
             swap_rates (list[float]): Par swap rates for each maturity
             swap_times (list[float]): Swap maturities in years
             year_fracs (list[list[float]]): Year fractions for each swap's cashflows
+            start_times (list[list[float]], optional): Start times for forward-starting
+                instruments (e.g., FRAs). For spot-starting instruments, use 0.0.
+                Defaults to None (all instruments spot-starting).
 
         Returns:
             tuple[jnp.ndarray, jnp.ndarray]:
@@ -3551,26 +3645,28 @@ class Engine:
             reach that time computes the DF using its rate. Subsequent swaps skip that time.
         """
         # Phase 1: Python preprocessing (fast, not the bottleneck)
-        points_data = self._preprocess_curve_points(swap_rates, year_fracs)
+        points_data = self._preprocess_curve_points(swap_rates, year_fracs, start_times)
 
         # Phase 2: JIT-compiled numerical bootstrap (THIS IS THE SPEEDUP)
         # Convert to JAX arrays
         rates = jnp.array(points_data['rates'])
         accs = jnp.array(points_data['accs'])
         prev_idxs = jnp.array(points_data['prev_idxs'], dtype=jnp.int32)
+        start_mats = jnp.array(points_data['start_mats'])  # NEW: For forward-starting instruments
+        all_maturities = jnp.array(points_data['maturities'])
 
         # Run JIT-compiled bootstrap (2-3x faster than non-JIT)
-        all_dfs = self._jit_bootstrap(rates, accs, prev_idxs)
+        all_dfs = self._jit_bootstrap(rates, accs, prev_idxs, start_mats, all_maturities)
 
         # Phase 3: Return results
-        all_maturities = jnp.array(points_data['maturities'])
         return all_maturities, all_dfs
 
-    def _cached_curve(self, key, swap_rates, swap_times, year_fracs, interp_type, compute_gamma=True):
+    def _cached_curve(self, key, swap_rates, swap_times, year_fracs, interp_type, start_times=None, compute_gamma=True):
         """
         Bootstrap the curve once and cache DFS, Jacobian and optionally Hessian.
 
         Args:
+            start_times: Start times for forward-starting instruments (optional)
             compute_gamma: If True, compute expensive Hessian for GAMMA calculations.
                           If False, skip Hessian (saves ~4-5s for large curves).
                           Default True for backward compatibility.
@@ -3581,7 +3677,7 @@ class Engine:
 
         # Build curve to get both times and DFs (including all intermediate points)
         rates = jnp.array(swap_rates)
-        times, dfs = self.build_curve_ad(rates, swap_times, year_fracs)
+        times, dfs = self.build_curve_ad(rates, swap_times, year_fracs, start_times)
 
         # IMPORTANT: Prepend time≈0 with DF≈1.0 to enable forward rate calculations
         # from value date. Without this, interpolating start_times=0 fails.
@@ -3596,7 +3692,7 @@ class Engine:
         # For AD, we need DFs as a function of rates only (times are constant)
         # Compute Jacobian for the original DFs (without time=0)
         def build_dfs_original(r):
-            _, dfs_out = self.build_curve_ad(r, swap_times, year_fracs)
+            _, dfs_out = self.build_curve_ad(r, swap_times, year_fracs, start_times)
             return dfs_out
 
         jac_original = jacrev(build_dfs_original)(rates)
@@ -5340,3 +5436,238 @@ class Engine:
             {RequestTypes.GAMMA},
         )
         return res["gamma"]
+
+###############################################################################
+# Cash Deposit and FRA Computation Methods
+###############################################################################
+
+    def _compute_deposit(self, derivative, reqs, collateral_type=None):
+        """Compute analytics for cash deposits (VALUE, DELTA, GAMMA).
+
+        Uses the same AD-based approach as OIS legs:
+        1. Define pricing function: pv_fn(dfs) = payment_amt * interp(maturity, times, dfs)
+        2. For DELTA: grad_dfs = grad(pv_fn)(dfs), then delta = grad_dfs @ jac
+        3. For GAMMA: hess_dfs = hessian(pv_fn)(dfs), then apply chain rule
+
+        Args:
+            derivative: CashDeposit instance
+            reqs: Set of RequestTypes (VALUE, DELTA, GAMMA)
+            collateral_type: Collateral type (future extensibility)
+
+        Returns:
+            AnalyticsResult with value, risk (delta), and gamma
+        """
+        # Get the curve name from the deposit's floating index
+        curve_name = derivative._floating_index.name
+        ir_model = getattr(self.model.curves, curve_name)
+
+        # Get cached curve data (times, DFs, Jacobian, Hessian)
+        curve_key = tuple(ir_model.swap_times)
+        cache = self._cached_curve(
+            curve_key,
+            ir_model.swap_rates,
+            ir_model.swap_times,
+            ir_model.year_fracs,
+            ir_model._interp_type
+        )
+
+        times = cache["times"]
+        dfs = cache["dfs"]
+        jac = cache["jac"]
+        hess_curve = cache["hess"]
+
+        # Compute maturity time in years
+        from cavour.utils.helpers import times_from_dates
+        maturity_time = times_from_dates(
+            derivative._maturity_dt,
+            ir_model._value_dt,
+            derivative._dc_type
+        )
+
+        # Get interpolator
+        from cavour.market.curves.interpolator_ad import InterpolatorAd
+        interpolator = InterpolatorAd(ir_model._interp_type)
+        interpolator.fit(times, dfs)
+
+        # Define pricing function: PV = payment_amt * DF(maturity) / DF(value_dt) - notional
+        # For value_dt = effective_dt (curve construction), DF(value_dt) = 1.0
+        def pv_fn(dfs_array):
+            """Pricing function for JAX autodiff."""
+            df_mat = interpolator.simple_interpolate(maturity_time, times, dfs_array, ir_model._interp_type.value)
+            pv_payment = derivative._payment_amt * df_mat  # Assuming value_dt = effective_dt, so df_value = 1
+            return pv_payment - derivative._notional
+
+        # Compute VALUE
+        value = None
+        if RequestTypes.VALUE in reqs:
+            val = pv_fn(dfs)
+            val_scalar = float(jnp.atleast_1d(val).item() if jnp.ndim(val) == 0 else val.squeeze())
+            value = Valuation(amount=val_scalar, currency=derivative._currency)
+
+        # Compute gradient for DELTA and/or GAMMA
+        need_grad = RequestTypes.DELTA in reqs or RequestTypes.GAMMA in reqs
+        grad_dfs = None
+        if need_grad:
+            grad_dfs = grad(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
+
+        # Compute DELTA
+        delta = None
+        if RequestTypes.DELTA in reqs:
+            # Chain rule: dV/d(rates) = (dV/d(DFs)) × (d(DFs)/d(rates))
+            sensitivities = jnp.dot(grad_dfs, jac)
+            sensies = [float(x) * 1e-4 for x in sensitivities]
+            delta = Delta(
+                risk_ladder=sensies,
+                tenors=to_tenor(ir_model.swap_times),
+                currency=derivative._currency,
+                curve_type=derivative._floating_index
+            )
+
+        # Compute GAMMA
+        gamma = None
+        if RequestTypes.GAMMA in reqs:
+            if hess_curve is None:
+                raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
+
+            # Compute Hessian: d²V/d(DFs)²
+            hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
+
+            # Chain rule with two terms:
+            # term1: jac.T @ hess_dfs @ jac  (second derivative through jacobian)
+            # term2: sum(grad_dfs * hess_curve)  (first derivative times curve hessian)
+            term1 = jac.T @ hess_dfs @ jac
+            term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
+            gammas = term1 + term2
+            gammas = np.array(gammas, dtype=np.float64) * 1e-8
+
+            gamma = Gamma(
+                risk_ladder=gammas,
+                tenors=to_tenor(ir_model.swap_times),
+                currency=derivative._currency,
+                curve_type=derivative._floating_index
+            )
+
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=None)
+
+    def _compute_fra(self, derivative, reqs, collateral_type=None):
+        """Compute analytics for FRAs (VALUE, DELTA, GAMMA).
+
+        Uses the same AD-based approach as deposits and OIS legs:
+        1. Define pricing function: pv_fn(dfs) with three interpolations
+        2. For DELTA: grad_dfs = grad(pv_fn)(dfs), then delta = grad_dfs @ jac
+        3. For GAMMA: hess_dfs = hessian(pv_fn)(dfs), then apply chain rule
+
+        FRA pricing formula:
+        PV = notional × (df_start/df_end - 1 - fra_rate × year_frac) × df_settlement
+
+        Args:
+            derivative: FRA instance
+            reqs: Set of RequestTypes (VALUE, DELTA, GAMMA)
+            collateral_type: Collateral type (future extensibility)
+
+        Returns:
+            AnalyticsResult with value, risk (delta), and gamma
+        """
+        # Get the curve name from the FRA's floating index
+        curve_name = derivative._floating_index.name
+        ir_model = getattr(self.model.curves, curve_name)
+
+        # Get cached curve data (times, DFs, Jacobian, Hessian)
+        curve_key = tuple(ir_model.swap_times)
+        cache = self._cached_curve(
+            curve_key,
+            ir_model.swap_rates,
+            ir_model.swap_times,
+            ir_model.year_fracs,
+            ir_model._interp_type
+        )
+
+        times = cache["times"]
+        dfs = cache["dfs"]
+        jac = cache["jac"]
+        hess_curve = cache["hess"]
+
+        # Compute three time points in years
+        from cavour.utils.helpers import times_from_dates
+        start_time = times_from_dates(
+            derivative._start_dt, ir_model._value_dt, derivative._dc_type
+        )
+        end_time = times_from_dates(
+            derivative._end_dt, ir_model._value_dt, derivative._dc_type
+        )
+        settlement_time = times_from_dates(
+            derivative._settlement_dt, ir_model._value_dt, derivative._dc_type
+        )
+
+        # Get interpolator
+        from cavour.market.curves.interpolator_ad import InterpolatorAd
+        interpolator = InterpolatorAd(ir_model._interp_type)
+        interpolator.fit(times, dfs)
+
+        # FRA parameters
+        notional = derivative._notional
+        year_frac = derivative._year_frac
+        fra_rate = derivative._fra_rate
+
+        # Define pricing function: PV = payoff × df_settlement
+        # payoff = notional × (df_start/df_end - 1 - fra_rate × year_frac)
+        def pv_fn(dfs_array):
+            """Pricing function for JAX autodiff."""
+            df_start = interpolator.simple_interpolate(start_time, times, dfs_array, ir_model._interp_type.value)
+            df_end = interpolator.simple_interpolate(end_time, times, dfs_array, ir_model._interp_type.value)
+            df_settlement = interpolator.simple_interpolate(settlement_time, times, dfs_array, ir_model._interp_type.value)
+
+            payoff = notional * (df_start / df_end - 1.0 - fra_rate * year_frac)
+            return payoff * df_settlement
+
+        # Compute VALUE
+        value = None
+        if RequestTypes.VALUE in reqs:
+            val = pv_fn(dfs)
+            val_scalar = float(jnp.atleast_1d(val).item() if jnp.ndim(val) == 0 else val.squeeze())
+            value = Valuation(amount=val_scalar, currency=derivative._currency)
+
+        # Compute gradient for DELTA and/or GAMMA
+        need_grad = RequestTypes.DELTA in reqs or RequestTypes.GAMMA in reqs
+        grad_dfs = None
+        if need_grad:
+            grad_dfs = grad(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
+
+        # Compute DELTA
+        delta = None
+        if RequestTypes.DELTA in reqs:
+            # Chain rule: dV/d(rates) = (dV/d(DFs)) × (d(DFs)/d(rates))
+            sensitivities = jnp.dot(grad_dfs, jac)
+            sensies = [float(x) * 1e-4 for x in sensitivities]
+            delta = Delta(
+                risk_ladder=sensies,
+                tenors=to_tenor(ir_model.swap_times),
+                currency=derivative._currency,
+                curve_type=derivative._floating_index
+            )
+
+        # Compute GAMMA
+        gamma = None
+        if RequestTypes.GAMMA in reqs:
+            if hess_curve is None:
+                raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
+
+            # Compute Hessian: d²V/d(DFs)²
+            hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
+
+            # Chain rule with two terms:
+            # term1: jac.T @ hess_dfs @ jac  (second derivative through jacobian)
+            # term2: sum(grad_dfs * hess_curve)  (first derivative times curve hessian)
+            term1 = jac.T @ hess_dfs @ jac
+            term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
+            gammas = term1 + term2
+            gammas = np.array(gammas, dtype=np.float64) * 1e-8
+
+            gamma = Gamma(
+                risk_ladder=gammas,
+                tenors=to_tenor(ir_model.swap_times),
+                currency=derivative._currency,
+                curve_type=derivative._floating_index
+            )
+
+        return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=None)

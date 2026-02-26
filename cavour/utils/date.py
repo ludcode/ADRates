@@ -793,6 +793,152 @@ class Date():
 
     ###########################################################################
 
+    def get_nth_imm_date(self, n: int):
+        """ Get the Nth IMM date from the current date.
+
+        Args:
+            n: Number of IMM dates forward (1 = next IMM, 2 = second next, etc.)
+
+        Returns:
+            Date object for the Nth IMM date
+
+        Example:
+            >>> dt = Date(15, 1, 2024)
+            >>> dt.get_nth_imm_date(1)  # Next IMM: March 20, 2024
+            >>> dt.get_nth_imm_date(2)  # Second IMM: June 19, 2024
+        """
+        if n < 1:
+            raise LibError("n must be >= 1")
+
+        temp_date = self
+        for i in range(n):
+            imm_date = temp_date.next_imm_date()
+            if i < n - 1:
+                # Move one day past current IMM to get next
+                temp_date = imm_date.add_days(1)
+
+        return imm_date
+
+    ###########################################################################
+
+    def is_imm_date(self):
+        """ Check if the current date is an IMM date.
+
+        IMM dates are the 3rd Wednesday of March, June, September, or December.
+
+        Returns:
+            True if date is an IMM date, False otherwise
+        """
+        # Check if month is an IMM month (3, 6, 9, 12)
+        if self._m not in [3, 6, 9, 12]:
+            return False
+
+        # Check if day is the 3rd Wednesday of the month
+        third_wed_day = self.third_wednesday_of_month(self._m, self._y)
+        return self._d == third_wed_day
+
+    ###########################################################################
+
+    def futures_month_code(self):
+        """ Return the futures month code for the current date's month.
+
+        Returns standard CME futures month codes:
+            F=Jan, G=Feb, H=Mar, J=Apr, K=May, M=Jun,
+            N=Jul, Q=Aug, U=Sep, V=Oct, X=Nov, Z=Dec
+
+        Returns:
+            Single character string representing the month code
+
+        Example:
+            >>> Date(15, 3, 2024).futures_month_code()  # 'H' (March)
+            >>> Date(15, 6, 2024).futures_month_code()  # 'M' (June)
+        """
+        month_codes = {
+            1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M',
+            7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'
+        }
+        return month_codes[self._m]
+
+    ###########################################################################
+
+    @staticmethod
+    def get_fomc_meeting_dates(year: int):
+        """ Get scheduled FOMC (Federal Open Market Committee) meeting dates for a given year.
+
+        The FOMC typically meets 8 times per year on pre-announced dates.
+        These dates are used for FOMC-dated SOFR futures contracts.
+
+        Note: This returns approximate dates (3rd Wednesday of scheduled months).
+        For production use, should be updated with actual FOMC calendar from federalreserve.gov
+
+        Args:
+            year: The year for which to get FOMC meeting dates
+
+        Returns:
+            List of Date objects for FOMC meeting dates (approximately 8 dates)
+
+        Typical FOMC meeting schedule (approximate, verify with Fed calendar):
+            Late January/Early February
+            Mid-March
+            Early May
+            Mid-June
+            Late July
+            Mid-September
+            Early November
+            Mid-December
+        """
+        # Approximate FOMC meeting months (typical pattern)
+        # IMPORTANT: For production, replace with actual Fed calendar
+        fomc_months = [2, 3, 5, 6, 7, 9, 11, 12]  # 8 meetings per year
+
+        meeting_dates = []
+        for month in fomc_months:
+            # Use 3rd Wednesday as approximation
+            # For production, should use actual published FOMC calendar
+            day = Date(1, month, year).third_wednesday_of_month(month, year)
+            meeting_dates.append(Date(day, month, year))
+
+        return meeting_dates
+
+    ###########################################################################
+
+    @staticmethod
+    def get_boe_meeting_dates(year: int):
+        """ Get scheduled BOE MPC (Monetary Policy Committee) meeting dates for a given year.
+
+        The BOE MPC typically meets 8 times per year on pre-announced dates.
+        Meetings are generally on the first Thursday of each month, but not all months.
+
+        Note: This returns approximate dates.
+        For production use, should be updated with actual BOE calendar from bankofengland.co.uk
+
+        Args:
+            year: The year for which to get BOE meeting dates
+
+        Returns:
+            List of Date objects for BOE MPC meeting dates (approximately 8 dates)
+
+        Typical BOE meeting schedule:
+            February, March, May, June, August, September, November, December
+        """
+        # BOE MPC meeting months (typical pattern, 8 meetings per year)
+        # IMPORTANT: For production, replace with actual BOE calendar
+        boe_months = [2, 3, 5, 6, 8, 9, 11, 12]
+
+        meeting_dates = []
+        for month in boe_months:
+            # Find first Thursday of the month
+            # Start from day 1 and find first Thursday
+            for day in range(1, 8):  # First week
+                test_date = Date(day, month, year)
+                if test_date.weekday() == Date.THU:
+                    meeting_dates.append(test_date)
+                    break
+
+        return meeting_dates
+
+    ###########################################################################
+
     def add_tenor(self,
                   tenor: (list, str)):
         """ Return the date following the Date by a period given by the

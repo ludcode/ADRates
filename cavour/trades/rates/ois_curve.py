@@ -33,7 +33,7 @@ Example:
     >>> # Bootstrap curve
     >>> curve = OISCurve(
     ...     value_dt=value_dt,
-    ...     ois_swaps=swaps,
+    ...     instruments=swaps,
     ...     interp_type=InterpTypes.LINEAR_ZERO_RATES,
     ...     check_refit=True  # Verify swap rates are reproduced
     ... )
@@ -86,16 +86,23 @@ class OISCurve(DiscountCurve):
 
     def __init__(self,
                  value_dt: Date,
-                 ois_swaps: list,
+                 instruments: list,
                  interp_type: InterpTypes = InterpTypes.FLAT_FWD_RATES,
                  check_refit: bool = False,  # Set to True to test it works
                  use_ad: bool = True,  # Enable AD storage by default
                  compute_gamma: bool = False,  # Compute Hessians for GAMMA (slow)
                  hessian_bandwidth: Optional[int] = None):  # Hessian sparsity: 0=diagonal only, None=full
         """ Create an instance of an overnight index rate swap curve given a
-        valuation date and a set of OIS rates. Some of these may
-        be left None and the algorithm will just use what is provided. An
-        interpolation method has also to be provided. The default is to use a
+        valuation date and a set of OIS rates or mixed money market instruments.
+
+        Supports:
+        - OIS swaps (for 1Y+ tenors)
+        - Cash deposits (for 0-12M tenors)
+        - FRAs (for 3M-2Y tenors)
+        - STIR futures (for 3M-2Y tenors, most liquid)
+        - Mixed instrument types for full term structure
+
+        An interpolation method has also to be provided. The default is to use a
         linear interpolation for swap rates on coupon dates and to then assume
         flat forwards between these coupon dates.
 
@@ -103,9 +110,9 @@ class OISCurve(DiscountCurve):
 
         Args:
             value_dt: Valuation date (anchor date for the curve)
-            ois_swaps: List of OIS instruments for calibration
+            instruments: List of instruments (OIS, CashDeposit, FRA, IRFuture) for calibration
             interp_type: Interpolation method for discount factors
-            check_refit: If True, verify calibration swaps reprice correctly
+            check_refit: If True, verify calibration instruments reprice correctly
             use_ad: If True, compute and store Jacobians for DELTA sensitivities
             compute_gamma: If True, compute Hessians for GAMMA (second-order sensitivities).
                           Default False for performance (3-5x faster curve construction).
@@ -116,10 +123,19 @@ class OISCurve(DiscountCurve):
                               Ignored if compute_gamma=False.
         """
 
+        # Validate inputs
         check_argument_types(getattr(self, _func_name(), None), locals())
 
+        # Store instruments for curve building
+        self._used_instruments = instruments
+
+        # Legacy attribute for backward compatibility with existing code
+        self._used_swaps = self._used_instruments
+
+        # Sort instruments by maturity for proper bootstrapping order
+        self._used_instruments = self._sort_instruments_by_maturity(self._used_instruments)
+
         self._value_dt = value_dt
-        self._used_swaps = ois_swaps
         self._interp_type = interp_type
         self._check_refit = check_refit
         self._use_ad = use_ad
@@ -140,13 +156,66 @@ class OISCurve(DiscountCurve):
 
 ###############################################################################
 
-    def _prepare_curve_builder_inputs(self):
-        """ Construct the discount curve using a bootstrap approach. This is
-        the linear swap rate method that is fast and exact as it does not
-        require the use of a solver. It is also market standard.
-        Adjusted for algorithmic differentiation """
+    def _sort_instruments_by_maturity(self, instruments):
+        """
+        Sort instruments by maturity date for proper bootstrapping order.
 
-        self._dc_type = self._used_swaps[0]._float_leg._dc_type
+        Bootstrapping requires instruments to be ordered from shortest to longest
+        maturity so that discount factors can be built sequentially.
+
+        Args:
+            instruments: List of instruments (OIS, CashDeposit, FRA)
+
+        Returns:
+            Sorted list of instruments by maturity date
+        """
+        def get_maturity(instrument):
+            """Extract maturity date from instrument."""
+            # All our instruments should have _maturity_dt attribute
+            if hasattr(instrument, '_maturity_dt'):
+                return instrument._maturity_dt
+            # Fallback for OIS swaps
+            elif hasattr(instrument, '_adjusted_fixed_dts'):
+                return instrument._adjusted_fixed_dts[-1]
+            else:
+                raise ValueError(f"Cannot determine maturity for instrument: {type(instrument)}")
+
+        return sorted(instruments, key=get_maturity)
+
+###############################################################################
+
+    def _prepare_curve_builder_inputs(self):
+        """
+        Prepare inputs for curve bootstrap from mixed instrument types.
+
+        Extracts rates, maturities, and year fractions from:
+        - OIS swaps (multi-cashflow)
+        - Cash deposits (single cashflow)
+        - FRAs (single cashflow)
+        - STIR futures (single cashflow)
+
+        All instruments must have:
+        - _fixed_coupon: The fixed rate
+        - _adjusted_fixed_dts: List of payment dates
+        - _fixed_year_fracs: List of year fractions
+        - _dc_type: Day count convention
+
+        Returns:
+            List of instrument rates for bootstrapping
+        """
+
+        # Extract day count convention from first instrument
+        # Try different instrument types
+        first_inst = self._used_instruments[0]
+        if hasattr(first_inst, '_float_leg'):
+            # OIS swap
+            self._dc_type = first_inst._float_leg._dc_type
+        elif hasattr(first_inst, '_dc_type'):
+            # Deposit or FRA
+            self._dc_type = first_inst._dc_type
+        else:
+            raise ValueError(f"Cannot determine day count for instrument: {type(first_inst)}")
+
         self._times = jnp.array([])
         self._dfs = jnp.array([])
         self._repr_dfs = jnp.array([])
@@ -160,26 +229,59 @@ class OISCurve(DiscountCurve):
         swap_rates = []
         swap_times = []
         year_fracs = []
+        start_times = []  # NEW: For forward-starting instruments
 
-        # I use the last coupon date for the swap rate interpolation as this
-        # may be different from the maturity date due to a holiday adjustment
-        # and the swap rates need to align with the coupon payment dates
+        # Extract data from each instrument (OIS, Deposit, FRA, IRFuture)
+        # All instruments store data in standardized attributes:
+        # - _fixed_coupon: The rate
+        # - _adjusted_fixed_dts: Payment dates (list)
+        # - _fixed_year_fracs: Year fractions (list)
+        # - _start_year_fracs: Start times for forward-starting (list, NEW)
 
         dcc = DayCount(self._dc_type)
         days_in_year = dcc.days_in_year()
 
-        for swap in self._used_swaps:
-            swap_rate = swap._fixed_coupon
-            maturity_dt = swap._adjusted_fixed_dts[-1]
+        for instrument in self._used_instruments:
+            # Extract rate (all instruments have this)
+            rate = instrument._fixed_coupon
+
+            # Extract maturity date (last payment date)
+            maturity_dt = instrument._adjusted_fixed_dts[-1]
             tswap = (maturity_dt - self._value_dt) / days_in_year
-            year_frac = swap._fixed_leg._year_fracs
+
+            # Extract year fractions
+            # For OIS: swap._fixed_leg._year_fracs (list of all coupon periods)
+            # For Deposit/FRA/IRFuture: instrument._fixed_year_fracs (list with 1 element)
+            if hasattr(instrument, '_fixed_leg'):
+                # OIS swap - multi-cashflow
+                year_frac = instrument._fixed_leg._year_fracs
+            else:
+                # Deposit, FRA, or IRFuture - use _fixed_year_fracs directly
+                year_frac = instrument._fixed_year_fracs
+
+            # Extract start times (NEW: for forward-starting instruments)
+            # For OIS: All periods are spot-starting (use swap bootstrap formula with prev_pv01)
+            # For Deposit: [0.0] (spot-starting)
+            # For FRA/IRFuture: [start_year_frac] (forward-starting from start_dt)
+            if hasattr(instrument, '_fixed_leg'):
+                # OIS swap - all periods use spot-starting formula with prev_pv01 accumulation
+                start_time = [0.0] * len(year_frac)
+            elif hasattr(instrument, '_start_year_fracs'):
+                # Deposit, FRA, or IRFuture with explicit start times
+                start_time = instrument._start_year_fracs
+            else:
+                # Fallback for instruments without _start_year_fracs (assume spot-starting)
+                start_time = [0.0] if isinstance(year_frac, list) else 0.0
+
             swap_times.append(tswap)
-            swap_rates.append(swap_rate)
+            swap_rates.append(rate)
             year_fracs.append(year_frac)
+            start_times.append(start_time)  # NEW
 
         self.swap_times = swap_times
         self.swap_rates = swap_rates
         self.year_fracs = year_fracs
+        self.start_times = start_times  # NEW
 
         return swap_rates
 
@@ -204,7 +306,8 @@ class OISCurve(DiscountCurve):
         times_dense, dfs_dense = engine_temp.build_curve_ad(
             swap_rates_array,
             self.swap_times,
-            self.year_fracs
+            self.year_fracs,
+            self.start_times  # NEW: Pass start times for forward-starting instruments
         )
 
         # Prepend time=0 with DF=1.0 if not already present (anchor point)
@@ -254,7 +357,8 @@ class OISCurve(DiscountCurve):
             _, dfs = engine_temp.build_curve_ad(
                 rates_array,
                 self.swap_times,
-                self.year_fracs
+                self.year_fracs,
+                self.start_times  # NEW: Pass start times for forward-starting instruments
             )
             return dfs
 
@@ -282,8 +386,8 @@ class OISCurve(DiscountCurve):
         # Engine gradients exclude t=0 (since it's a boundary condition, not a free parameter)
         # So we need to slice off the first row/element to match gradient dimensions
         # Check if first time point is t≈0
-        _, dfs_check = engine_temp.build_curve_ad(rates_array, self.swap_times, self.year_fracs)
-        times_check, _ = engine_temp.build_curve_ad(rates_array, self.swap_times, self.year_fracs)
+        _, dfs_check = engine_temp.build_curve_ad(rates_array, self.swap_times, self.year_fracs, self.start_times)
+        times_check, _ = engine_temp.build_curve_ad(rates_array, self.swap_times, self.year_fracs, self.start_times)
 
         if len(times_check) > 0 and times_check[0] < 1e-7:
             # First DF is at t≈0, slice it off
@@ -435,20 +539,53 @@ class OISCurve(DiscountCurve):
 ###############################################################################
 
     def _check_refits(self, swap_tol):
-        """ Ensure that the OIS curve refits the calibration instruments. """
+        """
+        Ensure that the curve refits all calibration instruments.
 
+        Handles:
+        - OIS swaps (value at effective date should be ~0)
+        - Cash deposits (value at effective date should be ~0)
+        - FRAs (value at effective date should be ~0)
+        - STIR futures (value at effective date should be ~0)
 
-        for swap in self._used_swaps:
-            # We value it as of the start date of the swap
-            v = swap.value(swap._effective_dt, self,
-                           None)
-            v = v / swap._notional
+        Args:
+            swap_tol: Tolerance for refit error (absolute value / notional)
+        """
+
+        for instrument in self._used_instruments:
+            # Value the instrument as of its effective/start date
+            effective_dt = instrument._effective_dt
+
+            # Call value() with appropriate signature
+            # All instruments support: value(value_dt, discount_curve, ois_curve)
+            if hasattr(instrument, '_float_leg'):
+                # OIS swap - needs ois_curve for floating leg projection
+                v = instrument.value(effective_dt, self, None)
+            else:
+                # Deposit, FRA, or IRFuture - only needs discount curve
+                v = instrument.value(effective_dt, discount_curve=self)
+
+            # Normalize by notional
+            v = v / instrument._notional
+
+            # Check refit tolerance
             if abs(v) > swap_tol:
-                print("Swap with maturity " + str(swap._maturity_dt)
-                      + " Not Repriced. Has Value", v)
-                swap.print_fixed_leg_pv()
-                swap.print_float_leg_pv()
-                raise LibError(f"Swap with maturity {swap._maturity_dt} not repriced. Difference is {abs(v)}")
+                inst_type = type(instrument).__name__
+                print(f"{inst_type} with maturity {instrument._maturity_dt} "
+                      f"Not Repriced. Has Value {v}")
+
+                # Print details if available
+                if hasattr(instrument, 'print_fixed_leg_pv'):
+                    instrument.print_fixed_leg_pv()
+                if hasattr(instrument, 'print_float_leg_pv'):
+                    instrument.print_float_leg_pv()
+                if hasattr(instrument, 'print_details'):
+                    instrument.print_details()
+
+                raise LibError(
+                    f"{inst_type} with maturity {instrument._maturity_dt} "
+                    f"not repriced. Difference is {abs(v)}"
+                )
 
 ###############################################################################
 

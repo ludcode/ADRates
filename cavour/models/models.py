@@ -144,6 +144,7 @@ class Model:
         name: str,
         px_list: List[float],
         tenor_list: List[str],
+        instrument_type: str = "OIS",  # NEW: "OIS", "DEPOSIT", or "FRA"
         spot_days: int = 0,
         swap_type=SwapTypes.PAY,
         fixed_dcc_type=DayCountTypes.ACT_360,
@@ -158,17 +159,23 @@ class Model:
         hessian_bandwidth: Optional[int] = None,  # Hessian sparsity: 0=diagonal only, None=full
     ):
         """
-        Manually construct an OIS curve from swap rates.
+        Manually construct a curve from market rates using various instrument types.
+
+        Supports building curves from:
+        - OIS swaps (for 1Y+ tenors)
+        - Cash deposits (for 0-12M tenors)
+        - FRAs (for 3M-2Y tenors)
 
         Args:
             name (str): Curve identifier (e.g., "GBP_OIS_SONIA")
-            px_list (List[float]): Swap rates in percentage (e.g., [5.0, 5.2, 5.5])
+            px_list (List[float]): Rates in percentage (e.g., [5.0, 5.2, 5.5])
             tenor_list (List[str]): Tenors (e.g., ["1M", "3M", "1Y"])
+            instrument_type (str): Instrument type - "OIS", "DEPOSIT", or "FRA" (default: "OIS")
             spot_days (int): Settlement lag in business days (default: 0)
-            swap_type (SwapTypes): PAY or RECEIVE fixed (default: PAY)
+            swap_type (SwapTypes): PAY or RECEIVE fixed (OIS only, default: PAY)
             fixed_dcc_type (DayCountTypes): Fixed leg day count (default: ACT_360)
-            fixed_freq_type (FrequencyTypes): Fixed leg frequency (default: ANNUAL)
-            float_freq_type (FrequencyTypes): Float leg frequency (default: ANNUAL)
+            fixed_freq_type (FrequencyTypes): Fixed leg frequency (OIS only, default: ANNUAL)
+            float_freq_type (FrequencyTypes): Float leg frequency (OIS only, default: ANNUAL)
             float_dc_type (DayCountTypes): Float leg day count (default: ACT_360)
             bus_day_type (BusDayAdjustTypes): Business day convention (default: MODIFIED_FOLLOWING)
             interp_type (InterpTypes): Interpolation method (default: LINEAR_ZERO_RATES)
@@ -183,12 +190,32 @@ class Model:
                                      None = full Hessian (default, maximum accuracy)
                                      Ignored if compute_gamma=False.
 
-        Example:
+        Examples:
+            >>> # OIS curve
             >>> model.build_curve(
             ...     name="GBP_OIS_SONIA",
-            ...     px_list=[5.19, 5.13, 5.04, 4.75, 4.24],
-            ...     tenor_list=["1M", "3M", "6M", "1Y", "5Y"],
+            ...     px_list=[5.19, 5.13, 5.04, 4.75],
+            ...     tenor_list=["1Y", "2Y", "5Y", "10Y"],
+            ...     instrument_type="OIS",
             ...     fixed_dcc_type=DayCountTypes.ACT_365F
+            ... )
+            >>>
+            >>> # Deposit curve
+            >>> model.build_curve(
+            ...     name="USD_OIS_SOFR",
+            ...     px_list=[5.10, 5.20, 5.30],
+            ...     tenor_list=["1M", "3M", "6M"],
+            ...     instrument_type="DEPOSIT",
+            ...     fixed_dcc_type=DayCountTypes.ACT_360
+            ... )
+            >>>
+            >>> # FRA curve
+            >>> model.build_curve(
+            ...     name="USD_OIS_SOFR",
+            ...     px_list=[5.25, 5.30, 5.35],
+            ...     tenor_list=["3x6", "6x9", "9x12"],
+            ...     instrument_type="FRA",
+            ...     fixed_dcc_type=DayCountTypes.ACT_360
             ... )
         """
         settle_dt = self.value_dt.add_weekdays(spot_days)
@@ -199,27 +226,71 @@ class Model:
         currency_code = name.split('_')[0]
         currency = CurrencyTypes[currency_code]
 
-        swaps = [
-            OIS(
-                effective_dt=settle_dt,
-                term_dt_or_tenor=tenor,
-                fixed_leg_type=swap_type,
-                fixed_coupon=px / 100,
-                fixed_freq_type=fixed_freq_type,
-                fixed_dc_type=fixed_dcc_type,
-                floating_index=curve_type,
-                currency=currency,
-                bd_type=bus_day_type,
-                float_freq_type=float_freq_type,
-                float_dc_type=float_dc_type,
-                payment_lag=payment_lag
-            )
-            for tenor, px in zip(tenor_list, px_list)
-        ]
+        # Create instruments based on type
+        instrument_type_upper = instrument_type.upper()
 
+        if instrument_type_upper == "OIS":
+            # Create OIS swaps
+            instruments = [
+                OIS(
+                    effective_dt=settle_dt,
+                    term_dt_or_tenor=tenor,
+                    fixed_leg_type=swap_type,
+                    fixed_coupon=px / 100,
+                    fixed_freq_type=fixed_freq_type,
+                    fixed_dc_type=fixed_dcc_type,
+                    floating_index=curve_type,
+                    currency=currency,
+                    bd_type=bus_day_type,
+                    float_freq_type=float_freq_type,
+                    float_dc_type=float_dc_type,
+                    payment_lag=payment_lag
+                )
+                for tenor, px in zip(tenor_list, px_list)
+            ]
+
+        elif instrument_type_upper == "DEPOSIT":
+            # Create cash deposits
+            from cavour.trades.rates.cash_deposit import CashDeposit
+            instruments = [
+                CashDeposit(
+                    effective_dt=settle_dt,
+                    term_dt_or_tenor=tenor,
+                    deposit_rate=px / 100,
+                    dc_type=fixed_dcc_type,
+                    floating_index=curve_type,
+                    currency=currency,
+                    bd_type=bus_day_type
+                )
+                for tenor, px in zip(tenor_list, px_list)
+            ]
+
+        elif instrument_type_upper == "FRA":
+            # Create FRAs
+            from cavour.trades.rates.fra import FRA
+            instruments = [
+                FRA(
+                    effective_dt=settle_dt,
+                    fra_notation=tenor,  # e.g., "3x6", "6x9"
+                    fra_rate=px / 100,
+                    dc_type=fixed_dcc_type,
+                    floating_index=curve_type,
+                    currency=currency,
+                    bd_type=bus_day_type
+                )
+                for tenor, px in zip(tenor_list, px_list)
+            ]
+
+        else:
+            raise ValueError(
+                f"Invalid instrument_type: {instrument_type}. "
+                f"Must be 'OIS', 'DEPOSIT', or 'FRA'"
+            )
+
+        # Build curve using the new 'instruments' parameter
         curve = OISCurve(
             value_dt=self.value_dt,
-            ois_swaps=swaps,
+            instruments=instruments,
             interp_type=interp_type,
             check_refit=True,
             use_ad=use_ad,
@@ -232,6 +303,7 @@ class Model:
         self._curve_params_dict[name] = {
             "tenor_list": tenor_list,
             "px_list": px_list,
+            "instrument_type": instrument_type,  # NEW: Store instrument type
             "spot_days": spot_days,
             "swap_type": swap_type,
             "fixed_dcc_type": fixed_dcc_type,
