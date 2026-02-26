@@ -2,11 +2,14 @@
 
 **Cavour** is a modern, Python-based quantitative finance library for pricing and risk management of fixed income derivatives using **Algorithmic Differentiation (AD)**. Built on JAX, Cavour computes Greeks (delta, gamma) directly through automatic differentiation rather than finite differences, providing exact sensitivities with superior performance. The library is optimized for portfolio-scale calculations and GPU acceleration, delivering **6x+ speedup** for batches of 10+ instruments through vectorized JAX operations on GPU/Linux environments.
 
+**Current Status:** The main branch uses a simplified OIS-only curve construction approach. Full multi-instrument bootstrapping (cash deposits, FRAs, IR futures, and OIS swaps) is actively under development in the `multiinstrument` branch (work in progress).
+
 ## Key Features
 
 - **Comprehensive Product Coverage**
   - OIS (Overnight Index Swaps): SONIA, SOFR, ESTR with full AD-based Greeks
   - Cross-Currency Swaps: Basis swaps with dual floating legs and notional exchange
+  - Multi-instrument curves (cash deposits, FRAs, IR futures, OIS): In development on `multiinstrument` branch
 
 - **Algorithmic Differentiation Greeks**
   - First-order sensitivities (Delta) computed via reverse-mode AD
