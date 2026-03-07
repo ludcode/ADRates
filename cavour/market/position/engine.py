@@ -1483,62 +1483,60 @@ class Engine:
             val_scalar = float(jnp.atleast_1d(val).item() if jnp.ndim(val) == 0 else val.squeeze())
             value = Valuation(amount=val_scalar, currency=derivative._currency)
 
-        # Compute gradient (needed for both DELTA and GAMMA)
-        need_grad = RequestTypes.DELTA in reqs or RequestTypes.GAMMA in reqs
-        grad_dfs = None
-        if need_grad:
-            grad_dfs = grad(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
+        # Use SensitivityEngine for DELTA and GAMMA computation (centralized implementation)
+        from cavour.market.sensitivity import SensitivityEngine
 
-        # Compute DELTA
-        if RequestTypes.DELTA in reqs:
-            # Chain rule: sensitivity to rates = d(PV)/d(DFs) * d(DFs)/d(rates)
-            sensitivities = jnp.dot(grad_dfs, jac)
-            # Convert to bp and extract values
-            sensies = [float(x) * 1e-4 for x in sensitivities]
+        # Create curve type enum based on currency
+        curve_type_map = {
+            CurrencyTypes.GBP: CurveTypes.GBP_OIS_SONIA,
+            CurrencyTypes.USD: CurveTypes.USD_OIS_SOFR,
+            CurrencyTypes.EUR: CurveTypes.EUR_OIS_ESTR,
+        }
+        curve_type = curve_type_map.get(derivative._currency, CurveTypes.GBP_OIS_SONIA)
 
-            # Create curve type enum based on currency
-            curve_type_map = {
-                CurrencyTypes.GBP: CurveTypes.GBP_OIS_SONIA,
-                CurrencyTypes.USD: CurveTypes.USD_OIS_SOFR,
-                CurrencyTypes.EUR: CurveTypes.EUR_OIS_ESTR,
-            }
-            curve_type = curve_type_map.get(derivative._currency, CurveTypes.GBP_OIS_SONIA)
+        need_both = RequestTypes.DELTA in reqs and RequestTypes.GAMMA in reqs
+        if need_both:
+            # Check GAMMA precondition
+            if hess_curve is None:
+                raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
 
-            delta = Delta(
-                risk_ladder=sensies,
-                tenors=to_tenor(ir_model.swap_times),
+            # Compute both DELTA and GAMMA efficiently (shares gradient computation)
+            delta, gamma = SensitivityEngine.compute_delta_gamma(
+                pv_fn=pv_fn,
+                dfs=dfs,
+                jac=jac,
+                hess_curve=hess_curve,
+                swap_times=ir_model.swap_times,
                 currency=derivative._currency,
-                curve_type=curve_type,
+                curve_type=curve_type
             )
+        else:
+            # Compute only what's requested
+            if RequestTypes.DELTA in reqs:
+                delta = SensitivityEngine.compute_delta(
+                    pv_fn=pv_fn,
+                    dfs=dfs,
+                    jac=jac,
+                    swap_times=ir_model.swap_times,
+                    currency=derivative._currency,
+                    curve_type=curve_type
+                )
 
-        # Compute GAMMA
-        if RequestTypes.GAMMA in reqs:
-            # Compute Hessian w.r.t. discount factors
-            hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
+            if RequestTypes.GAMMA in reqs:
+                # Check GAMMA precondition
+                if hess_curve is None:
+                    raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
 
-            # Chain rule for second derivatives:
-            # d²PV/dr² = d²PV/dDF² * (dDF/dr)² + dPV/dDF * d²DF/dr²
-            term1 = jac.T @ hess_dfs @ jac  # First term
-            term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)  # Second term
-            gammas = term1 + term2
-
-            # Convert to bp²
-            gammas = np.array(gammas, dtype=np.float64) * 1e-8
-
-            # Create curve type enum
-            curve_type_map = {
-                CurrencyTypes.GBP: CurveTypes.GBP_OIS_SONIA,
-                CurrencyTypes.USD: CurveTypes.USD_OIS_SOFR,
-                CurrencyTypes.EUR: CurveTypes.EUR_OIS_ESTR,
-            }
-            curve_type = curve_type_map.get(derivative._currency, CurveTypes.GBP_OIS_SONIA)
-
-            gamma = Gamma(
-                risk_ladder=gammas,
-                tenors=to_tenor(ir_model.swap_times),
-                currency=derivative._currency,
-                curve_type=curve_type,
-            )
+                gamma = SensitivityEngine.compute_gamma(
+                    pv_fn=pv_fn,
+                    dfs=dfs,
+                    jac=jac,
+                    hess_curve=hess_curve,
+                    grad_dfs=None,
+                    swap_times=ir_model.swap_times,
+                    currency=derivative._currency,
+                    curve_type=curve_type
+                )
 
         # Cashflows extraction
         cashflows = None
@@ -1774,49 +1772,59 @@ class Engine:
         if need_grad:
             # Check if discount and index curves are the same
             if index_curve_name == discount_curve_name:
-                # Single curve case - easier
-                # Compute gradient directly
-                grad_dfs = grad(lambda d: jnp.squeeze(pv_fn_combined(d)))(disc_dfs)
+                # Single curve case - use SensitivityEngine for centralized computation
+                from cavour.market.sensitivity import SensitivityEngine
 
-                # Compute DELTA
-                if RequestTypes.DELTA in reqs:
-                    sensitivities = jnp.dot(grad_dfs, disc_jac)
-                    sensies = [float(x) * 1e-4 for x in sensitivities]
+                curve_type_map = {
+                    CurrencyTypes.GBP: CurveTypes.GBP_OIS_SONIA,
+                    CurrencyTypes.USD: CurveTypes.USD_OIS_SOFR,
+                    CurrencyTypes.EUR: CurveTypes.EUR_OIS_ESTR,
+                }
+                curve_type = curve_type_map.get(derivative._currency, CurveTypes.GBP_OIS_SONIA)
 
-                    curve_type_map = {
-                        CurrencyTypes.GBP: CurveTypes.GBP_OIS_SONIA,
-                        CurrencyTypes.USD: CurveTypes.USD_OIS_SOFR,
-                        CurrencyTypes.EUR: CurveTypes.EUR_OIS_ESTR,
-                    }
-                    curve_type = curve_type_map.get(derivative._currency, CurveTypes.GBP_OIS_SONIA)
+                need_both = RequestTypes.DELTA in reqs and RequestTypes.GAMMA in reqs
+                if need_both:
+                    # Check GAMMA precondition
+                    if disc_hess is None:
+                        raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
 
-                    delta = Delta(
-                        risk_ladder=sensies,
-                        tenors=to_tenor(discount_model.swap_times),
+                    # Compute both DELTA and GAMMA efficiently (shares gradient computation)
+                    delta, gamma = SensitivityEngine.compute_delta_gamma(
+                        pv_fn=pv_fn_combined,
+                        dfs=disc_dfs,
+                        jac=disc_jac,
+                        hess_curve=disc_hess,
+                        swap_times=discount_model.swap_times,
                         currency=derivative._currency,
-                        curve_type=curve_type,
+                        curve_type=curve_type
                     )
+                else:
+                    # Compute only what's requested
+                    if RequestTypes.DELTA in reqs:
+                        delta = SensitivityEngine.compute_delta(
+                            pv_fn=pv_fn_combined,
+                            dfs=disc_dfs,
+                            jac=disc_jac,
+                            swap_times=discount_model.swap_times,
+                            currency=derivative._currency,
+                            curve_type=curve_type
+                        )
 
-                # Compute GAMMA
-                if RequestTypes.GAMMA in reqs:
-                    hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn_combined(d)))(disc_dfs)
+                    if RequestTypes.GAMMA in reqs:
+                        # Check GAMMA precondition
+                        if disc_hess is None:
+                            raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
 
-                    # Chain rule for second derivatives
-                    term1 = disc_jac.T @ hess_dfs @ disc_jac
-                    term2 = jnp.sum(grad_dfs[:, None, None] * disc_hess, axis=0)
-                    gammas = term1 + term2
-
-                    # Convert to bp^2
-                    gammas = np.array(gammas, dtype=np.float64) * 1e-8
-
-                    curve_type = curve_type_map.get(derivative._currency, CurveTypes.GBP_OIS_SONIA)
-
-                    gamma = Gamma(
-                        risk_ladder=gammas,
-                        tenors=to_tenor(discount_model.swap_times),
-                        currency=derivative._currency,
-                        curve_type=curve_type,
-                    )
+                        gamma = SensitivityEngine.compute_gamma(
+                            pv_fn=pv_fn_combined,
+                            dfs=disc_dfs,
+                            jac=disc_jac,
+                            hess_curve=disc_hess,
+                            grad_dfs=None,
+                            swap_times=discount_model.swap_times,
+                            currency=derivative._currency,
+                            curve_type=curve_type
+                        )
             else:
                 # Dual curve case - more complex (TODO: implement cross-curve sensitivities)
                 raise LibError("Dual-curve FRN delta/gamma not yet implemented. "
@@ -2863,9 +2871,8 @@ class Engine:
 
             grad_xccy_dfs_original = grad(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
 
-            # Domestic OIS GAMMA
-            # Compute Hessian w.r.t. domestic DFs
-            hess_dom_dfs_original = hessian(lambda d: jnp.squeeze(pv_dom_original_dfs(d)))(dom_dfs_original)
+            # Domestic OIS GAMMA - use SensitivityEngine for centralized computation
+            from cavour.market.sensitivity import SensitivityEngine
 
             # Get Hessian of curve bootstrapping (d²DFs/d(rates)²)
             if hasattr(domestic_model, '_hess') and domestic_model._hess is not None:
@@ -2884,35 +2891,24 @@ class Engine:
                     )
                 hess_dom_curve = dom_cache["hess"][1:, :, :] if dom_times[0] < 1e-6 else dom_cache["hess"]
 
-            # Chain rule for gamma: d²PV/d(rates)² = jac^T @ hess_dfs @ jac + sum(grad_dfs * hess_curve)
-            # term1: main chain rule (treating curve as fixed mapping)
-            # term2: correction for curve Hessian (derivative of Jacobian itself)
-            term1_dom = jac_dom_original.T @ hess_dom_dfs_original @ jac_dom_original
+            # Check GAMMA precondition
+            if hess_dom_curve is None:
+                raise LibError("GAMMA requested but domestic curve was not built with compute_gamma=True")
 
-            # Handle diagonal or full curve Hessian
-            if hess_dom_curve.ndim == 2:
-                # Diagonal Hessian: shape (n_dfs, n_rates)
-                # For diagonal: term2[j,k] = sum_i grad[i] * hess[i,j] if j==k, else 0
-                term2_diag = jnp.dot(grad_dom_dfs_original, hess_dom_curve)  # Shape: (n_rates,)
-                term2_dom = jnp.diag(term2_diag)  # Shape: (n_rates, n_rates)
-            else:
-                # Full Hessian: shape (n_dfs, n_rates, n_rates)
-                term2_dom = jnp.sum(grad_dom_dfs_original[:, None, None] * hess_dom_curve, axis=0)
+            # Compute GAMMA using SensitivityEngine (reuses pre-computed gradient)
+            gamma_domestic_obj = SensitivityEngine.compute_gamma(
+                pv_fn=pv_dom_original_dfs,
+                dfs=dom_dfs_original,
+                jac=jac_dom_original,
+                hess_curve=hess_dom_curve,
+                grad_dfs=grad_dom_dfs_original,
+                swap_times=domestic_model.swap_times,
+                currency=derivative._domestic_currency,
+                curve_type=derivative._domestic_floating_index
+            )
+            gammas_dom = gamma_domestic_obj.risk_ladder
 
-            gammas_dom_matrix = term1_dom + term2_dom
-
-            # Return FULL gamma matrix (not just diagonal)
-            # Shape: (n_dom_rates, n_dom_rates)
-            gammas_dom = gammas_dom_matrix
-
-            # Convert to GBP per bp²
-            # 1bp = 0.0001 in decimal → (1bp)² = 1e-8
-            gammas_dom = np.array(gammas_dom, dtype=np.float64) * 1e-8
-
-            # Foreign OIS GAMMA
-            # Compute Hessian w.r.t. foreign DFs (direct effect through forward rates)
-            hess_for_dfs_original = hessian(lambda d: jnp.squeeze(pv_for_original_dfs(d)))(for_ois_dfs_original)
-
+            # Foreign OIS GAMMA - use SensitivityEngine for centralized computation
             # Get Hessian of curve bootstrapping (d²DFs/d(rates)²)
             if hasattr(foreign_model, '_hess') and foreign_model._hess is not None:
                 # Use stored Hessian from curve construction
@@ -2930,33 +2926,30 @@ class Engine:
                     )
                 hess_for_curve = for_cache["hess"][1:, :, :] if for_times[0] < 1e-6 else for_cache["hess"]
 
-            # Chain rule for gamma - DIRECT effect (foreign OIS -> forward rates -> PV)
-            term1_for = jac_for_original.T @ hess_for_dfs_original @ jac_for_original
-
-            # Handle diagonal or full curve Hessian
-            if hess_for_curve.ndim == 2:
-                # Diagonal Hessian: shape (n_dfs, n_rates)
-                term2_diag = jnp.dot(grad_for_dfs_original, hess_for_curve)  # Shape: (n_rates,)
-                term2_for = jnp.diag(term2_diag)  # Shape: (n_rates, n_rates)
-            else:
-                # Full Hessian: shape (n_dfs, n_rates, n_rates)
-                term2_for = jnp.sum(grad_for_dfs_original[:, None, None] * hess_for_curve, axis=0)
-
-            gammas_for_matrix_direct = term1_for + term2_for
+            # Check GAMMA precondition
+            if hess_for_curve is None:
+                raise LibError("GAMMA requested but foreign curve was not built with compute_gamma=True")
 
             # Foreign OIS GAMMA: Only direct effect on forward rates
             # IMPORTANT: XCCY curve is treated as FIXED when bumping foreign OIS rates.
             # Same rationale as for DELTA - we hold XCCY basis spreads fixed, so XCCY DFs
             # do not change. Therefore, only the direct effect on forward rates matters.
-            gammas_for_matrix = gammas_for_matrix_direct
 
-            # Return FULL gamma matrix (not just diagonal)
-            # Shape: (n_for_rates, n_for_rates)
-            gammas_for = gammas_for_matrix
+            # Compute GAMMA using SensitivityEngine (reuses pre-computed gradient)
+            # Note: Result is in domestic currency, need FX adjustment
+            gamma_foreign_obj = SensitivityEngine.compute_gamma(
+                pv_fn=pv_for_original_dfs,
+                dfs=for_ois_dfs_original,
+                jac=jac_for_original,
+                hess_curve=hess_for_curve,
+                grad_dfs=grad_for_dfs_original,
+                swap_times=foreign_model.swap_times,
+                currency=derivative._domestic_currency,
+                curve_type=derivative._foreign_floating_index
+            )
 
-            # Convert to GBP per bp²
-            # Foreign leg PV is in USD, multiply by spot_fx to convert to GBP
-            gammas_for = np.array(gammas_for, dtype=np.float64) * 1e-8 / spot_fx
+            # Apply FX conversion: Foreign leg PV is in foreign currency, convert to domestic
+            gammas_for = gamma_foreign_obj.risk_ladder / spot_fx
 
             # Create Gamma objects for each curve
             gamma_domestic = Gamma(
@@ -5565,48 +5558,54 @@ class Engine:
             val_scalar = float(jnp.atleast_1d(val).item() if jnp.ndim(val) == 0 else val.squeeze())
             value = Valuation(amount=val_scalar, currency=derivative._currency)
 
-        # Compute gradient for DELTA and/or GAMMA
-        need_grad = RequestTypes.DELTA in reqs or RequestTypes.GAMMA in reqs
-        grad_dfs = None
-        if need_grad:
-            grad_dfs = grad(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
+        # Use SensitivityEngine for DELTA and GAMMA computation (centralized implementation)
+        from cavour.market.sensitivity import SensitivityEngine
 
-        # Compute DELTA
         delta = None
-        if RequestTypes.DELTA in reqs:
-            # Chain rule: dV/d(rates) = (dV/d(DFs)) × (d(DFs)/d(rates))
-            sensitivities = jnp.dot(grad_dfs, jac)
-            sensies = [float(x) * 1e-4 for x in sensitivities]
-            delta = Delta(
-                risk_ladder=sensies,
-                tenors=to_tenor(ir_model.swap_times),
-                currency=derivative._currency,
-                curve_type=derivative._floating_index
-            )
-
-        # Compute GAMMA
         gamma = None
-        if RequestTypes.GAMMA in reqs:
+
+        need_both = RequestTypes.DELTA in reqs and RequestTypes.GAMMA in reqs
+        if need_both:
+            # Check GAMMA precondition
             if hess_curve is None:
                 raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
 
-            # Compute Hessian: d²V/d(DFs)²
-            hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
-
-            # Chain rule with two terms:
-            # term1: jac.T @ hess_dfs @ jac  (second derivative through jacobian)
-            # term2: sum(grad_dfs * hess_curve)  (first derivative times curve hessian)
-            term1 = jac.T @ hess_dfs @ jac
-            term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
-            gammas = term1 + term2
-            gammas = np.array(gammas, dtype=np.float64) * 1e-8
-
-            gamma = Gamma(
-                risk_ladder=gammas,
-                tenors=to_tenor(ir_model.swap_times),
+            # Compute both efficiently (shares gradient computation)
+            delta, gamma = SensitivityEngine.compute_delta_gamma(
+                pv_fn=pv_fn,
+                dfs=dfs,
+                jac=jac,
+                hess_curve=hess_curve,
+                swap_times=ir_model.swap_times,
                 currency=derivative._currency,
                 curve_type=derivative._floating_index
             )
+        else:
+            # Compute only what's requested
+            if RequestTypes.DELTA in reqs:
+                delta = SensitivityEngine.compute_delta(
+                    pv_fn=pv_fn,
+                    dfs=dfs,
+                    jac=jac,
+                    swap_times=ir_model.swap_times,
+                    currency=derivative._currency,
+                    curve_type=derivative._floating_index
+                )
+
+            if RequestTypes.GAMMA in reqs:
+                if hess_curve is None:
+                    raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
+
+                gamma = SensitivityEngine.compute_gamma(
+                    pv_fn=pv_fn,
+                    dfs=dfs,
+                    jac=jac,
+                    hess_curve=hess_curve,
+                    grad_dfs=None,  # Will be computed inside
+                    swap_times=ir_model.swap_times,
+                    currency=derivative._currency,
+                    curve_type=derivative._floating_index
+                )
 
         return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=None)
 
@@ -5685,48 +5684,54 @@ class Engine:
             val_scalar = float(jnp.atleast_1d(val).item() if jnp.ndim(val) == 0 else val.squeeze())
             value = Valuation(amount=val_scalar, currency=derivative._currency)
 
-        # Compute gradient for DELTA and/or GAMMA
-        need_grad = RequestTypes.DELTA in reqs or RequestTypes.GAMMA in reqs
-        grad_dfs = None
-        if need_grad:
-            grad_dfs = grad(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
+        # Use SensitivityEngine for DELTA and GAMMA computation (centralized implementation)
+        from cavour.market.sensitivity import SensitivityEngine
 
-        # Compute DELTA
         delta = None
-        if RequestTypes.DELTA in reqs:
-            # Chain rule: dV/d(rates) = (dV/d(DFs)) × (d(DFs)/d(rates))
-            sensitivities = jnp.dot(grad_dfs, jac)
-            sensies = [float(x) * 1e-4 for x in sensitivities]
-            delta = Delta(
-                risk_ladder=sensies,
-                tenors=to_tenor(ir_model.swap_times),
-                currency=derivative._currency,
-                curve_type=derivative._floating_index
-            )
-
-        # Compute GAMMA
         gamma = None
-        if RequestTypes.GAMMA in reqs:
+
+        need_both = RequestTypes.DELTA in reqs and RequestTypes.GAMMA in reqs
+        if need_both:
+            # Check GAMMA precondition
             if hess_curve is None:
                 raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
 
-            # Compute Hessian: d²V/d(DFs)²
-            hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
-
-            # Chain rule with two terms:
-            # term1: jac.T @ hess_dfs @ jac  (second derivative through jacobian)
-            # term2: sum(grad_dfs * hess_curve)  (first derivative times curve hessian)
-            term1 = jac.T @ hess_dfs @ jac
-            term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
-            gammas = term1 + term2
-            gammas = np.array(gammas, dtype=np.float64) * 1e-8
-
-            gamma = Gamma(
-                risk_ladder=gammas,
-                tenors=to_tenor(ir_model.swap_times),
+            # Compute both efficiently (shares gradient computation)
+            delta, gamma = SensitivityEngine.compute_delta_gamma(
+                pv_fn=pv_fn,
+                dfs=dfs,
+                jac=jac,
+                hess_curve=hess_curve,
+                swap_times=ir_model.swap_times,
                 currency=derivative._currency,
                 curve_type=derivative._floating_index
             )
+        else:
+            # Compute only what's requested
+            if RequestTypes.DELTA in reqs:
+                delta = SensitivityEngine.compute_delta(
+                    pv_fn=pv_fn,
+                    dfs=dfs,
+                    jac=jac,
+                    swap_times=ir_model.swap_times,
+                    currency=derivative._currency,
+                    curve_type=derivative._floating_index
+                )
+
+            if RequestTypes.GAMMA in reqs:
+                if hess_curve is None:
+                    raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
+
+                gamma = SensitivityEngine.compute_gamma(
+                    pv_fn=pv_fn,
+                    dfs=dfs,
+                    jac=jac,
+                    hess_curve=hess_curve,
+                    grad_dfs=None,  # Will be computed inside
+                    swap_times=ir_model.swap_times,
+                    currency=derivative._currency,
+                    curve_type=derivative._floating_index
+                )
 
         return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=None)
 
@@ -5808,48 +5813,54 @@ class Engine:
             val_scalar = float(jnp.atleast_1d(val).item() if jnp.ndim(val) == 0 else val.squeeze())
             value = Valuation(amount=val_scalar, currency=derivative._currency)
 
-        # Compute gradient for DELTA and/or GAMMA
-        need_grad = RequestTypes.DELTA in reqs or RequestTypes.GAMMA in reqs
-        grad_dfs = None
-        if need_grad:
-            grad_dfs = grad(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
+        # Use SensitivityEngine for DELTA and GAMMA computation (centralized implementation)
+        from cavour.market.sensitivity import SensitivityEngine
 
-        # Compute DELTA
         delta = None
-        if RequestTypes.DELTA in reqs:
-            # Chain rule: dV/d(rates) = (dV/d(DFs)) × (d(DFs)/d(rates))
-            sensitivities = jnp.dot(grad_dfs, jac)
-            sensies = [float(x) * 1e-4 for x in sensitivities]
-            delta = Delta(
-                risk_ladder=sensies,
-                tenors=to_tenor(ir_model.swap_times),
-                currency=derivative._currency,
-                curve_type=derivative._floating_index
-            )
-
-        # Compute GAMMA
         gamma = None
-        if RequestTypes.GAMMA in reqs:
+
+        need_both = RequestTypes.DELTA in reqs and RequestTypes.GAMMA in reqs
+        if need_both:
+            # Check GAMMA precondition
             if hess_curve is None:
                 raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
 
-            # Compute Hessian: d²V/d(DFs)²
-            hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
-
-            # Chain rule with two terms:
-            # term1: jac.T @ hess_dfs @ jac  (second derivative through jacobian)
-            # term2: sum(grad_dfs * hess_curve)  (first derivative times curve hessian)
-            term1 = jac.T @ hess_dfs @ jac
-            term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
-            gammas = term1 + term2
-            gammas = np.array(gammas, dtype=np.float64) * 1e-8
-
-            gamma = Gamma(
-                risk_ladder=gammas,
-                tenors=to_tenor(ir_model.swap_times),
+            # Compute both efficiently (shares gradient computation)
+            delta, gamma = SensitivityEngine.compute_delta_gamma(
+                pv_fn=pv_fn,
+                dfs=dfs,
+                jac=jac,
+                hess_curve=hess_curve,
+                swap_times=ir_model.swap_times,
                 currency=derivative._currency,
                 curve_type=derivative._floating_index
             )
+        else:
+            # Compute only what's requested
+            if RequestTypes.DELTA in reqs:
+                delta = SensitivityEngine.compute_delta(
+                    pv_fn=pv_fn,
+                    dfs=dfs,
+                    jac=jac,
+                    swap_times=ir_model.swap_times,
+                    currency=derivative._currency,
+                    curve_type=derivative._floating_index
+                )
+
+            if RequestTypes.GAMMA in reqs:
+                if hess_curve is None:
+                    raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
+
+                gamma = SensitivityEngine.compute_gamma(
+                    pv_fn=pv_fn,
+                    dfs=dfs,
+                    jac=jac,
+                    hess_curve=hess_curve,
+                    grad_dfs=None,  # Will be computed inside
+                    swap_times=ir_model.swap_times,
+                    currency=derivative._currency,
+                    curve_type=derivative._floating_index
+                )
 
         return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=None)
 
@@ -5928,47 +5939,53 @@ class Engine:
             val_scalar = float(jnp.atleast_1d(val).item() if jnp.ndim(val) == 0 else val.squeeze())
             value = Valuation(amount=val_scalar, currency=derivative._currency)
 
-        # Compute gradient for DELTA and/or GAMMA
-        need_grad = RequestTypes.DELTA in reqs or RequestTypes.GAMMA in reqs
-        grad_dfs = None
-        if need_grad:
-            grad_dfs = grad(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
+        # Use SensitivityEngine for DELTA and GAMMA computation (centralized implementation)
+        from cavour.market.sensitivity import SensitivityEngine
 
-        # Compute DELTA
         delta = None
-        if RequestTypes.DELTA in reqs:
-            # Chain rule: dV/d(rates) = (dV/d(DFs)) × (d(DFs)/d(rates))
-            sensitivities = jnp.dot(grad_dfs, jac)
-            sensies = [float(x) * 1e-4 for x in sensitivities]
-            delta = Delta(
-                risk_ladder=sensies,
-                tenors=to_tenor(ir_model.swap_times),
-                currency=derivative._currency,
-                curve_type=derivative._floating_index
-            )
-
-        # Compute GAMMA
         gamma = None
-        if RequestTypes.GAMMA in reqs:
+
+        need_both = RequestTypes.DELTA in reqs and RequestTypes.GAMMA in reqs
+        if need_both:
+            # Check GAMMA precondition
             if hess_curve is None:
                 raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
 
-            # Compute Hessian: d²V/d(DFs)²
-            hess_dfs = hessian(lambda d: jnp.squeeze(pv_fn(d)))(dfs)
-
-            # Chain rule with two terms:
-            # term1: jac.T @ hess_dfs @ jac  (second derivative through jacobian)
-            # term2: sum(grad_dfs * hess_curve)  (first derivative times curve hessian)
-            term1 = jac.T @ hess_dfs @ jac
-            term2 = jnp.sum(grad_dfs[:, None, None] * hess_curve, axis=0)
-            gammas = term1 + term2
-            gammas = np.array(gammas, dtype=np.float64) * 1e-8
-
-            gamma = Gamma(
-                risk_ladder=gammas,
-                tenors=to_tenor(ir_model.swap_times),
+            # Compute both efficiently (shares gradient computation)
+            delta, gamma = SensitivityEngine.compute_delta_gamma(
+                pv_fn=pv_fn,
+                dfs=dfs,
+                jac=jac,
+                hess_curve=hess_curve,
+                swap_times=ir_model.swap_times,
                 currency=derivative._currency,
                 curve_type=derivative._floating_index
             )
+        else:
+            # Compute only what's requested
+            if RequestTypes.DELTA in reqs:
+                delta = SensitivityEngine.compute_delta(
+                    pv_fn=pv_fn,
+                    dfs=dfs,
+                    jac=jac,
+                    swap_times=ir_model.swap_times,
+                    currency=derivative._currency,
+                    curve_type=derivative._floating_index
+                )
+
+            if RequestTypes.GAMMA in reqs:
+                if hess_curve is None:
+                    raise LibError("GAMMA requested but curve was not built with compute_gamma=True")
+
+                gamma = SensitivityEngine.compute_gamma(
+                    pv_fn=pv_fn,
+                    dfs=dfs,
+                    jac=jac,
+                    hess_curve=hess_curve,
+                    grad_dfs=None,  # Will be computed inside
+                    swap_times=ir_model.swap_times,
+                    currency=derivative._currency,
+                    curve_type=derivative._floating_index
+                )
 
         return AnalyticsResult(value=value, risk=delta, gamma=gamma, cashflows=None)
