@@ -2966,23 +2966,17 @@ class Engine:
                 curve_type=derivative._foreign_floating_index,
             )
 
-            # XCCY Basis GAMMA
+            # XCCY Basis GAMMA - use SensitivityEngine for centralized computation
             # Compute Hessian w.r.t. XCCY DFs (if Jacobian available)
             if hasattr(xccy_curve, '_jac_basis') and xccy_curve._jac_basis is not None:
                 # Get basis spread tenors from XCCY curve
                 basis_swap_tenors = to_tenor(xccy_curve.swap_times)
-                # Compute Hessian w.r.t. XCCY DFs
-                hess_xccy_dfs_original = hessian(lambda d: jnp.squeeze(pv_xccy_original_dfs(d)))(xccy_dfs_original)
 
                 # The Jacobian is already at pillar-level (one column per swap/pillar)
                 jac_xccy_pillar = xccy_curve._jac_basis[1:, :] if xccy_times[0] < 1e-6 else xccy_curve._jac_basis
 
-                # Chain rule for gamma (COMPLETE version with both terms)
-                # term1: main chain rule (treating curve as fixed mapping)
-                # term2: correction for curve Hessian (derivative of Jacobian itself)
-                term1_xccy = jac_xccy_pillar.T @ hess_xccy_dfs_original @ jac_xccy_pillar
-
-                # Check if curve Hessian is available (added in xccy_curve.py)
+                # Get curve Hessian if available
+                hess_xccy_curve = None
                 if hasattr(xccy_curve, "_hess_basis") and xccy_curve._hess_basis is not None:
                     # NOTE: XCCY curve stores Hessian with prepended t=0 row (unlike OIS curves)
                     # Skip first row if curve has prepended t=0 to match original DFs
@@ -2994,27 +2988,21 @@ class Engine:
                     else:
                         hess_xccy_curve = xccy_curve._hess_basis
 
-                    # Handle diagonal or full curve Hessian
-                    if hess_xccy_curve.ndim == 2:
-                        # Diagonal Hessian: shape (n_dfs, n_basis)
-                        term2_diag = jnp.dot(grad_xccy_dfs_original, hess_xccy_curve)  # Shape: (n_basis,)
-                        term2_xccy = jnp.diag(term2_diag)  # Shape: (n_basis, n_basis)
-                    else:
-                        # Full Hessian: shape (n_dfs, n_basis, n_basis)
-                        term2_xccy = jnp.sum(grad_xccy_dfs_original[:, None, None] * hess_xccy_curve, axis=0)
+                # Compute GAMMA using SensitivityEngine (reuses pre-computed gradient)
+                # Note: If hess_xccy_curve is None, only term1 is computed (may give zero or near-zero)
+                gamma_basis_obj = SensitivityEngine.compute_gamma(
+                    pv_fn=pv_xccy_original_dfs,
+                    dfs=xccy_dfs_original,
+                    jac=jac_xccy_pillar,
+                    hess_curve=hess_xccy_curve,
+                    grad_dfs=grad_xccy_dfs_original,
+                    swap_times=xccy_curve.swap_times,
+                    currency=derivative._domestic_currency,
+                    curve_type=CurveTypes.USD_GBP_BASIS
+                )
 
-                    gammas_xccy_matrix = term1_xccy + term2_xccy
-                else:
-                    # Fallback to term1 only (will likely give zero or near-zero)
-                    gammas_xccy_matrix = term1_xccy
-
-                # Return FULL gamma matrix (not just diagonal)
-                # Shape: (n_basis, n_basis)
-                gammas_xccy = gammas_xccy_matrix
-
-                # Convert to GBP per bp²
-                # Foreign leg PV is in USD, divide by spot_fx to convert USD to GBP (spot_fx is USD/GBP)
-                gammas_xccy = np.array(gammas_xccy, dtype=np.float64) * 1e-8 / spot_fx
+                # Apply FX conversion: Foreign leg PV is in foreign currency, convert to domestic
+                gammas_xccy = gamma_basis_obj.risk_ladder / spot_fx
 
                 gamma_basis = Gamma(
                     risk_ladder=gammas_xccy,
