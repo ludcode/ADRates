@@ -493,17 +493,16 @@ class IRFuture:
         # Get forward rate from curve
         curve_forward_rate = self.forward_rate_from_curve(value_dt, discount_curve)
 
-        # Futures value = PV of rate differential * notional * year_frac
+        # Futures value = notional * rate differential * year_frac
         # Rate differential: curve_forward_rate - futures_implied_rate
         # (This should be ~0 if futures is priced correctly)
         rate_differential = curve_forward_rate - self._forward_rate
 
-        # Discount to present value
-        df_end = discount_curve.df(self._accrual_end_dt, self._dc_type)
-        df_value = discount_curve.df(value_dt, self._dc_type)
-
-        # PV = notional * rate_diff * year_frac * (DF_end / DF_value)
-        pv = self._notional * rate_differential * self._year_frac * (df_end / df_value)
+        # Futures are marked-to-market daily with immediate cash settlement
+        # No discounting applied - daily variation margin eliminates credit risk
+        # See: Market convention for SOFR/EURIBOR futures valuation
+        # PV = notional * rate_diff * year_frac (NO discount factor)
+        pv = self._notional * rate_differential * self._year_frac
 
         return pv
 

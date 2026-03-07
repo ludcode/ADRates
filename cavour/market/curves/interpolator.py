@@ -94,7 +94,9 @@ def _uinterpolate(t, times, dfs, method):
     if method == InterpTypes.LINEAR_ZERO_RATES.value:
 
         if i == 1:
-            r1 = -np.log(dfs[i]) / times[i]
+            # Special case: first interval from t=0 (DF=1.0, zero_rate=0.0) to first curve point
+            # At t=0: dfs[0]=1.0, so zero_rate = -log(1.0)/0 is undefined, but should be 0.0
+            r1 = 0.0 if times[i - 1] < 1e-10 else -np.log(dfs[i - 1]) / times[i - 1]
             r2 = -np.log(dfs[i]) / times[i]
             dt = times[i] - times[i - 1]
             rvalue = ((times[i] - t) * r1 + (t - times[i - 1]) * r2) / dt

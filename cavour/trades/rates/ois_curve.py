@@ -135,6 +135,9 @@ class OISCurve(DiscountCurve):
         # Sort instruments by maturity for proper bootstrapping order
         self._used_instruments = self._sort_instruments_by_maturity(self._used_instruments)
 
+        # Validate and auto-adjust futures convexity adjustments
+        self._validate_and_adjust_convexity(self._used_instruments)
+
         self._value_dt = value_dt
         self._interp_type = interp_type
         self._check_refit = check_refit
@@ -153,6 +156,67 @@ class OISCurve(DiscountCurve):
         # Compute and store Jacobians/Hessians for AD if requested
         if use_ad:
             self._compute_ad_derivatives(swap_rates)
+
+###############################################################################
+
+    def _validate_and_adjust_convexity(self, instruments):
+        """
+        Validate futures convexity adjustments.
+
+        Futures Convexity Adjustment (FCA) arises from the difference in cashflow timing:
+        - Futures: Daily mark-to-market (no discounting)
+        - OIS forwards: Single cashflow at maturity (discounted)
+
+        This creates a hedging asymmetry:
+        - When rates rise: Futures gains immediate, OIS gains discounted (worth less)
+        - When rates fall: Futures losses immediate, OIS losses discounted (hurts more)
+
+        Result: Futures rates > OIS forward rates by the FCA amount.
+
+        FCA can be observed directly from market data:
+          FCA = Futures_rate - OIS_forward_rate (same maturity)
+
+        This method warns when futures are used with FCA=0 (default), which assumes
+        futures rates = forward rates and may introduce arbitrage opportunities.
+
+        Args:
+            instruments: List of instruments (sorted by maturity)
+        """
+        from cavour.utils.global_types import InstrumentTypes
+        import warnings
+
+        # Find all futures
+        futures = []
+        for inst in instruments:
+            if hasattr(inst, 'derivative_type'):
+                if inst.derivative_type == InstrumentTypes.STIR_FUTURE:
+                    futures.append(inst)
+
+        # If no futures, nothing to validate
+        if not futures:
+            return
+
+        # Check for futures with FCA=0 (default)
+        futures_with_zero_fca = [f for f in futures if abs(f._convexity_adjustment) < 1e-10]
+
+        if futures_with_zero_fca:
+            # Issue warning for first occurrence only (avoid spam)
+            first_fut = futures_with_zero_fca[0]
+            warnings.warn(
+                f"IR Futures detected with convexity_adjustment=0.0 (default). "
+                f"This assumes Futures rate = Forward rate, ignoring the timing difference "
+                f"between daily mark-to-market (futures) and maturity settlement (forwards). "
+                f"\n\nFutures Convexity Adjustment (FCA) can be extracted from market data:\n"
+                f"  FCA = Futures_rate - OIS_forward_rate (same maturity)\n\n"
+                f"To avoid potential arbitrage, either:\n"
+                f"  1. Provide explicit convexity_adjustment parameter to IRFuture()\n"
+                f"  2. Use OIS swaps only (if futures data unavailable)\n\n"
+                f"First future with FCA=0: {first_fut._expiry_dt}, "
+                f"futures_price={first_fut._futures_price:.2f}, "
+                f"implied_rate={first_fut._implied_rate*100:.2f}%",
+                UserWarning,
+                stacklevel=3
+            )
 
 ###############################################################################
 

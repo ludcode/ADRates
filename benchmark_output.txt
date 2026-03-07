@@ -1,0 +1,19 @@
+================================================================================
+XCCY GAMMA BENCHMARK - PHASE 1 OPTIMIZATIONS
+================================================================================
+Changes:
+  - JIT compilation on vmap (expected: 5-10x speedup)
+  - Pre-computed wrapper conditionals (expected: 1.5-2x speedup)
+  - Total expected: 7-12x faster
+================================================================================
+
+[1/5] Loading Bloomberg market data...
+  Data loaded: 3.56s
+
+[2/5] Building curves with compute_gamma=True...
+  Curves built: 208.16s
+
+[3/5] Creating 20Y XCCY swap...
+  Swap created
+
+[4/7] Computing VALUE only...
